@@ -1,0 +1,37 @@
+[package]
+name = "Hooks"
+description = "32-bit DLL injected into GTAIV.exe: engine hooks, game events, direct-to-online boot."
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+# GTA IV is 32-bit: build with `--target i686-pc-windows-msvc`.
+[lib]
+# Everything injected into the game (this crate plus Networking, NativeInvoker, Core) links
+# into this one DLL.
+name = "IVMP_Client"
+crate-type = ["cdylib"]
+
+[dependencies]
+Shared = { path = "../Shared" }
+Core = { path = "../Core" }
+NativeInvoker = { path = "../NativeInvoker" }
+Networking = { path = "../Networking" }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D9",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Environment",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]
