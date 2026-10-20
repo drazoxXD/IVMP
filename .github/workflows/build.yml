@@ -1,0 +1,71 @@
+# Builds the client (IVMP_Client.dll + ivmp_launcher.exe) and the server (Server.exe), zips each
+# and publishes them as a pre-release. Never a full release: every build is marked pre-release
+# and not latest.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add i686-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            Client
+            Server
+
+      - name: Build client DLL (32-bit, injected into GTAIV.exe)
+        working-directory: Client
+        run: cargo build --release --locked --target i686-pc-windows-msvc -p Hooks
+
+      - name: Build launcher (64-bit)
+        working-directory: Client
+        run: cargo build --release --locked -p Launcher
+
+      - name: Build server
+        working-directory: Server
+        run: cargo build --release --locked
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/client, dist/server | Out-Null
+          Copy-Item Client/target/i686-pc-windows-msvc/release/IVMP_Client.dll dist/client/
+          Copy-Item Client/target/release/ivmp_launcher.exe dist/client/
+          Copy-Item Server/target/release/Server.exe dist/server/
+          Compress-Archive -Path dist/client/* -DestinationPath IVMP_Client.zip
+          Compress-Archive -Path dist/server/* -DestinationPath IVMP_Server.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IVMP-${{ github.run_number }}
+          path: |
+            IVMP_Client.zip
+            IVMP_Server.zip
+
+      - name: Pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "build-${{ github.run_number }}"
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          gh release create $tag IVMP_Client.zip IVMP_Server.zip `
+            --target ${{ github.sha }} `
+            --title "Build ${{ github.run_number }} ($sha)" `
+            --notes "Automatic build of $sha. Pre-release only." `
+            --prerelease --latest=false
