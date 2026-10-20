@@ -1,6 +1,6 @@
 //! Every networked entity the server has seen, from the clients' clone creates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use crate::nodes::{self, Local, Sector};
@@ -30,6 +30,9 @@ impl Entity {
 #[derive(Default)]
 pub struct Registry {
     pub entities: BTreeMap<u16, Entity>,
+    /// Every object id ever created; a client that took an entity over re-creates it for the
+    /// others, so only a first create says who picked the id.
+    seen: BTreeSet<u16>,
     pub clone_syncs: u64,
     pub migrations: u64,
     /// Creates whose position layout decoded.
@@ -51,8 +54,9 @@ impl Registry {
                             if !self.entities.contains_key(&create.object_id) {
                                 // A block that isn't the sender's means an id the server didn't
                                 // give it, which can collide with another client's entity.
+                                let first = self.seen.insert(create.object_id);
                                 let outside = match crate::ids::client_of(create.object_id) {
-                                    Some(client) if client != from => " (outside its id block)",
+                                    Some(client) if first && client != from => " (outside its id block)",
                                     _ => "",
                                 };
                                 events.push(format!(
