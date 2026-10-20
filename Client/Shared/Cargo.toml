@@ -1,0 +1,12 @@
+[package]
+name = "Shared"
+description = "Types shared by the launcher (x64) and the in-game hooks DLL (x86)."
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ivmp_shared"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

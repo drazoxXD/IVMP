@@ -1,0 +1,22 @@
+[package]
+name = "Core"
+description = "Shared helpers for the 32-bit in-game crates: GTAIV.exe memory (scanning, patching) and the log file."
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ivmp_core"
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]
