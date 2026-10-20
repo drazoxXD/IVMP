@@ -1,0 +1,269 @@
+//! IVMP wire protocol between the client DLL and the server (UDP).
+//!
+//! The server is a lobby and a relay: it gives every client a virtual IPv4 address and forwards the
+//! game engine's own UDP packets (rage netSocket) between clients by those addresses. The engine
+//! never sees real addresses, so it treats every player as a LAN peer.
+//!
+//! Every datagram starts with [`MAGIC`] and a one-byte message tag; integers are little-endian.
+
+use std::net::Ipv4Addr;
+
+pub const MAGIC: [u8; 2] = *b"IV";
+/// Bump when the wire format changes; the server rejects other versions.
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const DEFAULT_PORT: u16 = 9999;
+/// The engine reads at most 0x400 bytes per packet.
+pub const MAX_GAME_PAYLOAD: usize = 0x400;
+/// Virtual addresses are `10.0.0.<client id>`.
+pub const VIRTUAL_NETWORK: [u8; 3] = [10, 0, 0];
+/// Clients send a keep-alive at least this often; the server drops them after [`TIMEOUT_SECS`].
+pub const KEEPALIVE_SECS: u64 = 2;
+pub const TIMEOUT_SECS: u64 = 10;
+/// Destination meaning "everyone else" (the engine's LAN broadcast).
+pub const BROADCAST: Ipv4Addr = Ipv4Addr::BROADCAST;
+
+pub type ClientId = u8;
+
+pub fn virtual_ip(id: ClientId) -> Ipv4Addr {
+    Ipv4Addr::new(VIRTUAL_NETWORK[0], VIRTUAL_NETWORK[1], VIRTUAL_NETWORK[2], id)
+}
+
+pub fn client_id_of(ip: Ipv4Addr) -> Option<ClientId> {
+    let o = ip.octets();
+    (o[..3] == VIRTUAL_NETWORK && o[3] != 0 && o[3] != 255).then_some(o[3])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientMessage {
+    Hello { version: u16, nickname: String },
+    /// A game packet from the local engine (`from_port` = its socket port) to a virtual address.
+    Tunnel { from_port: u16, to: Ipv4Addr, to_port: u16, payload: Vec<u8> },
+    KeepAlive,
+    Bye,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    VersionMismatch,
+    ServerFull,
+    BadNickname,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerMessage {
+    /// Accepted: your virtual address, and who hosts the engine session.
+    Welcome { id: ClientId, host: ClientId },
+    Reject(RejectReason),
+    PeerJoined { id: ClientId, nickname: String },
+    PeerLeft { id: ClientId },
+    HostChanged { host: ClientId },
+    /// A game packet from another client's engine, to hand to the local engine.
+    Tunnel { from: Ipv4Addr, from_port: u16, to_port: u16, payload: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    BadMagic,
+    UnknownTag(u8),
+    Truncated,
+    BadString,
+}
+
+// Tags. Client -> server 0x0_, server -> client 0x8_.
+const C_HELLO: u8 = 0x01;
+const C_TUNNEL: u8 = 0x02;
+const C_KEEPALIVE: u8 = 0x03;
+const C_BYE: u8 = 0x04;
+const S_WELCOME: u8 = 0x81;
+const S_REJECT: u8 = 0x82;
+const S_PEER_JOINED: u8 = 0x83;
+const S_PEER_LEFT: u8 = 0x84;
+const S_HOST_CHANGED: u8 = 0x85;
+const S_TUNNEL: u8 = 0x86;
+
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn new(tag: u8) -> Self {
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&MAGIC);
+        v.push(tag);
+        Writer(v)
+    }
+    fn u8(mut self, v: u8) -> Self {
+        self.0.push(v);
+        self
+    }
+    fn u16(mut self, v: u16) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    fn ip(mut self, v: Ipv4Addr) -> Self {
+        self.0.extend_from_slice(&v.octets());
+        self
+    }
+    fn str(self, s: &str) -> Self {
+        let bytes = &s.as_bytes()[..s.len().min(u8::MAX as usize)];
+        let mut w = self.u8(bytes.len() as u8);
+        w.0.extend_from_slice(bytes);
+        w
+    }
+    fn rest(mut self, bytes: &[u8]) -> Vec<u8> {
+        self.0.extend_from_slice(bytes);
+        self.0
+    }
+    fn done(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if self.0.len() < n {
+            return Err(DecodeError::Truncated);
+        }
+        let (head, tail) = self.0.split_at(n);
+        self.0 = tail;
+        Ok(head)
+    }
+    fn u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn ip(&mut self) -> Result<Ipv4Addr, DecodeError> {
+        let b = self.take(4)?;
+        Ok(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+    }
+    fn str(&mut self) -> Result<String, DecodeError> {
+        let len = self.u8()? as usize;
+        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| DecodeError::BadString)
+    }
+    fn rest(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0).to_vec()
+    }
+}
+
+fn header(bytes: &[u8]) -> Result<(u8, Reader<'_>), DecodeError> {
+    if bytes.len() < 3 {
+        return Err(DecodeError::Truncated);
+    }
+    if bytes[..2] != MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    Ok((bytes[2], Reader(&bytes[3..])))
+}
+
+impl ClientMessage {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            ClientMessage::Hello { version, nickname } => Writer::new(C_HELLO).u16(*version).str(nickname).done(),
+            ClientMessage::Tunnel { from_port, to, to_port, payload } => {
+                Writer::new(C_TUNNEL).u16(*from_port).ip(*to).u16(*to_port).rest(payload)
+            }
+            ClientMessage::KeepAlive => Writer::new(C_KEEPALIVE).done(),
+            ClientMessage::Bye => Writer::new(C_BYE).done(),
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (tag, mut r) = header(bytes)?;
+        Ok(match tag {
+            C_HELLO => ClientMessage::Hello { version: r.u16()?, nickname: r.str()? },
+            C_TUNNEL => ClientMessage::Tunnel { from_port: r.u16()?, to: r.ip()?, to_port: r.u16()?, payload: r.rest() },
+            C_KEEPALIVE => ClientMessage::KeepAlive,
+            C_BYE => ClientMessage::Bye,
+            other => return Err(DecodeError::UnknownTag(other)),
+        })
+    }
+}
+
+impl ServerMessage {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            ServerMessage::Welcome { id, host } => Writer::new(S_WELCOME).u8(*id).u8(*host).done(),
+            ServerMessage::Reject(reason) => Writer::new(S_REJECT)
+                .u8(match reason {
+                    RejectReason::VersionMismatch => 0,
+                    RejectReason::ServerFull => 1,
+                    RejectReason::BadNickname => 2,
+                })
+                .done(),
+            ServerMessage::PeerJoined { id, nickname } => Writer::new(S_PEER_JOINED).u8(*id).str(nickname).done(),
+            ServerMessage::PeerLeft { id } => Writer::new(S_PEER_LEFT).u8(*id).done(),
+            ServerMessage::HostChanged { host } => Writer::new(S_HOST_CHANGED).u8(*host).done(),
+            ServerMessage::Tunnel { from, from_port, to_port, payload } => {
+                Writer::new(S_TUNNEL).ip(*from).u16(*from_port).u16(*to_port).rest(payload)
+            }
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (tag, mut r) = header(bytes)?;
+        Ok(match tag {
+            S_WELCOME => ServerMessage::Welcome { id: r.u8()?, host: r.u8()? },
+            S_REJECT => ServerMessage::Reject(match r.u8()? {
+                0 => RejectReason::VersionMismatch,
+                1 => RejectReason::ServerFull,
+                _ => RejectReason::BadNickname,
+            }),
+            S_PEER_JOINED => ServerMessage::PeerJoined { id: r.u8()?, nickname: r.str()? },
+            S_PEER_LEFT => ServerMessage::PeerLeft { id: r.u8()? },
+            S_HOST_CHANGED => ServerMessage::HostChanged { host: r.u8()? },
+            S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
+            other => return Err(DecodeError::UnknownTag(other)),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_messages_round_trip() {
+        for m in [
+            ClientMessage::Hello { version: PROTOCOL_VERSION, nickname: "Niko".into() },
+            ClientMessage::Tunnel { from_port: 6672, to: virtual_ip(2), to_port: 6672, payload: vec![1, 2, 3] },
+            ClientMessage::Tunnel { from_port: 1, to: BROADCAST, to_port: 2, payload: vec![] },
+            ClientMessage::KeepAlive,
+            ClientMessage::Bye,
+        ] {
+            assert_eq!(ClientMessage::decode(&m.encode()), Ok(m));
+        }
+    }
+
+    #[test]
+    fn server_messages_round_trip() {
+        for m in [
+            ServerMessage::Welcome { id: 3, host: 1 },
+            ServerMessage::Reject(RejectReason::ServerFull),
+            ServerMessage::PeerJoined { id: 4, nickname: "Roman".into() },
+            ServerMessage::PeerLeft { id: 4 },
+            ServerMessage::HostChanged { host: 2 },
+            ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
+        ] {
+            assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));
+        }
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(ClientMessage::decode(b"XX\x01"), Err(DecodeError::BadMagic));
+        assert_eq!(ClientMessage::decode(b"IV"), Err(DecodeError::Truncated));
+        assert_eq!(ClientMessage::decode(b"IV\x7f"), Err(DecodeError::UnknownTag(0x7f)));
+        assert_eq!(ServerMessage::decode(b"IV\x81\x01"), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn virtual_addresses() {
+        assert_eq!(virtual_ip(7), Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(client_id_of(virtual_ip(7)), Some(7));
+        assert_eq!(client_id_of(Ipv4Addr::new(192, 168, 0, 7)), None);
+        assert_eq!(client_id_of(Ipv4Addr::new(10, 0, 0, 255)), None);
+    }
+}

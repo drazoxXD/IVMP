@@ -1,0 +1,14 @@
+[package]
+name = "NetProtocol"
+description = "IVMP wire protocol (lib) and the lobby + relay server (bin ivmp_server)."
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "NetProtocol"
+
+[[bin]]
+name = "ivmp_server"
+path = "src/main.rs"
+
+[dependencies]
