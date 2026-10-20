@@ -6,7 +6,7 @@ world to anyone who connects, and can own entities itself.
 
 ## Where we are (2026-10-20)
 
-* Every engine packet already passes through the server (`net.rs` tunnel, `ivmp_server` relay),
+* Every engine packet already passes through the server (`net.rs` tunnel, `Server` relay),
   but the server treats them as opaque bytes and just forwards them.
 * The engine's own clone sync (rage `netObjectMgr`, `CNetObj*`) works peer to peer between the
   clients: the first client hosts the session, the others join it.
@@ -58,7 +58,7 @@ checks on incoming sync (speed, teleport, ownership).
   payload was RC4 (0x6F1530) with a key from the nonce (key generator 0x6F1590, deterministic in
   IVMP) XOR a title key (0x6EB3E0 / 0x6EB440). IVMP clients now skip the RC4 calls
   (`Networking/src/crypt.rs`), so captures are plain.
-* `ivmp_server --capture file` records `u64 ms, u8 from, u8 to, u16 len, packet`.
+* `Server --capture file` records `u64 ms, u8 from, u8 to, u16 len, packet`.
 * First capture (46k packets): payload starts with a big-endian u16 total length, then a u16
   (frame header / sequence), then bit-packed frame data. Recurring `c9 19 14`, `c9 19 16`,
   `c9 19 18` look like message headers. Next: reverse the netConnection frame layout (sequence,
@@ -142,7 +142,7 @@ object id grant, was never sent, which is why joiners had no ids.
 
 ## Phase 1 result (2026-10-20)
 
-`Server/Sync` (`ivmp_sync`) decodes the traffic and `ivmp_server` keeps a live entity registry:
+`Server/Sync` (`ivmp_sync`) decodes the traffic and `Server` keeps a live entity registry:
 
 * Payload: big-endian u16 split, flags byte (bit 1 = first area compressed with the engine's
   LZSS, 0x670EB0, implemented in `packet::decompress`), two frame areas; frames have a 9-byte

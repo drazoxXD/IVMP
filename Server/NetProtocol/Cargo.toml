@@ -1,22 +1,10 @@
 [package]
 name = "NetProtocol"
-description = "IVMP wire protocol (lib) and the lobby + relay server (bin ivmp_server)."
+description = "IVMP wire protocol between the client DLL and the server."
 version = "0.1.0"
 edition = "2024"
 
 [lib]
 name = "NetProtocol"
 
-[[bin]]
-name = "ivmp_server"
-path = "src/main.rs"
-required-features = ["server"]
-
-# The server binary needs the sync decoder; clients only use the protocol (they build without
-# default features, which also avoids a clash with the client's own `Sync` crate).
-[features]
-default = ["server"]
-server = ["dep:Sync"]
-
 [dependencies]
-Sync = { path = "../Sync", optional = true }

@@ -1,0 +1,17 @@
+[package]
+name = "Server"
+description = "IVMP server (Server.exe): lobby, relay for the game's traffic and the entity registry."
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "Server"
+path = "src/main.rs"
+
+[dependencies]
+NetProtocol = { path = "NetProtocol" }
+Sync = { path = "Sync" }
+
+[workspace]
+members = [".", "NetProtocol", "Sync", "Auth", "Natives", "Scripting"]
+resolver = "3"

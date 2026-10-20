@@ -1,4 +1,4 @@
-//! Runs a server capture (`ivmp_server --capture file`) through the decoder:
+//! Runs a server capture (`Server --capture file`) through the decoder:
 //! `cargo run --example decode_capture -- capture.bin`.
 
 use ivmp_sync::registry::Registry;

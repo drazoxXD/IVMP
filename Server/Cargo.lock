@@ -3,9 +3,26 @@
 version = 4
 
 [[package]]
+name = "Auth"
+version = "0.1.0"
+
+[[package]]
+name = "Natives"
+version = "0.1.0"
+
+[[package]]
 name = "NetProtocol"
 version = "0.1.0"
+
+[[package]]
+name = "Scripting"
+version = "0.1.0"
+
+[[package]]
+name = "Server"
+version = "0.1.0"
 dependencies = [
+ "NetProtocol",
  "Sync",
 ]
 
