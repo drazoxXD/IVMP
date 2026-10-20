@@ -1,6 +1,10 @@
 [package]
 name = "Sync"
+description = "Server side of entity sync: decodes the game's own network messages (clone create / sync / remove) and keeps the entity registry."
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "ivmp_sync"
 
 [dependencies]

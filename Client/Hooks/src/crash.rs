@@ -32,6 +32,69 @@ pub fn install() {
     }
 }
 
+// --- Process exits -------------------------------------------------------------------------------
+// The game can also end itself (fatal error paths, `_exit`, TerminateProcess) without an
+// exception, and then nothing above is logged. Log who called ExitProcess / TerminateProcess.
+
+/// Import slots (Ghidra addresses).
+const EXIT_PROCESS_IMPORT: usize = 0x00E7_32F8;
+const TERMINATE_PROCESS_IMPORT: usize = 0x00E7_32E0;
+
+static ORIGINAL_EXIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORIGINAL_TERMINATE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Logs the game return addresses found on the stack above `esp`.
+fn log_stack(esp: usize, label: &str) {
+    let image = memory::game_image();
+    let base = image.as_ptr() as usize;
+    let mut found = 0;
+    for slot in 0..512 {
+        let at = esp + slot * 4;
+        if !readable(at, 4) {
+            break;
+        }
+        let value = unsafe { *(at as *const u32) } as usize;
+        if (base + 0x1000..base + 0xA73000).contains(&value) {
+            log!("{label}   [esp+{:#05x}] {}", slot * 4, describe(value));
+            found += 1;
+            if found == 24 {
+                break;
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn exit_process(code: u32) {
+    let marker = 0u32;
+    log!("exit: ExitProcess({code:#x}) called");
+    log_stack(&marker as *const u32 as usize, "exit:");
+    let original: unsafe extern "system" fn(u32) = unsafe { std::mem::transmute(ORIGINAL_EXIT.load(Ordering::SeqCst)) };
+    unsafe { original(code) }
+}
+
+unsafe extern "system" fn terminate_process(process: *mut c_void, code: u32) -> i32 {
+    let marker = 0u32;
+    log!("exit: TerminateProcess({process:p}, {code:#x}) called");
+    log_stack(&marker as *const u32 as usize, "exit:");
+    let original: unsafe extern "system" fn(*mut c_void, u32) -> i32 =
+        unsafe { std::mem::transmute(ORIGINAL_TERMINATE.load(Ordering::SeqCst)) };
+    unsafe { original(process, code) }
+}
+
+/// Hooks the game's exit imports. Call once the game code is unpacked.
+pub fn install_exit_logging() {
+    for (slot, hook, original) in [
+        (EXIT_PROCESS_IMPORT, exit_process as usize, &ORIGINAL_EXIT),
+        (TERMINATE_PROCESS_IMPORT, terminate_process as usize, &ORIGINAL_TERMINATE),
+    ] {
+        let slot = memory::from_ghidra(slot);
+        original.store(unsafe { std::ptr::read_unaligned(slot as *const usize) }, Ordering::SeqCst);
+        if let Err(e) = unsafe { memory::patch(slot, &(hook as u32).to_le_bytes()) } {
+            log!("exit: hook at {slot:#x} failed: {e}");
+        }
+    }
+}
+
 fn is_crash(code: NTSTATUS) -> bool {
     [
         EXCEPTION_ACCESS_VIOLATION,

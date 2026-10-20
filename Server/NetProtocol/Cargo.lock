@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "NetProtocol"
 version = "0.1.0"
+dependencies = [
+ "Sync",
+]
+
+[[package]]
+name = "Sync"
+version = "0.1.0"

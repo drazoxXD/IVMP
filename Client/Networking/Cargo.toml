@@ -11,7 +11,7 @@ name = "ivmp_networking"
 Core = { path = "../Core" }
 NativeInvoker = { path = "../NativeInvoker" }
 Shared = { path = "../Shared" }
-NetProtocol = { path = "../../Server/NetProtocol" }
+NetProtocol = { path = "../../Server/NetProtocol", default-features = false }
 
 [dependencies.windows]
 workspace = true

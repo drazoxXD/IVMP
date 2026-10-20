@@ -7,6 +7,12 @@
 //! so deactivation only reaches DefWindowProc. The procedure is decrypted at runtime, so we wait
 //! for its bytes to appear.
 //!
+//! Background slowdown: Windows throttles background processes (EcoQoS, and it ignores the
+//! game's 1 ms timer resolution for windows that aren't in front), and the game skips work
+//! while `IsIconic` says the window is minimised. A client that slows down while alt-tabbed
+//! falls out of sync, so both are switched off: power throttling is disabled for the process
+//! and `IsIconic` always answers "not minimised".
+//!
 //! Input still arrives while unfocused (the DirectInput devices read in the background), so the
 //! keyboard and mouse devices' GetDeviceState / GetDeviceData report nothing while another
 //! window has the focus.
@@ -51,8 +57,48 @@ pub fn wait_for_unpack() -> bool {
     false
 }
 
+/// `IsIconic` import slot (Ghidra address).
+const IS_ICONIC_IMPORT: usize = 0x00E7_33DC;
+
+unsafe extern "system" fn never_iconic(_window: windows::Win32::Foundation::HWND) -> i32 {
+    0
+}
+
+/// Keeps the game at full speed in the background.
+fn no_background_slowdown() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+        SetProcessInformation,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        // Take control of both, with neither enabled: no EcoQoS, keep our timer resolution.
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    let result = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const _ as *const c_void,
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    match result {
+        Ok(()) => log!("focus: background power throttling off"),
+        Err(e) => log!("focus: could not turn off power throttling: {e}"),
+    }
+    let slot = memory::from_ghidra(IS_ICONIC_IMPORT);
+    match unsafe { memory::patch(slot, &(never_iconic as usize as u32).to_le_bytes()) } {
+        Ok(()) => log!("focus: the game never sees itself as minimised"),
+        Err(e) => log!("focus: IsIconic hook failed: {e}"),
+    }
+}
+
 /// Patches the window procedure. Call after [`wait_for_unpack`].
 pub fn install() {
+    no_background_slowdown();
     let site = memory::from_ghidra(WNDPROC_SITE) + 6;
     let mut current = [0u8; 1];
     if !memory::read(site, &mut current) || current[0] != 0x74 {

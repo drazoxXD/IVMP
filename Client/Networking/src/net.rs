@@ -50,6 +50,8 @@ static CONNECTION: OnceLock<Connection> = OnceLock::new();
 /// Our client id once welcomed (0 = not yet).
 static OUR_ID: AtomicU8 = AtomicU8::new(0);
 static HOST_ID: AtomicU8 = AtomicU8::new(0);
+/// Our network object id block from the server: first << 16 | count (0 = not given yet).
+static OBJECT_IDS: AtomicU32 = AtomicU32::new(0);
 static ORIGINAL_SEND: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_RECEIVE: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_SENDTO: AtomicUsize = AtomicUsize::new(0);
@@ -69,6 +71,12 @@ pub fn our_id() -> Option<u8> {
 
 pub fn host_id() -> Option<u8> {
     Some(HOST_ID.load(Ordering::SeqCst)).filter(|id| *id != 0)
+}
+
+/// The network object ids the server gave us: `first..first + count`.
+pub fn object_ids() -> Option<(u16, u16)> {
+    let ids = OBJECT_IDS.load(Ordering::SeqCst);
+    (ids != 0).then_some(((ids >> 16) as u16, ids as u16))
 }
 
 pub fn is_host() -> bool {
@@ -122,6 +130,12 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 OUR_ID.store(id, Ordering::SeqCst);
                 HOST_ID.store(host, Ordering::SeqCst);
+            }
+            Ok(ServerMessage::ObjectIds { first, count }) => {
+                if object_ids().is_none() {
+                    log!("net: server gave us object ids {first}..{}", first + count);
+                }
+                OBJECT_IDS.store((first as u32) << 16 | count as u32, Ordering::SeqCst);
             }
             Ok(ServerMessage::Reject(reason)) => {
                 log!("net: server rejected us: {reason:?}");

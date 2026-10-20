@@ -29,6 +29,7 @@ const TELL_NET_PLAYER_TO_START_PLAYING: u32 = 0x465D424D;
 const NETWORK_START_SESSION: u32 = 0x5880_2CE5;
 /// Network state machine value (0x17F5EA4) for "in the lobby".
 const NETWORK_STATE_LOBBY: u32 = 8;
+const NETWORK_STATE_IN_GAME: u32 = 10;
 
 /// Free Mode, any ranked, any episode.
 const FIND_ARGS: [u32; 4] = [16, 0, 0, 0];
@@ -68,9 +69,12 @@ struct HostSystem {
     frames: u32,
     /// NETWORK_START_SESSION already called.
     started: bool,
+    /// Network state when the server's object ids were last put in the engine's ring (0 = not
+    /// yet).
+    ids_given: u32,
 }
 
-static SYSTEM: Mutex<HostSystem> = Mutex::new(HostSystem { state: State::Idle, attempts: 0, wait_frames: 0, told: 0, frames: 0, started: false });
+static SYSTEM: Mutex<HostSystem> = Mutex::new(HostSystem { state: State::Idle, attempts: 0, wait_frames: 0, told: 0, frames: 0, started: false, ids_given: 0 });
 
 impl HostSystem {
     fn set(&mut self, state: State) {
@@ -171,10 +175,22 @@ impl HostSystem {
                 if self.frames % 300 == 1 {
                     log_players();
                 }
-                // Joiner only: no object ids from the host after a while -> take our own block.
-                if self.state == State::Joined && self.frames == 300 && object_id_count() == 0 {
-                    if let Some(id) = net::our_id() {
-                        give_object_ids(id);
+                // Network object ids come from the server, host and joiner alike: the host's
+                // grant never reaches joiners, and the host's own ids would collide with theirs.
+                // Taken straight away (waiting let the game spawn people and cars it couldn't
+                // network), and again once the game is running if starting the session emptied
+                // them (it does on the joiner).
+                // Refilling a ring that still has ids would hand out ids already in use.
+                let in_game = network_state == NETWORK_STATE_IN_GAME;
+                if in_game && self.ids_given != 0 && self.ids_given != NETWORK_STATE_IN_GAME && object_id_count() != 0 {
+                    self.ids_given = NETWORK_STATE_IN_GAME;
+                }
+                if self.ids_given == 0 || (in_game && self.ids_given != NETWORK_STATE_IN_GAME) {
+                    if let Some((first, count)) = net::object_ids() {
+                        use_object_ids(first, count);
+                        self.ids_given = network_state.max(1);
+                    } else if self.frames % 300 == 1 {
+                        log!("host: no object ids from the server yet");
                     }
                 }
                 if natives::invoke_bool(LOCAL_PLAYER_READY_TO_START, &[]) {
@@ -343,13 +359,13 @@ fn log_players() {
 /// Network object ids this machine may use: a ring of i16 (0x1900 entries at 0x19360C8) with
 /// write position 0x19392C8, read position 0x19392CC and count 0x19392D0. The joining copy
 /// should get a block from the host (message read by 0x4A5EB0) but receives none, so its
-/// player never becomes a network object. Until that's fixed, a joiner gives itself a block
-/// that can't clash with the host's: 100 ids starting at 4000 + 1000 * client id.
+/// player never becomes a network object. Every client (host too) uses the block the server
+/// gave it instead (`ivmp_sync::ids`), so no two engines create entities with the same id.
 const OBJECT_ID_RING: usize = 0x0193_60C8;
 const OBJECT_ID_WRITE: usize = 0x0193_92C8;
+const OBJECT_ID_READ: usize = 0x0193_92CC;
 const OBJECT_ID_COUNT: usize = 0x0193_92D0;
 const OBJECT_ID_RING_LEN: u32 = 0x1900;
-const OBJECT_IDS_PER_CLIENT: u32 = 100;
 
 fn object_id_count() -> u32 {
     unsafe { *(crate::memory::from_ghidra(OBJECT_ID_COUNT) as *const u32) }
@@ -364,18 +380,23 @@ fn first_object_ids() -> Vec<i16> {
     }
 }
 
-fn give_object_ids(id: u8) {
+/// Replaces the engine's free object ids with the server's block `first..first + count`.
+fn use_object_ids(first: u16, count: u16) {
     unsafe {
         let ring = crate::memory::from_ghidra(OBJECT_ID_RING) as *mut i16;
         let write = crate::memory::from_ghidra(OBJECT_ID_WRITE) as *mut u32;
-        let count = crate::memory::from_ghidra(OBJECT_ID_COUNT) as *mut u32;
-        let first = 4000 + id as u32 * 1000;
-        for object_id in first..first + OBJECT_IDS_PER_CLIENT {
+        let read = crate::memory::from_ghidra(OBJECT_ID_READ) as *const u32;
+        let free = crate::memory::from_ghidra(OBJECT_ID_COUNT) as *mut u32;
+        let dropped = *free;
+        // Empty ring (write == read), then push the block.
+        *write = *read;
+        *free = 0;
+        for object_id in first..first + count.min(OBJECT_ID_RING_LEN as u16) {
             *write = (*write + 1) % OBJECT_ID_RING_LEN;
             *ring.add(*write as usize) = object_id as i16;
-            *count += 1;
+            *free += 1;
         }
-        log!("host: gave ourselves network object ids {first}..{}", first + OBJECT_IDS_PER_CLIENT);
+        log!("host: using the server's object ids {first}..{} (dropped {dropped} engine ids)", first + count);
     }
 }
 

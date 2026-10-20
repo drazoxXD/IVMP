@@ -10,5 +10,13 @@ name = "NetProtocol"
 [[bin]]
 name = "ivmp_server"
 path = "src/main.rs"
+required-features = ["server"]
+
+# The server binary needs the sync decoder; clients only use the protocol (they build without
+# default features, which also avoids a clash with the client's own `Sync` crate).
+[features]
+default = ["server"]
+server = ["dep:Sync"]
 
 [dependencies]
+Sync = { path = "../Sync", optional = true }

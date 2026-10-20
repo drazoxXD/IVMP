@@ -14,6 +14,7 @@ mod enginelog;
 mod events;
 mod focus;
 mod hang;
+mod mods;
 
 pub(crate) use ivmp_core::{log, memory};
 use ivmp_natives::nativelog;
@@ -74,6 +75,12 @@ fn on_attach() {
             log!("game code never finished unpacking, no patches applied");
             return;
         }
+        // Mods first, so FusionFix and the file overlay are in before the game loads its data.
+        // The second client (-cl2) runs without mods.
+        if !instance::second_client() {
+            mods::install(dll_dir());
+        }
+        crash::install_exit_logging();
         focus::install();
         // Let another copy of the game start next to this one.
         instance::release_single_instance_mutex();
@@ -91,6 +98,8 @@ fn on_attach() {
             instance::install_bind_hook();
             ivmp_networking::jointrace::install();
             ivmp_networking::jointrace::install_clone_trace();
+            ivmp_networking::netobjects::install();
+            ivmp_networking::crypt::install();
             net::start(&config.server, &config.nickname);
         }
     });

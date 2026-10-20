@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -57,6 +57,9 @@ pub enum ServerMessage {
     PeerJoined { id: ClientId, nickname: String },
     PeerLeft { id: ClientId },
     HostChanged { host: ClientId },
+    /// The network object ids this client's engine may use: `first..first + count`. The server
+    /// gives every client its own block, so entities never collide (docs/onesync-plan.md).
+    ObjectIds { first: u16, count: u16 },
     /// A game packet from another client's engine, to hand to the local engine.
     Tunnel { from: Ipv4Addr, from_port: u16, to_port: u16, payload: Vec<u8> },
 }
@@ -80,6 +83,7 @@ const S_PEER_JOINED: u8 = 0x83;
 const S_PEER_LEFT: u8 = 0x84;
 const S_HOST_CHANGED: u8 = 0x85;
 const S_TUNNEL: u8 = 0x86;
+const S_OBJECT_IDS: u8 = 0x87;
 
 struct Writer(Vec<u8>);
 
@@ -196,6 +200,7 @@ impl ServerMessage {
             ServerMessage::PeerJoined { id, nickname } => Writer::new(S_PEER_JOINED).u8(*id).str(nickname).done(),
             ServerMessage::PeerLeft { id } => Writer::new(S_PEER_LEFT).u8(*id).done(),
             ServerMessage::HostChanged { host } => Writer::new(S_HOST_CHANGED).u8(*host).done(),
+            ServerMessage::ObjectIds { first, count } => Writer::new(S_OBJECT_IDS).u16(*first).u16(*count).done(),
             ServerMessage::Tunnel { from, from_port, to_port, payload } => {
                 Writer::new(S_TUNNEL).ip(*from).u16(*from_port).u16(*to_port).rest(payload)
             }
@@ -214,6 +219,7 @@ impl ServerMessage {
             S_PEER_JOINED => ServerMessage::PeerJoined { id: r.u8()?, nickname: r.str()? },
             S_PEER_LEFT => ServerMessage::PeerLeft { id: r.u8()? },
             S_HOST_CHANGED => ServerMessage::HostChanged { host: r.u8()? },
+            S_OBJECT_IDS => ServerMessage::ObjectIds { first: r.u16()?, count: r.u16()? },
             S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
             other => return Err(DecodeError::UnknownTag(other)),
         })
