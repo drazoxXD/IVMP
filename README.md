@@ -1,9 +1,18 @@
 ![](https://raw.githubusercontent.com/drazoxXD/IVMP/a4180cf9466a1b8862f157d2d35b2ad8afbd5687/.github/media/banner.svg)
-## IVMP
+## 
 Based on the works of [LibertyM](https://github.com/citizenfx/fivem) and [IV-Network](https://github.com/GTA-Network/IV-Network).\
-This client is made only for the Steam version of the game and it won't work with any other version.\
-The client has Full Ped,Vehicle sync wich is not perfect but it works.\
-Currently can host the original game modes with no problems, my plan is to have the same features as fivem but for GTA-IV.
+
+**Supported version:**
+- Complete Edition ([Steam](https://store.steampowered.com/app/12210/Grand_Theft_Auto_IV_The_Complete_Edition/) for now, and later Rockstar Launcher)
+
+Currently:
+- Plays every gamemode witha fake P2P session.
+- Freemode like FiveM and GTA Connected
+- Host handle the game as a LAN, my client onyl handles the connection.
+
+Later:
+- Full scripting
+- Server sided host no P2P
 
 ## Images
 <img width="3305" height="1082" alt="image" src="https://github.com/user-attachments/assets/7feb68ba-ef02-49a9-ab6c-7f3fac7a2a25" />
