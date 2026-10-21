@@ -20,6 +20,9 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(300);
 /// If the game exits this soon after injection, assume a launcher restarted it and wait again.
 const RELAUNCH_WINDOW: Duration = Duration::from_secs(20);
 const MAX_RELAUNCHES: u32 = 3;
+/// The Rockstar Games Launcher's first start of the game sometimes quits at once (exit code
+/// 0xC0E90002); Retry in that launcher starts it again, so we wait for the next one.
+const MAX_FAILED_STARTS: u32 = 5;
 
 pub enum Event {
     Log(String),
@@ -88,6 +91,7 @@ fn session(dll_path: &PathBuf, second_client: Option<String>, send: &dyn Fn(Even
     }
 
     let mut relaunches = 0;
+    let mut failed_starts = 0;
     loop {
         status("Waiting for the game to start...");
         let pid = match second_pid {
@@ -100,7 +104,15 @@ fn session(dll_path: &PathBuf, second_client: Option<String>, send: &dyn Fn(Even
         // protection crashes at random (0x824B16AD) if the process is read or injected while it
         // is still unpacking. The window only exists once the unpacked game code runs.
         status("Waiting for the game window...");
-        wait_for_window(pid, LAUNCH_TIMEOUT)?;
+        if !wait_for_window(pid, LAUNCH_TIMEOUT)? {
+            failed_starts += 1;
+            if second_pid.is_some() || failed_starts > MAX_FAILED_STARTS {
+                return Err(format!("{GAME_EXE} exited before opening its window."));
+            }
+            log(format!("{GAME_EXE} quit while starting; press Retry in the Rockstar Games Launcher"));
+            status("Game quit while starting: press Retry in the Rockstar Games Launcher");
+            continue;
+        }
         log("Game window is up".into());
 
         let game = inject::open_game(pid)?;
@@ -134,8 +146,9 @@ fn session(dll_path: &PathBuf, second_client: Option<String>, send: &dyn Fn(Even
     }
 }
 
-/// Waits until `pid` owns a top-level window. Uses only window APIs, never opens the process.
-fn wait_for_window(pid: u32, timeout: Duration) -> inject::Result<()> {
+/// Waits until `pid` owns a top-level window: `true`, or `false` if it exited first. Uses only
+/// window APIs, never opens the process.
+fn wait_for_window(pid: u32, timeout: Duration) -> inject::Result<bool> {
     unsafe extern "system" fn check(window: HWND, found: LPARAM) -> BOOL {
         let (pid, found) = unsafe { &mut *(found.0 as *mut (u32, bool)) };
         let mut owner = 0u32;
@@ -153,10 +166,10 @@ fn wait_for_window(pid: u32, timeout: Duration) -> inject::Result<()> {
             let _ = EnumWindows(Some(check), LPARAM(&mut state as *mut _ as isize));
         }
         if state.1 {
-            return Ok(());
+            return Ok(true);
         }
         if !crate::process::find_processes(GAME_EXE).contains(&pid) {
-            return Err(format!("{GAME_EXE} exited before opening its window."));
+            return Ok(false);
         }
         if start.elapsed() > timeout {
             return Err("The game window did not appear.".into());
