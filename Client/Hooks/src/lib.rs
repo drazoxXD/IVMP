@@ -15,6 +15,7 @@ mod events;
 mod focus;
 mod hang;
 mod mods;
+mod window;
 
 pub(crate) use ivmp_core::{log, memory};
 use ivmp_natives::nativelog;
@@ -68,6 +69,9 @@ fn on_attach() {
     if instance::second_client() {
         log!("running as the second client ({})", ivmp_shared::SECOND_CLIENT_ARG);
     }
+    log!("build: {}", window::title());
+    // Only Win32 window calls: no need to wait for the game code to unpack.
+    window::install();
     // We are injected while the copy protection may still be unpacking the game. Scanning or
     // patching during that killed the game at random, so wait until it is done, off the loader lock.
     std::thread::spawn(|| {

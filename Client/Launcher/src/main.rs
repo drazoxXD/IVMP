@@ -4,7 +4,8 @@
 //! copy of GTA IV: Complete Edition, wait for GTAIV.exe and inject
 //! `IVMP_Client.dll` (x86), which takes over the boot and loads straight into online.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// No console window, debug builds too: the launcher reports through its own window.
+#![windows_subsystem = "windows"]
 
 mod game;
 mod inject;
@@ -51,21 +52,17 @@ pub struct Launcher {
     #[nwg_layout_item(layout: grid, row: 1, col: 1, col_span: 3)]
     server: nwg::TextInput,
 
-    #[nwg_control(text: "Load straight into online (skip story mode)")]
-    #[nwg_layout_item(layout: grid, row: 2, col: 0, col_span: 4)]
-    direct_online: nwg::CheckBox,
-
     #[nwg_control(text: "Play")]
-    #[nwg_layout_item(layout: grid, row: 3, col: 3)]
+    #[nwg_layout_item(layout: grid, row: 2, col: 3)]
     #[nwg_events(OnButtonClick: [Launcher::on_play])]
     play: nwg::Button,
 
     #[nwg_control(text: "Ready")]
-    #[nwg_layout_item(layout: grid, row: 3, col: 0, col_span: 3)]
+    #[nwg_layout_item(layout: grid, row: 2, col: 0, col_span: 3)]
     status: nwg::Label,
 
     #[nwg_control]
-    #[nwg_layout_item(layout: grid, row: 4, col: 0, col_span: 4, row_span: 5)]
+    #[nwg_layout_item(layout: grid, row: 3, col: 0, col_span: 4, row_span: 6)]
     log: nwg::ListBox<String>,
 
     #[nwg_control]
@@ -84,11 +81,6 @@ impl Launcher {
         let config = LaunchConfig::load(&exe_dir(), second_client());
         self.nickname.set_text(&config.nickname);
         self.server.set_text(&config.server);
-        self.direct_online.set_check_state(if config.direct_online {
-            nwg::CheckBoxState::Checked
-        } else {
-            nwg::CheckBoxState::Unchecked
-        });
     }
 
     fn on_play(&self) {
@@ -100,7 +92,8 @@ impl Launcher {
         let config = LaunchConfig {
             nickname,
             server: self.server.text().trim().to_string(),
-            direct_online: self.direct_online.check_state() == nwg::CheckBoxState::Checked,
+            // IVMP always boots straight into online (no option for the story mode boot).
+            direct_online: true,
             // Keep settings the launcher has no UI for.
             ..LaunchConfig::load(&exe_dir(), second_client())
         };

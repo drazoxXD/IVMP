@@ -1,14 +1,14 @@
 ![](https://raw.githubusercontent.com/drazoxXD/IVMP/a4180cf9466a1b8862f157d2d35b2ad8afbd5687/.github/media/banner.svg)
 ## 
-Based on the works of [LibertyM](https://github.com/citizenfx/fivem) and [IV-Network](https://github.com/GTA-Network/IV-Network).\
+Based on the works of [LibertyM](https://github.com/citizenfx/fivem) and [IV-Network](https://github.com/GTA-Network/IV-Network).
 
 **Supported version:**
 - Complete Edition ([Steam](https://store.steampowered.com/app/12210/Grand_Theft_Auto_IV_The_Complete_Edition/) for now, and later Rockstar Launcher)
 
 Currently:
-- Plays every gamemode witha fake P2P session.
+- Plays every gamemode with a fake P2P session.
 - Freemode like FiveM and GTA Connected
-- Host handle the game as a LAN, my client onyl handles the connection.
+- The host handles the game as a LAN, my client only handles the connection.
 
 Later:
 - Full scripting
