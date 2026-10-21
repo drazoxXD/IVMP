@@ -97,6 +97,7 @@ fn on_attach() {
             peer::install();
             instance::install_bind_hook();
             ivmp_networking::jointrace::install();
+            ivmp_networking::jointrace::install_add_gamer_trace();
             ivmp_networking::jointrace::install_clone_trace();
             ivmp_networking::netobjects::install();
             ivmp_networking::crypt::install();

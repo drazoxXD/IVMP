@@ -393,10 +393,17 @@ extern "C" fn spawn_player_after_load(after_save_load: u32) {
 const CREATE_PLAYER_INDEX_SITE: usize = 0x00BB_53FE;
 const CREATE_PLAYER_INDEX_ORIGINAL: [u8; 9] = [0xE8, 0x4D, 0x9C, 0xD8, 0xFF, 0x85, 0xC0, 0x75, 0x1A];
 
+/// The client id the IVMP server uses when it hosts the session itself (`Server --host`).
+const SERVER_HOST_ID: u8 = 254;
+
 /// Our physical player index. The host (first client) is 0. The host hands joiners free slots
 /// from the top (the first joiner became 31 on the host), and a joiner's own player must use
 /// the slot the host gave it, so client 2 -> 31, client 3 -> 30, ...
+/// When the IVMP server hosts (host id 254), it is slot 0 and gives client `id` slot `32 - id`.
 fn player_slot() -> u8 {
+    if ivmp_networking::net::host_id() == Some(SERVER_HOST_ID) {
+        return ivmp_networking::net::our_id().map_or(0, |id| 32u8.saturating_sub(id).max(1));
+    }
     match ivmp_networking::net::our_id() {
         None | Some(0) | Some(1) => 0,
         Some(id) => 33u8.saturating_sub(id).max(1),

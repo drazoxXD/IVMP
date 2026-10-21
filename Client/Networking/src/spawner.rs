@@ -14,6 +14,9 @@
 //! * CPedFactoryNY (instance at 0x166D9F4) slot 5, 0x5C3770: (pop type, model, matrix,
 //!   networked, mission)
 //! * add to the world 0x93E2D0 (entity, false)
+//! * despawn: network object by id 0x4913C0 on the object manager at 0x1908EF0, its entity at
+//!   +4, then the factory's destroy (vehicles slot 2 0xB59180, peds slot 6 0xB58EA0), which also
+//!   unregisters it so the other players remove their copies
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -42,6 +45,14 @@ const NET_OBJECT_ID: usize = 0xC;
 const LOAD_TIMEOUT_FRAMES: u32 = 600;
 /// How long our networked player must exist before we spawn anything.
 const READY_AFTER: Duration = Duration::from_secs(5);
+const NET_OBJECT_MANAGER: usize = 0x0190_8EF0;
+const NET_OBJECT_BY_ID: usize = 0x0049_13C0;
+/// Network object +4 = its entity; +0xE = non-zero for a clone (someone else owns it).
+const NET_OBJECT_ENTITY: usize = 0x4;
+const NET_OBJECT_IS_CLONE: usize = 0xE;
+const VEHICLE_FACTORY_DESTROY_SLOT: usize = 2;
+const PED_FACTORY_DESTROY_SLOT: usize = 6;
+
 /// Current viewport: index at 0x118D818, viewport pointers right after it (slot `i` at
 /// 0x118D818 + 4 * i). The vehicle factory ends with an on-screen check (0xA31B10 -> 0x431E40)
 /// on the current viewport, which is empty (slot 2, null) when our code runs, and crashed.
@@ -67,6 +78,7 @@ struct Pending {
 }
 
 static QUEUE: Mutex<VecDeque<Request>> = Mutex::new(VecDeque::new());
+static DESPAWNS: Mutex<Vec<(SpawnKind, u16)>> = Mutex::new(Vec::new());
 static LOADING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 /// Requests we created, with the object id, so a repeated request isn't created twice.
 static CREATED: Mutex<Option<HashMap<u32, u16>>> = Mutex::new(None);
@@ -113,6 +125,12 @@ pub fn request(request: Request) {
     QUEUE.lock().unwrap().push_back(request);
 }
 
+/// Queues a delete from the server (any thread); done by [`tick`].
+pub fn despawn(kind: SpawnKind, object_id: u16) {
+    log!("spawner: server asks to delete {kind:?} object {object_id}");
+    DESPAWNS.lock().unwrap().push((kind, object_id));
+}
+
 /// Game thread, every frame once we are in the session.
 pub fn tick() {
     {
@@ -123,6 +141,13 @@ pub fn tick() {
         }
         if ready.get_or_insert_with(Instant::now).elapsed() < READY_AFTER {
             return;
+        }
+    }
+    let despawns: Vec<(SpawnKind, u16)> = DESPAWNS.lock().unwrap().drain(..).collect();
+    for (kind, object_id) in despawns {
+        unsafe { delete(kind, object_id) };
+        if let Some(created) = CREATED.lock().unwrap().as_mut() {
+            created.retain(|_, id| *id != object_id);
         }
     }
     let new: Vec<Request> = QUEUE.lock().unwrap().drain(..).collect();
@@ -197,6 +222,33 @@ fn matrix(position: [f32; 3], heading_degrees: f32) -> [f32; 16] {
 /// Virtual method `slot` of the object at `this`.
 unsafe fn method(this: usize, slot: usize) -> usize {
     unsafe { *((*(this as *const usize)) as *const usize).add(slot) }
+}
+
+/// Deletes our entity with network object id `object_id`.
+unsafe fn delete(kind: SpawnKind, object_id: u16) {
+    unsafe {
+        let by_id: extern "thiscall" fn(usize, u32, u32) -> usize =
+            std::mem::transmute(memory::from_ghidra(NET_OBJECT_BY_ID));
+        let net_object = by_id(memory::from_ghidra(NET_OBJECT_MANAGER), object_id as u32, 0);
+        if net_object == 0 {
+            return log!("spawner: no object {object_id} to delete");
+        }
+        if *((net_object + NET_OBJECT_IS_CLONE) as *const u8) != 0 {
+            return log!("spawner: object {object_id} belongs to someone else, not deleting");
+        }
+        let entity = *((net_object + NET_OBJECT_ENTITY) as *const usize);
+        if entity == 0 {
+            return log!("spawner: object {object_id} has no entity");
+        }
+        let (factory, slot) = match kind {
+            SpawnKind::Vehicle => (VEHICLE_FACTORY, VEHICLE_FACTORY_DESTROY_SLOT),
+            SpawnKind::Ped => (PED_FACTORY, PED_FACTORY_DESTROY_SLOT),
+        };
+        let factory = *(memory::from_ghidra(factory) as *const usize);
+        let destroy: extern "thiscall" fn(usize, usize) = std::mem::transmute(method(factory, slot));
+        destroy(factory, entity);
+        log!("spawner: deleted {kind:?} object {object_id}");
+    }
 }
 
 /// Points the current viewport at one that exists while `f` runs (see [`VIEWPORTS`]).

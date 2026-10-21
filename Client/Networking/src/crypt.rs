@@ -6,12 +6,18 @@
 //! (thiscall `rc4(state, data, len)`, 0x6F1530). Pointing just those two calls at a no-op leaves
 //! the payload unencrypted; the MAC stays and still matches, since both sides now see the same
 //! bytes. Every client must run this, or packets between them are garbage.
+//!
+//! The receiver also stops checking the MAC (the `jnz` after the compare at 0x6D258C), so the
+//! IVMP server can send packets as the session host without the engine's key material.
 
 use crate::{log, memory};
 
 const ENCRYPT_CALL: usize = 0x006D_2200;
 const DECRYPT_CALL: usize = 0x006D_25B6;
 const RC4: usize = 0x006F_1530;
+/// `cmp eax, [ecx]; jnz reject` on the received MAC.
+const MAC_CHECK: usize = 0x006D_258C;
+const MAC_CHECK_BYTES: [u8; 4] = [0x3B, 0x01, 0x75, 0x54];
 
 /// thiscall with two stack arguments: return and pop them.
 #[unsafe(naked)]
@@ -33,5 +39,13 @@ pub fn install() {
             Ok(_) => log!("crypt: packet {name} off"),
             Err(e) => log!("crypt: packet {name} patch failed: {e}"),
         }
+    }
+    let site = memory::from_ghidra(MAC_CHECK);
+    if unsafe { std::slice::from_raw_parts(site as *const u8, 4) } != MAC_CHECK_BYTES {
+        return log!("crypt: MAC check not found at {site:#x}");
+    }
+    match unsafe { memory::patch(site + 2, &[0x90, 0x90]) } {
+        Ok(()) => log!("crypt: MAC check off"),
+        Err(e) => log!("crypt: MAC check patch failed: {e}"),
     }
 }

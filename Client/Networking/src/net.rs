@@ -160,6 +160,7 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             Ok(ServerMessage::Spawn { request, kind, model, position, heading }) => {
                 crate::spawner::request(crate::spawner::Request { id: request, kind, model, position, heading });
             }
+            Ok(ServerMessage::Despawn { kind, object_id }) => crate::spawner::despawn(kind, object_id),
             Err(e) => log!("net: bad packet from server: {e:?}"),
         }
     }
