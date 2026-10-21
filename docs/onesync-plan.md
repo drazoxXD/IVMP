@@ -310,3 +310,215 @@ time, host time). Clients skip the packet MAC check (crypt.rs).
 * The DLL (14:52 build) traces each field read of the block (`jointrace.rs`, "gamer block: ..."
   lines). Next test: `Server.exe --host --capture host10.bin`, two clients, then read which field
   returns 0 for the intro.
+
+## Server settings (2026-10-21)
+
+`server.cfg` next to `Server.exe` (written with defaults on first start; the command line still
+overrides): `bind`, `host = 0|1` (1 = the server is the session host; 0 = peer, the default since 2026-10-21,
+to peer with the first player hosting, the server only relays), `gamemode` (16 = Free Mode; negative = IVMP's own modes, -2 = scripted
+IVMP freeroam, the default; 16 = GTA IV's own online Free Mode. IVMP modes run on a Free Mode session underneath), `slots`, `capture`. The server sends `ServerMessage::GameSettings`
+(protocol 5) after the welcome; clients host and find games with that mode and slots
+(`net::game_settings`, hostsys NETWORK_HOST_GAME / NETWORK_FIND_GAME, the lobby host override
+and the stored network game config). The server host itself only replays Free Mode templates.
+
+Two players with the server host: the AddGamer's app data was wrong. The gamer block is session
+part, gamer info, peer address, a field, then app data (10-bit byte length + bytes) and a 6-bit
+gamer count; in a join request the app data is the CMsgJoinRequest, in AddGamer the player's
+CMsgPeerData (18 bytes). host10's trace showed the read stopping right after the app data length.
+The server now builds AddGamer as: prefix of the player's join block, length 18, its peer data,
+count 0 (the host's own AddGamer has the same shape). Untested.
+
+### host11 (2026-10-21): two players work through the server host
+
+The AddGamer fix worked: both games connect to each other (about 10,000 packets between them),
+see each other and sync cars and peds; the server registry saw 93 entities. Problems seen:
+driving another player's car doesn't move it for others, and both games spawn ambient traffic and
+peds in the same spots (stacked cars, explosions).
+
+* The games treat the server as a player and send it clone creates (330), syncs (459) and wait
+  for confirmation; entities only change owner once every player has them. The server now
+  confirms: CMsgPackedReliables section 1 (create acks) and 3 (remove acks), items 14-bit object
+  id + 3-bit result (0 = ok, 1 = refused; reader 0x497F40 / 0x498310, handler 0x498930), reliable
+  on ch7; CMsgPackedCloneSyncAcks (0x8B) per clone sync: 16-bit sequence, 8 bits 0, 1 bit 1
+  (reader 0x49A1A0), unreliable on ch7. Untested.
+* The games also send the host netComplaintMsg (0x55, 81 times on ch13), complaints about a peer
+  that a host would act on (kick). The server ignores them for now.
+* Population: next, the server picks one game per area to spawn ambient traffic and peds.
+
+### Players leaving (2026-10-21)
+
+When a client leaves or times out, the server sends every other joined client
+snMsgRemoveGamersFromSessionCmd (0x53, reliable on ch13, with the session envelope): session id
+(2 x u32), 6-bit gamer count (<= 32), per gamer its 8-byte gamer handle (two u32), then a 16-bit
+reason (sign bit + 15 bits; 0). Writer 0x627060, reader 0x6271A0, validation 0x623EE0 (state 2..3,
+session id == +0x540/+0x544), applied by 0x622360 (sender must be the host; looks each gamer up
+with 0x622D90, the local gamer -> snEventRemovedFromSession, others -> snDropGamersTask).
+The handle is taken from the leaver's gamer block: session id (64 bits), one set bit, then the
+gamer info, which starts with the handle (bits 65..129; on host11 client 1's is DrazoxXD_HUN's
+`441a7b8ee505d6c6`). Untested in game.
+
+### Complaints and chunk sequencing (2026-10-21)
+
+netComplaintMsg (0x55, unreliable, ch13; writer 0x6D7D30, reader 0x6D7DE0): complainer peer id
+(2 x u32), u32 count (<= 64), the peer ids complained about (2 x u32 each). The complaint manager
+(globals 0x1980CA0..0x1981920): 0x6D6D80 adds a peer to the list (0x19814F0, count 0x19816F0)
+and sends it to the host at once (0x6D73D0), 0x6D6E40 removes one, 0x6D6F20 updates (a member
+resends its list to the host every interval via 0x6D7440; a host processes the list, 0x6D74C0,
+and its handler 0x6D70F0 pairs complainer and complainee). The only caller of the add is the
+connection event handler 0x47E2B0 on **netEventConnectionError** (event type 4; rage event ids:
+0 Requested, 1 Established, 2 Reassigned, 3 RelayAddressChanged, 4 Error, 5 Closed,
+6 FrameReceived, 7 AckReceived, 8 BandwidthExceeded, 9 OutOfMemory).
+
+host11: all 81 complaints are client 1 about peer 57001221:b8244948, the server host itself, once a
+second from 340 s to the end (`cargo run -p Host --example complaints -- host11.bin`). Cause: the
+server's reliable ordering was wrong, so client 1's connection to it errored out.
+
+How the engine orders chunks (0x6F60B0): reliable and unreliable chunks share one sequence
+counter. A reliable chunk carries its sequence; an unreliable one doesn't, it counts on from the
+frame header's `seq` (the games put 0 there in frames without unreliable chunks). Every chunk's
+16-bit `previous` is the sender's **last reliable** sequence, not seq - 1. A chunk is taken in
+order when `previous` == the last reliable taken and its sequence isn't behind the next expected;
+a reliable chunk up to 22 ahead is buffered, anything else dropped. In host11, client 1 sent
+reliable 62933, 459 unreliable clone syncs (62934..63392), then reliable 63393 (previous 62933).
+The server took every unreliable as `previous + 1` = 62934, expected 62935, dropped 63393 forever;
+the client resent it every 250 ms until the connection errored (340 s).
+
+Fixed in `Server/Host/src/session.rs`, both ways: incoming chunks are numbered and ordered as
+above; outgoing chunks carry our last reliable sequence as `previous` and unreliable ones their
+sequence in the frame's `seq` (before, the sync acks the host12 build sends had frame seq 0 and
+the next reliable chunk named an unreliable as `previous`, which a client would drop forever).
+Replaying host11 (`--example simulate -- host11.bin 1 100000`) now acks past 63393. Tools:
+`--example complaints`, `--example link -- capture <client> [from ms] [to ms]` (frames between a
+client and the server host).
+
+### host12 (2026-10-21): a bike frozen for the other player
+
+Test: Test2 (client 2) rode a bike; for Test (client 1) it stood still. Bike = object 991
+(`cargo run -p Sync --example entity_log -- host12.bin 991`): owner 2 -> 1 (395 s) -> 2 (415 s)
+-> 1 (436 s), then client 1 sent client 2 a new clone create of it (442.8 s) while client 2 kept
+syncing it: both games thought they owned it, and client 1 ignored client 2's syncs.
+
+Cause (most likely): the host12 server's ch7 was broken both ways by the chunk ordering bugs
+above. It took only the first unreliable clone sync after each reliable chunk (so it acked almost
+no syncs), and its own reliable chunks named an unreliable chunk as `previous`, so the clients
+dropped them (only one batch of create acks arrived, at 240 s). A game hands an entity over
+cleanly only once every player, the server included, has confirmed it, so handovers misbehaved.
+Replaying host12 through the fixed server (`--example simulate -- host12.bin <client> 100000`)
+keeps ch7 acked to the end. Untested in game.
+
+Still unanswered by the server (`cargo run -p Host --example syncs -- host12.bin 600`):
+* CMsgPackedEvents (0x4F, 573 + 377): game events with the server in scope wait for its reply
+  (CMsgPackedEventReliablesMsgs 0x89) and are resent forever, e.g. REQUEST_EXPLOSION_EVENT
+  ("Peer IVMP_Server_ in scope of event" in IVMP_Engine.log, packed 1150 times).
+* CMsgArrayElements (0x86, 53 from client 2): probably waits for CMsgArrayElementsAck (0x87).
+The client complaints in host12 (about client 2's peer 1f00025e:00000002, from 525 s) are just
+client 1 noticing that cl2 was closed.
+
+### Game events and array elements (2026-10-21)
+
+The server host now acks both (`Server/Host/src/session.rs`), like a player whose game took them.
+
+* CMsgPackedEvents (0x4F, unreliable, ch7; writer 0x4AC010 via 0x4AC0A0, read by 0x4AC140 /
+  0x4ABF90): 5-bit item count, 15-bit length in bits, the events. Each event (0x4AEFB0): 5-bit
+  type, 15-bit id (low 7 bits the number, the rest a sequence: `NAME_<number>_<sequence>` in
+  IVMP_Engine.log), 15-bit data length, a flag (16 more bits if set), the data. The dispatcher
+  0x4AF610 drops repeats per sender and calls the handler for the type (0..26).
+* CMsgPackedEventReliablesMsgs (0x89, reliable, ch7; writer 0x4B18C0, reader 0x4B1940): 2-bit mask,
+  bit 0 = acks block (count 5, length 15, 15-bit event ids; read by 0x4AF330 -> 0x4AFBB0), bit 1 =
+  replies block (count, length, per reply 15-bit id, 15-bit data length, data; 0x4AF3E0 -> 0x4AFCC0).
+  Ack and reply both clear the answering player's bit in the event's pending mask; at 0 the event
+  is destroyed. An ack calls the event's ack handler (vtable +0x38), a reply its reply handlers
+  (+0x28, +0x30/+0x34/+0x50) with the data. The server only acks.
+* host12: the only event sent to the server was type 14, REQUEST_EXPLOSION (client 1 event 13_1
+  573 times, cl2 27_1 377 times); between the clients types 1, 3, 11, 18, 25 (answered).
+* CMsgArrayElements (0x86, unreliable; 0x4B71B0 / 0x4B7250, body 0x4B8810 / 0x4B88B0): 13-bit
+  length, data that starts with a 16-bit sequence (one counter over all recipients), a 3-bit array
+  handler and a 6-bit index. CMsgArrayElementsAck (0x87, unreliable; writer 0x4B8940): handler 3,
+  index 6, sequence 16. In host12 cl2 sent handler 6, index 0 once a second to the server.
+* Tools: `cargo run -p Host --example events|arrays -- capture.bin ...`. `--example simulate --
+  capture 0 1000000` now replays every client into one server host (needed with two players: the
+  host hands out channel sequences in join order); it only feeds packets addressed to the server.
+  Replaying host12 that way the server acks all of cl2's 377 events, 53 array updates and 651 syncs.
+
+### host13 (2026-10-21): client 1 can't drive
+
+Build with the chunk ordering fix (before the event/array acks). 12 minutes, both players
+connected throughout; ch7 healthy both ways (the server acked all 794 / 838 clone syncs, no stuck
+reliable chunks); no complaints about the server. Unanswered: game events and array elements (the
+next build acks them). Stuck events were requests for the host: CREATE_PICKUP (type 19, cl2,
+2368 resends), REQUEST_FIRE (12, client 1), REQUEST_EXPLOSION (14, cl2). Event types: 1
+GIVE_CONTROL, 3 WEAPON_DAMAGE, 11 VEHICLE_COMPONENT_CONTROL, 12 REQUEST_FIRE, 14 REQUEST_EXPLOSION,
+19 CREATE_PICKUP, 25 DOOR_BREAK.
+
+Seen by Drazox: client 2 drives with good sync; client 1 can't drive. Capture: car 503 while client
+1 owns it (378 s, 407 s; 47..77 syncs per 5 s) stays within ~10 m; once client 2 takes it (440 s)
+it moves at ~20 m/s. Ownership flips 2 -> 1 -> 2 every ~15 s (`--example entity_log -- host13.bin
+503`). Client 1 triggered 124 GIVE_CONTROL events, client 2 63: client 1 gives away even the car
+its player drives. cl2 refused 39 of client 1's VEHICLE_COMPONENT_CONTROL requests (reply `0`),
+client 1 none.
+
+How the game passes control (all on the owner):
+* Vehicle update 0x4C9BF0: a vehicle whose driver (+0xF50) belongs to another player logs
+  ">> Driver / >> Vehicle ... peer owner" (when the driver isn't a player, ped +0x219 = 0, set
+  from the ped constructor's control info, 0x9E26A0); a player driver gets the vehicle (GIVE_CONTROL
+  via 0x4AFEA0 at 0x4C9EB4) if CanPassControl allows; otherwise the generic path (vtable +0xFC).
+* Generic proximity handover 0x48D1F0 (every 500 ms per owned object): if the object is farther
+  than a threshold from the local player's ped (CPlayerInfo 0x11A8808[local index] +0x598), it goes
+  to the nearest player that may take it (GIVE_CONTROL at 0x48D533).
+* CanPassControl: vehicle 0x4CA050 (driver and passengers too) -> net object 0x48B4B0 -> 0x48E2D0:
+  cloned on the target (per-player state at +0x28 + 3 * index: cloned, +0x29 create pending,
+  +0x2A remove pending; 0x48D970 makes the masks), locally owned, no pending owner (+0x10 = 0xFF);
+  with flag 2 (+0x12) every non-local player must have the clone; no creates or removes pending.
+* VEHICLE_COMPONENT_CONTROL decision 0x4A8230: refused (reply bit 0) when the vehicle isn't
+  locally owned or already has a pending owner, or the ped's player isn't the sender.
+
+Next: the client DLL now logs every GIVE_CONTROL this game triggers (`controltrace.rs`: site,
+object, target, local player index / ped / position, entity position, driver), to see why client 1
+hands away the car it drives. Suspects: the local player's ped/position seen by the proximity check
+(client 1 is player slot 31), or CanPassControl failing for client 1 as target on cl2.
+
+### host14 (2026-10-21): handover trace
+
+Build with the event/array acks and the DLL's give-control trace (`controltrace.rs`). Drazox:
+vehicle sync still wrong (client 1 showed Test2 standing on a bike while Test2 drove a car on
+cl2), and NPC vehicles/peds still spawn badly (population, open issue 3).
+
+* Client 1 could drive: it owned car 518 from 190 to 290 s and drove it ~500 m east and back at
+  20..25 m/s (`--example track -- host14.bin 518`). Car 556 was handed to client 1 by cl2's
+  driver path (558 s), synced by it at driving rate, but barely moved.
+* Trace: client 1 made 74 handovers, all proximity, none of the car its own ped drove (ruled
+  out). cl2 made 43 proximity and 8 driver-path handovers (cars 518 and 556 to player 31); the
+  pending owner stayed 0x1F over repeated attempts until the handover went through.
+* Clone create refusals: result 1 comes from the net object's create (vtable +0x94, checked at
+  0x498744 -> 0x498882), i.e. the game couldn't build the entity; 2 and 4 are other checks. cl2
+  refused 87 of client 1's objects, every one accepted on a later resend (model streaming, normal).
+  Client 1 refused cl2's object 993 (an OBJECT) all 360 times cl2 sent it (237..349 s) and its
+  result-1 counter passed 1025; those refusals never show as acks in the capture (the handler
+  only acks when it finds the sender's player, 0x498834). `--example creates -- capture`,
+  `cargo run -p Sync --example create_types -- capture`.
+* Not found yet: why client 1 showed Test2 on the bike. cl2 synced no vehicle at driving rate to
+  client 1 in the last minute of the capture, and its player syncs to client 1 were sparse.
+
+### Receiving side (2026-10-21, after host14)
+
+* Clone sync results (per entry 0x493440, called at 0x492A2F, args sender, type, object id):
+  5 applied, 3 no such object, 2 sender may not sync it (0x48E000 / object being removed), 1 the
+  sync didn't apply (node read, vtable +0xB4) or a ped <-> dummy ped switch failed (0x495FE0), or
+  the thread flags lack bit 1. CMsgPackedCloneSyncAcks (writer 0x4EDDC0): 16-bit sequence, 8-bit
+  count, per failed entry 14-bit object id + 3-bit result (applied entries have no item).
+  `cargo run -p Host --example sync_acks -- capture <from> <to>`. host14: client 1 failed cl2's
+  syncs with result 1 for many peds (object 516 172 times, 1003 79), cl2 failed almost nothing.
+* Clone create result 1 = the net object couldn't build its entity (vtable +0x94, 0x498744 ->
+  0x498882); 4 = no room; 2 = existing object check.
+* NPCs that "despawn and respawn": the registry now logs removes too. host14 object 491: created
+  as DUMMYPED, synced into a PED, removed by its owner 1..3 s later, created again as a DUMMYPED
+  (every few seconds for minutes). Ped <-> dummy ped switching done as remove + create.
+* The DLL now logs (IVMP_Client.log): `sync in:` every failed received sync with the local
+  object's type/owner and a 30 s summary per type and result (`synctrace.rs`); `clone create:`
+  refusals per object and objects created again within 60 s (`jointrace.rs`); `give control`
+  handovers (`controltrace.rs`).
+
+How others do it: FiveM's GTA IV code (LibertyM) keeps a player as session host with migration
+and relays the game's traffic without reading it (as GTA Connected); FiveM's GTA V OneSync
+replaces the game's clone handling so the server decides ownership. IVMP: the server is the
+session host and confirms like a player; the games still decide ownership among themselves.

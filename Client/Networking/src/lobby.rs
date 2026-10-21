@@ -56,11 +56,10 @@ static FRAMES_IN_LOBBY: AtomicU32 = AtomicU32::new(0);
 // network_startup hosts with NETWORK_HOST_GAME(mode, ranked, slots, private, episode, maxTeams)
 // (impl 0xBDAF00); those arguments become the first match config fields, and the mode decides the
 // game: the recorded Free Mode game had +0x00 = 16 and +0x08 = 32, the default deathmatch 0 and 0.
-// Swapping only the lobby script started a deathmatch game, so override the host arguments.
+// Swapping only the lobby script started a deathmatch game, so override the host arguments with
+// the server's game mode and slots (server.cfg, `net::game_settings`).
 
 const HOST_GAME: usize = 0x00BD_AF00;
-const FREE_MODE: i32 = 16;
-const FREE_MODE_SLOTS: i32 = 32;
 static ORIGINAL_HOST_GAME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn install_host_override() {
@@ -77,10 +76,25 @@ pub fn install_host_override() {
 
 extern "C" fn host_game(mode: i32, ranked: u32, slots: i32, private: u32, episode: i32, max_teams: i32) -> u32 {
     log!("lobby: script hosts mode {mode}, ranked {ranked}, slots {slots}, private {private}, episode {episode}, teams {max_teams}");
-    let (mode, slots) = (FREE_MODE, FREE_MODE_SLOTS);
-    log!("lobby: hosting as mode {mode} with {slots} slots instead");
     let original: extern "C" fn(i32, u32, i32, u32, i32, i32) -> u32 =
         unsafe { std::mem::transmute(ORIGINAL_HOST_GAME.load(Ordering::SeqCst)) };
+    // `gamemode = -1`: the first player (the server's host) hosts what was picked in the lobby;
+    // everyone else joins that session (hostsys.rs), so their script must not host its own.
+    if crate::net::lobby_mode() {
+        if crate::net::our_id().is_some() && crate::net::our_id() != crate::net::host_id() {
+            log!("lobby: gamemode -1 and we aren't the host: not hosting, joining the host instead");
+            return 0;
+        }
+        // The script passed garbage for `ranked` (44037632) in the first lobby test; joiners
+        // look for unranked games, as IVMP always hosts them.
+        if ranked != 0 {
+            log!("lobby: hosting unranked (the script asked for ranked {ranked})");
+        }
+        return original(mode, 0, slots, private, episode, max_teams);
+    }
+    let (mode, slots) = crate::net::game_settings();
+    let (mode, slots) = (mode, slots as i32);
+    log!("lobby: hosting as mode {mode} with {slots} slots instead");
     original(mode, ranked, slots, private, episode, max_teams)
 }
 

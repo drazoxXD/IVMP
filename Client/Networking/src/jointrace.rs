@@ -139,17 +139,35 @@ const CLONE_CREATE_ACK_CALL: usize = 0x0049_8854;
 static ORIGINAL_ACK: AtomicUsize = AtomicUsize::new(0);
 static ACK_RESULTS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
 
+/// Per object: (refusals, last successful create). A create for an object we created shortly
+/// before means it went away in between (the "despawns and respawns" seen in game).
+static CREATES: std::sync::Mutex<Option<std::collections::HashMap<u16, (u32, Option<std::time::Instant>)>>> =
+    std::sync::Mutex::new(None);
+
 extern "C" fn record_ack(args: *const u32) {
     let (object_id, result) = unsafe { (*args as u16, *args.add(1)) };
     let slot = (result as usize).min(ACK_RESULTS.len() - 1);
     let seen = ACK_RESULTS[slot].fetch_add(1, Ordering::Relaxed);
     if seen < 5 || seen.is_power_of_two() {
         log!(
-            "clone create: object {object_id} -> result {result} (seen {} times), thread {}, thread flags {:#x}",
+            "clone create: result {result} seen {} times, thread {}, thread flags {:#x}",
             seen + 1,
             unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
             game_thread_flags()
         );
+    }
+    let mut guard = CREATES.lock().unwrap();
+    let (refused, last) = guard.get_or_insert_with(Default::default).entry(object_id).or_default();
+    if result != 0 {
+        *refused += 1;
+        if *refused <= 3 || refused.is_power_of_two() {
+            log!("clone create: object {object_id} refused with result {result} ({refused} times)");
+        }
+    } else {
+        if let Some(previous) = last.filter(|t| t.elapsed().as_secs() < 60) {
+            log!("clone create: object {object_id} created again {:.1}s after the last time", previous.elapsed().as_secs_f32());
+        }
+        *last = Some(std::time::Instant::now());
     }
 }
 

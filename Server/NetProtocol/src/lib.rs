@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -73,6 +73,9 @@ pub enum ServerMessage {
     /// Create a server-owned entity: `model` is the model name hash, `heading` in degrees. The
     /// client answers with [`ClientMessage::Spawned`].
     Spawn { request: u32, kind: SpawnKind, model: u32, position: [f32; 3], heading: f32 },
+    /// The game session's settings from server.cfg: the network game mode clients host and join
+    /// (16 = Free Mode; negative = IVMP's own modes) and its player slots.
+    GameSettings { mode: i32, slots: u8 },
     /// Delete a server-owned entity; sent to the client that owns it.
     Despawn { kind: SpawnKind, object_id: u16 },
     /// A game packet from another client's engine, to hand to the local engine.
@@ -102,6 +105,7 @@ const S_TUNNEL: u8 = 0x86;
 const S_OBJECT_IDS: u8 = 0x87;
 const S_SPAWN: u8 = 0x88;
 const S_DESPAWN: u8 = 0x89;
+const S_GAME_SETTINGS: u8 = 0x8A;
 
 fn kind_byte(kind: SpawnKind) -> u8 {
     match kind {
@@ -257,6 +261,9 @@ impl ServerMessage {
                 .f32(position[2])
                 .f32(*heading)
                 .done(),
+            ServerMessage::GameSettings { mode, slots } => {
+                Writer::new(S_GAME_SETTINGS).u32(*mode as u32).u8(*slots).done()
+            }
             ServerMessage::Despawn { kind, object_id } => {
                 Writer::new(S_DESPAWN).u8(kind_byte(*kind)).u16(*object_id).done()
             }
@@ -286,6 +293,7 @@ impl ServerMessage {
                 position: [r.f32()?, r.f32()?, r.f32()?],
                 heading: r.f32()?,
             },
+            S_GAME_SETTINGS => ServerMessage::GameSettings { mode: r.u32()? as i32, slots: r.u8()? },
             S_DESPAWN => ServerMessage::Despawn { kind: byte_kind(r.u8()?), object_id: r.u16()? },
             S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
             other => return Err(DecodeError::UnknownTag(other)),
@@ -328,6 +336,7 @@ mod tests {
                 heading: 90.0,
             },
             ServerMessage::Despawn { kind: SpawnKind::Vehicle, object_id: 491 },
+            ServerMessage::GameSettings { mode: -2, slots: 32 },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));

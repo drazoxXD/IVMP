@@ -99,6 +99,8 @@ fn on_attach() {
             ivmp_networking::jointrace::install();
             ivmp_networking::jointrace::install_add_gamer_trace();
             ivmp_networking::jointrace::install_clone_trace();
+            ivmp_networking::controltrace::install();
+            ivmp_networking::synctrace::install();
             ivmp_networking::netobjects::install();
             ivmp_networking::crypt::install();
             net::start(&config.server, &config.nickname);

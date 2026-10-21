@@ -5,10 +5,13 @@
 //! * payload: big-endian u16 offset of the second area, a flags byte (2 = first area LZSS
 //!   compressed), then two areas of frames.
 //! * frame (receive 0x6CF560): 9-byte header, MSB first: size 10 | out of band 1 | direct 1 |
-//!   has ack 1 | has seq 1 | channel 4 | seq 16 | ack 16 | 22 bits (zero). `ack` = the next
-//!   reliable sequence expected on that channel. An out-of-band frame holds one message.
-//! * chunk (inside a connection frame, 0x6F60B0): size 10 | reliable 1 | previous seq 16 |
+//!   has ack 1 | has seq 1 | channel 4 | seq 16 | ack 16 | 22 bits (zero). `seq` = the sequence
+//!   of the frame's first unreliable chunk (0 without any), `ack` = the next sequence expected on
+//!   that channel. An out-of-band frame holds one message.
+//! * chunk (inside a connection frame, 0x6F60B0): size 10 | reliable 1 | previous 16 |
 //!   seq 16 (reliable only) | 5 bits (13 so far): 6 bytes (4 when unreliable); then messages.
+//!   Reliable and unreliable chunks share one sequence counter; an unreliable chunk's sequence
+//!   is counted on from the frame's `seq`. `previous` is the sender's last reliable sequence.
 
 use ivmp_sync::bits::BitReader;
 
@@ -21,8 +24,9 @@ pub const CHUNK_HEADER: usize = 4;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Chunk {
     pub reliable: bool,
-    /// The sequence before this one (`seq - 1` in every capture).
+    /// The sender's last reliable sequence before this chunk.
     pub previous: u16,
+    /// Reliable chunks only (unreliable ones count on from the frame's `seq`).
     pub seq: u16,
     /// The 5 bits after the sequence numbers (unknown; 13 in every capture so far).
     pub tag: u8,

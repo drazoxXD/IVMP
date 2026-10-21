@@ -55,6 +55,8 @@ enum State {
     Hosting,
     HostingNetGame,
     Hosted,
+    /// `gamemode = -1`: the game's own lobby (network_startup) hosts, finds and starts games.
+    Lobby,
     Fatal,
     GaveUp,
 }
@@ -77,6 +79,26 @@ struct HostSystem {
 static SYSTEM: Mutex<HostSystem> = Mutex::new(HostSystem { state: State::Idle, attempts: 0, wait_frames: 0, told: 0, frames: 0, started: false, ids_given: 0 });
 
 impl HostSystem {
+    /// Network object ids come from the server, host and joiner alike: the host's grant never
+    /// reaches joiners, and the host's own ids would collide with theirs. Taken straight away
+    /// (waiting let the game spawn people and cars it couldn't network), and again once the game
+    /// is running if starting the session emptied them (it does on the joiner).
+    /// Refilling a ring that still has ids would hand out ids already in use.
+    fn give_object_ids(&mut self, network_state: u32) {
+        let in_game = network_state == NETWORK_STATE_IN_GAME;
+        if in_game && self.ids_given != 0 && self.ids_given != NETWORK_STATE_IN_GAME && object_id_count() != 0 {
+            self.ids_given = NETWORK_STATE_IN_GAME;
+        }
+        if self.ids_given == 0 || (in_game && self.ids_given != NETWORK_STATE_IN_GAME) {
+            if let Some((first, count)) = net::object_ids() {
+                use_object_ids(first, count);
+                self.ids_given = network_state.max(1);
+            } else if self.frames % 300 == 1 {
+                log!("host: no object ids from the server yet");
+            }
+        }
+    }
+
     fn set(&mut self, state: State) {
         if self.state != state {
             log!("host: {:?} -> {:?}", self.state, state);
@@ -87,6 +109,20 @@ impl HostSystem {
     fn process(&mut self) {
         match self.state {
             State::Idle | State::GaveUp => {}
+            // `gamemode = -1`: the first player (the server's host) gets the game's lobby, which
+            // hosts and picks the game; everyone else joins that player's session as in peer to
+            // peer (no lobby script there, see boot.rs use_game_lobby).
+            State::Loaded if net::lobby_mode() => match (net::our_id(), net::host_id()) {
+                (Some(us), Some(host)) if us != host => {
+                    log!("host: gamemode -1, joining the lobby of {}", NetProtocol::virtual_ip(host));
+                    self.set(State::StartFinding);
+                }
+                (Some(_), Some(_)) => {
+                    log!("host: gamemode -1, we host: the game's lobby picks the game");
+                    self.set(State::Lobby);
+                }
+                _ => {}
+            },
             // The IVMP server decides who hosts; everyone else joins that host.
             State::Loaded => match (net::our_id(), net::host_id()) {
                 (Some(us), Some(host)) if us != host => {
@@ -98,7 +134,8 @@ impl HostSystem {
                 _ => {}
             },
             State::StartFinding => {
-                natives::invoke(NETWORK_FIND_GAME, &FIND_ARGS);
+                let (mode, _) = net::game_settings();
+                natives::invoke(NETWORK_FIND_GAME, &[mode as u32, FIND_ARGS[1], FIND_ARGS[2], FIND_ARGS[3]]);
                 self.set(State::Finding);
             }
             State::Finding => {
@@ -144,7 +181,13 @@ impl HostSystem {
             // The host call's return value isn't reliable here (the impl at 0xBDAF00 returns
             // whatever is in AL), and hosting twice deadlocks (0x47CDF0), so don't retry on it:
             // judge by the pending / succeeded natives instead.
-            State::StartHosting => match natives::invoke(NETWORK_HOST_GAME, &HOST_ARGS) {
+            State::StartHosting => match natives::invoke(NETWORK_HOST_GAME, &{
+                let (mode, slots) = net::game_settings();
+                let mut args = HOST_ARGS;
+                args[0] = mode as u32;
+                args[2] = slots;
+                args
+            }) {
                 Some(ret) => {
                     log!("host: NETWORK_HOST_GAME returned {:#x}", ret & 0xFF);
                     self.set(State::Hosting);
@@ -166,6 +209,12 @@ impl HostSystem {
             }
             State::Hosted | State::Joined => {
                 let network_state = unsafe { *(crate::memory::from_ghidra(0x017F_5EA4) as *const u32) };
+                // In a lobby game (`gamemode = -1`) the host's lobby starts the game when the
+                // host picked it; the joiner waits in the lobby state until then.
+                if net::lobby_mode() && !self.started && network_state == NETWORK_STATE_LOBBY {
+                    self.started = true;
+                    log!("host: in the host's lobby, waiting for the host to start the game");
+                }
                 if !self.started && network_state == NETWORK_STATE_LOBBY {
                     self.started = true;
                     let ok = natives::invoke_bool(NETWORK_START_SESSION, &[]);
@@ -175,24 +224,7 @@ impl HostSystem {
                 if self.frames % 300 == 1 {
                     log_players();
                 }
-                // Network object ids come from the server, host and joiner alike: the host's
-                // grant never reaches joiners, and the host's own ids would collide with theirs.
-                // Taken straight away (waiting let the game spawn people and cars it couldn't
-                // network), and again once the game is running if starting the session emptied
-                // them (it does on the joiner).
-                // Refilling a ring that still has ids would hand out ids already in use.
-                let in_game = network_state == NETWORK_STATE_IN_GAME;
-                if in_game && self.ids_given != 0 && self.ids_given != NETWORK_STATE_IN_GAME && object_id_count() != 0 {
-                    self.ids_given = NETWORK_STATE_IN_GAME;
-                }
-                if self.ids_given == 0 || (in_game && self.ids_given != NETWORK_STATE_IN_GAME) {
-                    if let Some((first, count)) = net::object_ids() {
-                        use_object_ids(first, count);
-                        self.ids_given = network_state.max(1);
-                    } else if self.frames % 300 == 1 {
-                        log!("host: no object ids from the server yet");
-                    }
-                }
+                self.give_object_ids(network_state);
                 if network_state == NETWORK_STATE_IN_GAME {
                     crate::spawner::tick();
                 }
@@ -209,6 +241,22 @@ impl HostSystem {
                             log!("host: player {player} told to start playing");
                         }
                     }
+                }
+            }
+            // The lobby's scripts host or join, start the game and launch the players; we only
+            // keep the server's object ids in the engine (only once in a session: before that
+            // there is nothing to network) and run the spawner.
+            State::Lobby => {
+                let network_state = unsafe { *(crate::memory::from_ghidra(0x017F_5EA4) as *const u32) };
+                self.frames += 1;
+                if self.frames % 600 == 1 {
+                    log!("host: lobby, network state {network_state}");
+                }
+                if network_state >= NETWORK_STATE_LOBBY {
+                    self.give_object_ids(network_state);
+                }
+                if network_state == NETWORK_STATE_IN_GAME {
+                    crate::spawner::tick();
                 }
             }
             State::Fatal => {

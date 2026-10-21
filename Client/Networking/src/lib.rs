@@ -11,12 +11,15 @@
 //! * [`netobjects`]: network object fixes (no duplicate player registration).
 //! * [`spawner`]: creates the entities the server owns, when it asks us to.
 //! * [`jointrace`]: diagnostics for the join path.
+//! * [`controltrace`]: diagnostics for entity handovers (GIVE_CONTROL_EVENT).
+//! * [`synctrace`]: diagnostics for received clone syncs (applied or why not).
 
 use std::sync::OnceLock;
 
 pub use ivmp_core::{log, memory};
 pub use ivmp_natives::natives;
 
+pub mod controltrace;
 pub mod crypt;
 pub mod hostsys;
 pub mod instance;
@@ -28,6 +31,7 @@ pub mod peer;
 pub mod relay;
 pub mod session;
 pub mod spawner;
+pub mod synctrace;
 
 static NICKNAME: OnceLock<String> = OnceLock::new();
 

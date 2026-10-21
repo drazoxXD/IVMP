@@ -3,7 +3,7 @@
 //!
 //! Research and addresses (GTAIV.exe 1.2.0.59): `docs/boot-flow-research.md`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{log, memory};
 
@@ -88,6 +88,44 @@ const ONLY_SKIP_STORY_SCRIPT: Patch = Patch {
     original: &[0x74, 0x07],
     bytes: &[0x74, 0x5B],
 };
+
+/// The startup script site once "no startup script" is applied (`jnz` became `jmp`).
+const STARTUP_SCRIPTS_SKIPPED: &str = "80 7D 08 00 C6 05 ?? ?? ?? ?? 00 EB 64 E8 ?? ?? ?? ?? 84 C0 74 07";
+
+/// The network session has started loading (the startup scripts launch while it loads).
+static SESSION_LOADING: AtomicBool = AtomicBool::new(false);
+
+/// `gamemode = -1` (told by the server, before the session loads): give the host the game's own
+/// multiplayer lobby back. Undo "no startup script" and skip only the story `startup` script
+/// ([`ONLY_SKIP_STORY_SCRIPT`]), so `network_startup` runs: it hosts and opens the lobby, where
+/// the host picks the game. Only on the host: on a joiner the script's session calls ran into
+/// IVMP's join and the game thread hung in the join code (0x47CF9F); joiners join as in peer
+/// to peer and get the game when the host starts it. Called from the network thread.
+fn use_game_lobby(mode: i32) {
+    use ivmp_networking::net;
+    if mode != net::LOBBY_MODE {
+        return;
+    }
+    if net::our_id().is_none() || net::our_id() != net::host_id() {
+        log!("boot: gamemode -1: we join the host's lobby, no lobby script here");
+        return;
+    }
+    if SESSION_LOADING.load(Ordering::SeqCst) {
+        log!("boot: gamemode -1 came after the session started loading; no lobby this time");
+        return;
+    }
+    let Some(site) = memory::find(STARTUP_SCRIPTS_SKIPPED) else {
+        log!("boot: gamemode -1: startup script site not found, no lobby");
+        return;
+    };
+    // `jmp` -> `jnz` again (offset 11), then `jz startup` -> `jz exit` (offset 20).
+    let restored = unsafe { memory::patch(site + 11, &[0x75]) };
+    let story_only = unsafe { memory::patch(site + 20, ONLY_SKIP_STORY_SCRIPT.bytes) };
+    match (restored, story_only) {
+        (Ok(()), Ok(())) => log!("boot: gamemode -1: network_startup runs, players get the game's lobby"),
+        (r, s) => log!("boot: gamemode -1: lobby patch failed ({r:?}, {s:?})"),
+    }
+}
 
 /// With `network_test`: the first world load is already a network game (the LibertyM way, see
 /// docs/libertym-notes.md), so the player and world are created as network objects and the
@@ -201,6 +239,8 @@ fn install_network_boot() {
             *config = 16; // Free Mode
             *config.add(2) = 32; // slots
             log!("boot: network game config at {config:p} set to Free Mode, 32 slots");
+            // The server's game mode and slots replace these once it sends them.
+            ivmp_networking::net::set_network_config(config as usize);
         }
         if let Some(site) = memory::find(CONFIG_ZEROING_CALL.0) {
             let call = site + CONFIG_ZEROING_CALL.1;
@@ -227,12 +267,12 @@ pub fn network_boot() -> bool {
 /// Applies the boot patches. Must run before the game reaches its boot flow.
 pub fn install() {
     log!("boot: scanning {} KB of game code", memory::code_section().len() / 1024);
-    // LibertyM route: no network_startup lobby either, our host system (hostsys.rs) hosts.
-    // ONLY_SKIP_STORY_SCRIPT is kept for going back to the script-driven lobby.
-    let _ = &ONLY_SKIP_STORY_SCRIPT;
+    // LibertyM route: no network_startup lobby either, our host system (hostsys.rs) hosts;
+    // with `gamemode = -1` the lobby comes back ([`use_game_lobby`]).
     apply(PATCHES);
     if network_boot() {
         install_network_boot();
+        ivmp_networking::net::on_game_settings(use_game_lobby);
     }
     install_spawn_hook();
 }
@@ -358,6 +398,7 @@ fn install_network_session_hook() {
 /// The boot path spawns and fades in through Game_SpawnPlayerAfterLoad; a network session load
 /// has no such step (network_startup would do it), so the screen stayed on "LOADING...".
 extern "fastcall" fn start_network_session(loading_screen_up: u32) {
+    SESSION_LOADING.store(true, Ordering::SeqCst);
     unsafe {
         let original: extern "fastcall" fn(u32) = std::mem::transmute(ORIGINAL_START_NETWORK.load(Ordering::SeqCst));
         original(loading_screen_up);

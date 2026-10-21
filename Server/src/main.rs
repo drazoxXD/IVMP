@@ -1,7 +1,8 @@
 //! IVMP server (`Server.exe`).
 //!
-//! Usage: `Server [bind address] [--capture <file>]` (default `0.0.0.0:9999`). Output also goes
-//! to `ivmp_server.log` next to the executable.
+//! Settings come from `server.cfg` next to the executable (written with defaults the first time),
+//! with the command line on top: `Server [bind address] [--capture <file>] [--host]` (see
+//! [`config`]). Output also goes to `ivmp_server.log` next to the executable.
 //!
 //! * [`config`]: command line.
 //! * [`log`]: console + log file output (`say!`).
@@ -27,6 +28,9 @@ mod world;
 
 fn main() -> std::io::Result<()> {
     log::open();
-    let config = config::Config::from_args(std::env::args().skip(1));
+    let (config, notes) = config::Config::load(std::env::args().skip(1));
+    for note in notes {
+        say!("{note}");
+    }
     server::Server::start(&config)?.run()
 }

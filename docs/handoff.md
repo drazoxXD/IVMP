@@ -1,0 +1,186 @@
+# IVMP handoff (2026-10-21)
+
+Everything a fresh session needs to continue. Read this first, then `docs/onesync-plan.md`.
+
+## Goal
+
+IVMP is a GTA IV multiplayer mod in Rust for the Steam Complete Edition (GTAIV.exe 1.2.0.59, run
+through the Rockstar Games Launcher). It uses the game's own network engine (rage netcode, clone
+sync), with all game traffic tunnelled through the IVMP server. Targets: load straight into online
+(no story mode), player / animation / weapon / vehicle / object sync, server-owned entities
+("OneSync"-like), and the **server as the permanent session host** (no host migration; clients
+are just players). Later: server scripting for game mode -2 (IVMP freeroam).
+
+## Rules from Drazox (the user)
+
+* **Never commit unless explicitly asked** for that commit. Commit style: `type(scopes): Title`,
+  short body, optional "Current problems:" list, **no Co-Authored-By trailer**. **Never push.**
+* Keep code in separate, editable crates and modules (networking is not baked into the hooks DLL).
+* Builds go to `out/<profile>` (the launcher loads from `Client/out/debug`). Builds must work from
+  cmd and PowerShell.
+* Ghidra: rename functions you identify and add `IVMP:` comments.
+* No client-only spawns: every ped/vehicle must be networked (the factories are patched).
+* An unfocused (alt-tabbed) game must not throttle or slow down (desync); it keeps rendering and
+  ignores input.
+* Intros stay on (the intro-skip patch is disabled).
+* `server.cfg` comments use Drazox's wording for `host` (see below).
+
+## Layout
+
+* `Client/` (Cargo workspace, 32-bit target `i686-pc-windows-msvc` for the DLL):
+  * `Core` (`ivmp_core`): memory helpers (`from_ghidra`, patterns, patches), logger.
+  * `NativeInvoker` (`ivmp_natives`): native calls by hash, native logger.
+  * `Networking` (`ivmp_networking`): `net` (server connection, tunnel, game settings),
+    `peer` (peer identity, find-game answer, session reader), `relay`, `hostsys` (host/join state
+    machine, object id ring), `session`, `lobby`, `instance` (`-cl2`), `netobjects`, `crypt`
+    (packets unencrypted, MAC check off), `spawner` (server-owned spawns/despawns), `jointrace`
+    (diagnostic call traces incl. the AddGamer checks).
+  * `Hooks` (cdylib **IVMP_Client.dll**): boot (network boot, player slot, MP model), focus,
+    crash logging, mods folder (FusionFix `mods\dinput8.dll`, not for cl2), engine log, glue.
+  * `Launcher` (`ivmp_launcher.exe`, 64-bit): starts the game via Steam, injects the DLL after
+    the window opens; `-cl2` starts a second client (parent = Rockstar launcher). Waits for a
+    retried start when the first start quits (exit 0xC0E90002; press Retry in the R* launcher).
+  * `Shared`: config (`ivmp.json`, `ivmp_cl2.json`), constants.
+* `Server/` (Cargo workspace): root package builds **Server.exe** (`src/`: config, log, lobby,
+  relay, capture, world (server-owned entities), console, server loop); crates `NetProtocol`
+  (wire protocol, shared with the client; protocol version 5), `Sync` (`ivmp_sync`: packet/frame
+  decoding, entity registry, object id blocks, position nodes), `Host` (`ivmp_host`: the server as
+  session host: frame codec, session, templates), `Auth`/`Natives`/`Scripting` (empty stubs).
+* `.github/workflows/build.yml`: builds client + server, separate zips, pre-release only.
+
+## Build and run
+
+```
+cd Client
+cargo build --target i686-pc-windows-msvc -p Hooks     # IVMP_Client.dll
+cargo build -p Launcher                                  # ivmp_launcher.exe
+# copy target/i686-pc-windows-msvc/debug/IVMP_Client.dll (+ .pdb) and target/debug/ivmp_launcher.exe
+# to Client/out/debug (if locked by a running game, rename the old file first)
+cd ../Server
+cargo build                                              # target/debug/Server.exe
+cargo test --workspace
+```
+Run: start `Server/target/debug/Server.exe`, then `Client/out/debug/ivmp_launcher.exe`; second
+client: `ivmp_launcher.exe -cl2` (or `cl2.cmd`). A running Server.exe locks its exe: rename it
+(`Server.old<time>.exe`) before rebuilding, or close it.
+
+`server.cfg` (next to Server.exe, written with defaults on first start; command line overrides
+with `--host`, `--capture <file>`, `--ids a,b`):
+```
+host = 0        # 0 = peer to peer (first player hosts, the default), 1 = server is the host (experimental)
+gamemode = -2   # -2 = IVMP freeroam (current), 16 = GTA IV's own online Free Mode
+slots = 32
+bind = 0.0.0.0:9999
+capture =
+```
+Server console: `spawn car|ped <model> [x y z [heading]]`, `despawn <id>`, `entities`, `help`.
+
+Logs: `Client/out/debug/IVMP_Client.log` / `IVMP_Client_cl2.log` (DLL), `IVMP_Engine.log` /
+`IVMP_Engine_cl2.log` (the game's own logger), `Server/target/debug/ivmp_server.log`, captures
+(`--capture`) in `Server/target/debug/*.bin`. Rockstar launcher log:
+`Documents/Rockstar Games/Launcher/launcher.log`.
+
+Capture tools (from `Server/`): `cargo run -p Host --example chunks|simulate|roundtrip|diff|
+to_host|acks|create_acks|extract|complaints|link|syncs|events|arrays -- <capture> ...`, `cargo run -p Sync --example
+frames|handshake|decode_capture|check_positions|track -- <capture> ...`.
+
+Reverse engineering: Ghidra (GTAIV_dump.exe, Ghidra addresses base 0x400000, runtime relocated;
+use `memory::from_ghidra`). If the Ghidra MCP plugin drops, its HTTP API is at
+`http://127.0.0.1:8080` (`decompile_function?address=`, `xrefs_to`, `read_memory`,
+`disassemble_function`). For code Ghidra didn't analyse: `pip` capstone over
+`Client/out/debug/GTAIV_dump.exe`. GTA IV 1.2.0.59 native hashes don't match public lists
+(scrambled); the spawner calls the engine factories directly.
+
+## What works (as of host11, 2026-10-21)
+
+* Boot straight into a network Free Mode session; second client on the same PC (`-cl2`).
+* Peer to peer (`host = 0`): first player hosts, others join; players, peds, cars sync.
+* Unfocused games keep running without slowing down; input blocked when unfocused.
+* Server: decodes all traffic, entity registry with owners and positions, object id blocks per
+  client, server-owned cars/peds (`spawn`/`despawn`, re-created if they disappear).
+* **Server as host (`host = 1`)**: with two clients, both join the server, connect to each other,
+  see each other and sync cars and peds (host11). Getting in a car and steering show for the other
+  player.
+
+## Waiting on
+
+* **host12 test** (current build, not yet tested): the server now confirms clone creates /
+  removes (CMsgPackedReliables sections 1 and 3) and clone syncs (CMsgPackedCloneSyncAcks) like a
+  player would. Expected to fix: a driven car not moving for the other player (cars only change
+  owner to the driver once every player, including the server, has confirmed them). Test:
+  `Server.exe --capture host12.bin`, two clients, one drives a car the other spawned or was near.
+
+## Open issues / planned
+
+1. Car ownership to the driver. host14: client 1 could drive (car 518), but client 1 still
+   showed Test2 on an old bike while Test2 drove a car; cause not found (onesync-plan.md
+   "host14"). host13: client 2 drives fine, client 1 can't (it keeps giving
+   the car it drives away; see onesync-plan.md "host13"); the DLL now traces every GIVE_CONTROL
+   (`controltrace.rs`), next test reads it from IVMP_Client.log. Earlier: host12 still failed (a bike frozen for the other player, both
+   games owning it); caused by the server's broken ch7 sequencing, fixed after host12 (see
+   onesync-plan.md "host12"). Test again. The server now also acks game events (0x4F -> 0x89) and
+   array elements (0x86 -> 0x87) sent to it (after the host13 build; untested in game).
+2. Complaints (netComplaintMsg 0x55): in host11 client 1 complained about the server host from
+   340 s on, because the server's reliable chunk ordering was wrong and its connection errored
+   (details in onesync-plan.md "Complaints and chunk sequencing"). Fixed in the server in both
+   directions after the host12 build; untested in game. The server still ignores complaints.
+3. NPCs that despawn and respawn: ped <-> dummy ped switching runs as remove + create (host14,
+   object 491 every few seconds); the DLL now logs received syncs (`synctrace.rs`) and creates
+   per object. Population: both games spawn ambient traffic and peds around their own player, so cars stack
+   and explode when players are close. Plan: the server picks one game per area to spawn
+   population and turns it off for the others; as a safety net refuse creates on top of an
+   existing networked vehicle.
+4. Players leaving a server-hosted session: the server now sends the others
+   snMsgRemoveGamersFromSessionCmd (layout in onesync-plan.md). Untested in game: quit one client
+   (or let it time out) and check the other drops its player.
+5. Server-host game modes: the host replays Free Mode templates only.
+6. Deferred: gamemode -2 server scripting (Scripting crate), FiveM-style.
+7. Positions: only the first entity of each clone sync is decoded.
+
+## Key facts and addresses (Ghidra space)
+
+* Network state 0x17F5EA4 (8 lobby, 10 in game); boot patches in `boot.rs`; network game config
+  {16,_,32} via pattern; player slot patch at Player_Create 0xBB53FE (server host: slot `32 - id`,
+  server is slot 1/0 in lists).
+* Object id ring 0x19360C8 / write 0x19392C8 / read 0x19392CC / count 0x19392D0; server blocks:
+  client c gets `c*490 .. +490`.
+* Packet `[flags][nonce u32][payload][mac u32]`; RC4 calls 0x6D2200/0x6D25B6 skipped; MAC check
+  jnz at 0x6D258E nopped. Frame and chunk layout: `docs/onesync-plan.md`.
+* Message ids (CMsgCloneSync 0x8A, PackedCloneSyncAcks 0x8B, PackedReliables 0x8C, PeerData
+  0x90, HostData 0x92, snMsgJoinRequest 0x41, AddGamer 0x64, ...): table in onesync-plan.md.
+* Factories: vehicle 0x166D9FC slot 1 create 0x5DA990 / slot 2 destroy 0xB59180; ped 0x166D9F4
+  slot 5 create 0x5C3770 / slot 6 destroy 0xB58EA0; net object by id 0x4913C0 on 0x1908EF0.
+* Clone create handler 0x498430; AddGamer handler 0x6245C0, validation 0x623D80, block reader
+  0x626E70.
+
+## Other docs
+
+* `docs/onesync-plan.md`: everything about sync, the server as host (templates, findings,
+  test history host1..host11), settings.
+* `docs/networking-plan.md`: the tunnel/relay design.
+* `docs/libertym-notes.md`: what FiveM's GTA IV code (LibertyM) does and what IVMP took from it.
+* `docs/boot-flow-research.md`: boot-skip research.
+
+## Decision (2026-10-21): peer to peer for now
+
+After host14/host15 (bike: steering synced, speed/movement didn't; NPCs despawning and respawning)
+Drazox decided to stay with peer to peer networking for now, like FiveM's GTA IV code (LibertyM):
+the first player hosts, the server relays. `host = 0` is the default (code, server.cfg template,
+and the local server.cfg). The server-host work (Server/Host, `host = 1` / `--host`) and its
+diagnostics stay in place for later; findings are in onesync-plan.md.
+
+## Game modes (2026-10-21)
+
+`gamemode` in server.cfg (Drazox's list in the template): -2 IVMP freeroam (Free Mode underneath,
+no scripting yet), -1 the game's lobby, 0..16 the game's own modes (16 = Free Mode; the others are
+passed to NETWORK_HOST_GAME / FIND_GAME, untested).
+
+`-1` (first attempt, untested in game): when the server's settings arrive (before the session
+loads) `boot.rs use_game_lobby` undoes "no startup script" and applies ONLY_SKIP_STORY_SCRIPT, so
+`network_startup` runs and shows the game's lobby. The first player (the server's host) lets the
+lobby host and pick the game (`lobby.rs` passes the script's own host arguments); everyone else
+joins that session through hostsys as in peer to peer, with no lobby script of its own (in the
+first test cl2's network_startup ran alongside IVMP's join, the join failed and the game thread
+hung in the join code at 0x47CF9F), and doesn't start the session: the host's lobby does. The host
+is forced unranked (the script passed ranked 44037632). Object ids and the spawner still run. If the mode arrives after the session started loading the
+log says "no lobby this time".

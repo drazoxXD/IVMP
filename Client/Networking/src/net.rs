@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,53 @@ static CONNECTION: OnceLock<Connection> = OnceLock::new();
 /// Our client id once welcomed (0 = not yet).
 static OUR_ID: AtomicU8 = AtomicU8::new(0);
 static HOST_ID: AtomicU8 = AtomicU8::new(0);
+/// The session's game mode and slots from the server (server.cfg); Free Mode, 32 until told.
+static GAME_MODE: AtomicI32 = AtomicI32::new(FREE_MODE);
+static SLOTS: AtomicU8 = AtomicU8::new(32);
+/// The game's stored network game config (30 dwords: +0 mode, +8 slots), found by the boot code.
+static NETWORK_CONFIG: AtomicUsize = AtomicUsize::new(0);
+const FREE_MODE: i32 = 16;
+/// `gamemode = -1`: players land in the game's own multiplayer lobby (network_startup) and
+/// host, find and pick the game there; IVMP doesn't host or join for them.
+pub const LOBBY_MODE: i32 = -1;
+/// Called (from the network thread) when the server's game mode changes; the boot code uses it.
+static SETTINGS_HOOK: OnceLock<fn(i32)> = OnceLock::new();
+
+/// Registers the function told about the server's game mode.
+pub fn on_game_settings(hook: fn(i32)) {
+    let _ = SETTINGS_HOOK.set(hook);
+}
+
+/// The server wants the game's own lobby (`gamemode = -1`).
+pub fn lobby_mode() -> bool {
+    GAME_MODE.load(Ordering::SeqCst) == LOBBY_MODE
+}
+
+/// The network game mode and slots to host and join with. IVMP's own modes (negative, e.g. -2
+/// scripted) run on Free Mode for now.
+pub fn game_settings() -> (i32, u32) {
+    let mode = GAME_MODE.load(Ordering::SeqCst);
+    (if mode < 0 { FREE_MODE } else { mode }, SLOTS.load(Ordering::SeqCst) as u32)
+}
+
+/// Where the game keeps its network game config; the server's settings are written there too.
+pub fn set_network_config(config: usize) {
+    NETWORK_CONFIG.store(config, Ordering::SeqCst);
+    write_network_config();
+}
+
+fn write_network_config() {
+    let config = NETWORK_CONFIG.load(Ordering::SeqCst) as *mut i32;
+    if config.is_null() {
+        return;
+    }
+    let (mode, slots) = game_settings();
+    unsafe {
+        *config = mode;
+        *config.add(2) = slots as i32;
+    }
+}
+
 /// Our network object id block from the server: first << 16 | count (0 = not given yet).
 static OBJECT_IDS: AtomicU32 = AtomicU32::new(0);
 static ORIGINAL_SEND: AtomicUsize = AtomicUsize::new(0);
@@ -136,6 +183,18 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                     log!("net: server gave us object ids {first}..{}", first + count);
                 }
                 OBJECT_IDS.store((first as u32) << 16 | count as u32, Ordering::SeqCst);
+            }
+            Ok(ServerMessage::GameSettings { mode, slots }) => {
+                let mode_changed = GAME_MODE.swap(mode, Ordering::SeqCst) != mode;
+                if mode_changed || SLOTS.swap(slots, Ordering::SeqCst) != slots {
+                    log!("net: server game mode {mode}, {slots} slots (playing mode {})", game_settings().0);
+                }
+                if mode_changed {
+                    if let Some(hook) = SETTINGS_HOOK.get() {
+                        hook(mode);
+                    }
+                }
+                write_network_config();
             }
             Ok(ServerMessage::Reject(reason)) => {
                 log!("net: server rejected us: {reason:?}");

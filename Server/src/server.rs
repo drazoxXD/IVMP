@@ -40,6 +40,9 @@ pub struct Server {
     console: Receiver<Result<Command, String>>,
     /// The game session host, when the server hosts (`--host`).
     host: Option<HostSession>,
+    /// What clients host and join (server.cfg `gamemode`, `slots`).
+    gamemode: i32,
+    slots: u8,
 }
 
 impl Server {
@@ -57,7 +60,13 @@ impl Server {
         };
         if config.host {
             say!("the server hosts the game session (10.0.0.{HOST_ID}); every player joins it");
+            if config.gamemode >= 0 && config.gamemode != 16 {
+                say!("the server host only knows Free Mode sessions so far; gamemode {} is sent to clients anyway", config.gamemode);
+            }
+        } else {
+            say!("the first player hosts the game session (peer to peer)");
         }
+        say!("game mode {}, {} slots", config.gamemode, config.slots);
         say!("{}", console::HELP);
         Ok(Server {
             socket,
@@ -69,6 +78,8 @@ impl Server {
             last_world: Instant::now(),
             console: console::start(),
             host: config.host.then(HostSession::default),
+            gamemode: config.gamemode,
+            slots: config.slots,
         })
     }
 
@@ -219,6 +230,7 @@ impl Server {
         self.send(from, &ServerMessage::Welcome { id, host });
         let (first, count) = ids::block(id);
         self.send(from, &ServerMessage::ObjectIds { first, count });
+        self.send(from, &ServerMessage::GameSettings { mode: self.gamemode, slots: self.slots });
     }
 
     /// Each client with its player's position, when the registry knows it.

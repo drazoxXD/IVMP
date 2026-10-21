@@ -83,7 +83,12 @@ impl Registry {
                         for object_id in reliables.removes {
                             // Only the owner removes an entity for everyone.
                             if self.entities.get(&object_id).is_some_and(|e| e.owner == from) {
-                                self.entities.remove(&object_id);
+                                if let Some(entity) = self.entities.remove(&object_id) {
+                                    events.push(format!(
+                                        "entity {object_id} {} removed by client {from}",
+                                        OBJECT_TYPES[entity.object_type as usize]
+                                    ));
+                                }
                             }
                         }
                     }
