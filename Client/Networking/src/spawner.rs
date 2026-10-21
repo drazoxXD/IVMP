@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use NetProtocol::{ClientMessage, SpawnKind};
 
@@ -39,9 +40,13 @@ const ENTITY_NET_OBJECT: usize = 0x6C;
 const NET_OBJECT_ID: usize = 0xC;
 /// Frames to wait for a model to stream in.
 const LOAD_TIMEOUT_FRAMES: u32 = 600;
-/// Frames our networked player must exist before we spawn anything: the factories touch the
-/// local player (spawning right as the session started crashed in 0x5DA990 -> 0xA31B10).
-const READY_FRAMES: u32 = 300;
+/// How long our networked player must exist before we spawn anything.
+const READY_AFTER: Duration = Duration::from_secs(5);
+/// Current viewport: index at 0x118D818, viewport pointers right after it (slot `i` at
+/// 0x118D818 + 4 * i). The vehicle factory ends with an on-screen check (0xA31B10 -> 0x431E40)
+/// on the current viewport, which is empty (slot 2, null) when our code runs, and crashed.
+const VIEWPORTS: usize = 0x0118_D818;
+const VIEWPORT_SLOTS: u32 = 8;
 /// Local player: index 0x1036F14 into the CPlayerInfo pointers at 0x11A8808; info +0x598 = ped.
 const LOCAL_PLAYER_INDEX: usize = 0x0103_6F14;
 const PLAYER_INFOS: usize = 0x011A_8808;
@@ -63,8 +68,8 @@ struct Pending {
 
 static QUEUE: Mutex<VecDeque<Request>> = Mutex::new(VecDeque::new());
 static LOADING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
-/// Frames our networked player has existed for.
-static READY: Mutex<u32> = Mutex::new(0);
+/// Since when our networked player exists.
+static READY: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Our player's ped exists and is networked.
 fn local_player_networked() -> bool {
@@ -98,8 +103,11 @@ pub fn request(request: Request) {
 pub fn tick() {
     {
         let mut ready = READY.lock().unwrap();
-        *ready = if local_player_networked() { ready.saturating_add(1) } else { 0 };
-        if *ready < READY_FRAMES {
+        if !local_player_networked() {
+            *ready = None;
+            return;
+        }
+        if ready.get_or_insert_with(Instant::now).elapsed() < READY_AFTER {
             return;
         }
     }
@@ -174,8 +182,32 @@ unsafe fn method(this: usize, slot: usize) -> usize {
     unsafe { *((*(this as *const usize)) as *const usize).add(slot) }
 }
 
+/// Points the current viewport at one that exists while `f` runs (see [`VIEWPORTS`]).
+unsafe fn with_viewport<T>(f: impl FnOnce() -> T) -> T {
+    let base = memory::from_ghidra(VIEWPORTS) as *mut u32;
+    unsafe {
+        let current = *base;
+        let slot = |i: u32| *base.add(i as usize);
+        if (1..VIEWPORT_SLOTS).contains(&current) && slot(current) != 0 {
+            return f();
+        }
+        let Some(valid) = (1..VIEWPORT_SLOTS).find(|i| slot(*i) != 0) else {
+            log!("spawner: no viewport (current {current})");
+            return f();
+        };
+        *base = valid;
+        let result = f();
+        *base = current;
+        result
+    }
+}
+
 /// Creates the entity; returns its network object id (0 = failed).
 unsafe fn spawn(request: &Request, model_index: i32) -> u16 {
+    unsafe { with_viewport(|| spawn_now(request, model_index)) }
+}
+
+unsafe fn spawn_now(request: &Request, model_index: i32) -> u16 {
     let matrix = matrix(request.position, request.heading);
     let entity = unsafe {
         match request.kind {
