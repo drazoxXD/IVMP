@@ -1,0 +1,11 @@
+[package]
+name = "Host"
+description = "The server as the game's session host: the engine's connection layer and the host's session messages."
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ivmp_host"
+
+[dependencies]
+Sync = { path = "../Sync" }

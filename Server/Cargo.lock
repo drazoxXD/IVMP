@@ -7,6 +7,13 @@ name = "Auth"
 version = "0.1.0"
 
 [[package]]
+name = "Host"
+version = "0.1.0"
+dependencies = [
+ "Sync",
+]
+
+[[package]]
 name = "Natives"
 version = "0.1.0"
 
@@ -22,6 +29,7 @@ version = "0.1.0"
 name = "Server"
 version = "0.1.0"
 dependencies = [
+ "Host",
  "NetProtocol",
  "Sync",
 ]

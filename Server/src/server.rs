@@ -5,6 +5,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use ivmp_host::session::HostSession;
 use ivmp_sync::{ids, nodes, registry::Registry};
 use NetProtocol::{ClientId, ClientMessage, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
 
@@ -21,6 +22,10 @@ const SUMMARY_EVERY: Duration = Duration::from_secs(10);
 const WORLD_EVERY: Duration = Duration::from_secs(1);
 /// Where `spawn` without a position puts things, from the first player.
 const SPAWN_OFFSET: [f32; 3] = [4.0, 4.0, 0.5];
+/// The client id (virtual address 10.0.0.254) the server hosts the game session as.
+pub const HOST_ID: ClientId = 254;
+/// The engine's game port.
+const GAME_PORT: u16 = 6672;
 
 pub struct Server {
     socket: UdpSocket,
@@ -33,12 +38,15 @@ pub struct Server {
     world: World,
     last_world: Instant,
     console: Receiver<Result<Command, String>>,
+    /// The game session host, when the server hosts (`--host`).
+    host: Option<HostSession>,
 }
 
 impl Server {
     pub fn start(config: &Config) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(&config.bind)?;
-        socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+        // Short, so the session host's resends and acks go out on time.
+        socket.set_read_timeout(Some(Duration::from_millis(20)))?;
         say!("IVMP server listening on {} (protocol {PROTOCOL_VERSION})", config.bind);
         let capture = match &config.capture {
             Some(path) => {
@@ -47,16 +55,20 @@ impl Server {
             }
             None => None,
         };
+        if config.host {
+            say!("the server hosts the game session (10.0.0.{HOST_ID}); every player joins it");
+        }
         say!("{}", console::HELP);
         Ok(Server {
             socket,
-            lobby: Lobby::default(),
+            lobby: Lobby { preset_ids: config.ids.clone(), ..Lobby::default() },
             capture,
             entities: Registry::default(),
             last_summary: Instant::now(),
             world: World::default(),
             last_world: Instant::now(),
             console: console::start(),
+            host: config.host.then(HostSession::default),
         })
     }
 
@@ -73,6 +85,7 @@ impl Server {
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
                 Err(e) => say!("receive failed: {e}"),
             }
+            self.host_tick();
             for id in self.lobby.timed_out() {
                 self.remove(id, "timed out");
             }
@@ -123,6 +136,9 @@ impl Server {
                 for line in self.entities.observe(id, &payload) {
                     say!("{line}");
                 }
+                if to == virtual_ip(HOST_ID) && self.host.is_some() {
+                    return self.to_host(id, from_port, &payload);
+                }
                 let packet = ServerMessage::Tunnel { from: virtual_ip(id), from_port, to_port, payload };
                 match target {
                     Target::Everyone => self.broadcast(Some(id), &packet),
@@ -149,6 +165,34 @@ impl Server {
         }
     }
 
+    /// A game packet for the session host.
+    fn to_host(&mut self, client: ClientId, client_port: u16, payload: &[u8]) {
+        let Some(host) = self.host.as_mut() else { return };
+        let answers = host.receive(client, payload);
+        for line in host.log.drain(..) {
+            say!("{line}");
+        }
+        for answer in answers {
+            self.from_host(client, client_port, answer);
+        }
+    }
+
+    /// A packet from the session host to `client`.
+    fn from_host(&mut self, client: ClientId, client_port: u16, payload: Vec<u8>) {
+        let Some(addr) = self.lobby.clients.get(&client).map(|c| c.addr) else { return };
+        if let Some(capture) = self.capture.as_mut() {
+            capture.record(HOST_ID, client, &payload);
+        }
+        self.send(addr, &ServerMessage::Tunnel { from: virtual_ip(HOST_ID), from_port: GAME_PORT, to_port: client_port, payload });
+    }
+
+    fn host_tick(&mut self) {
+        let Some(host) = self.host.as_mut() else { return };
+        for (client, packet) in host.tick() {
+            self.from_host(client, GAME_PORT, packet);
+        }
+    }
+
     fn hello(&mut self, from: SocketAddr, version: u16, nickname: &str, existing: Option<ClientId>) {
         if version != PROTOCOL_VERSION {
             return self.send(from, &ServerMessage::Reject(RejectReason::VersionMismatch));
@@ -171,7 +215,7 @@ impl Server {
                 Err(reason) => return self.send(from, &ServerMessage::Reject(reason)),
             },
         };
-        let host = self.lobby.host.unwrap_or(id);
+        let host = if self.host.is_some() { HOST_ID } else { self.lobby.host.unwrap_or(id) };
         self.send(from, &ServerMessage::Welcome { id, host });
         let (first, count) = ids::block(id);
         self.send(from, &ServerMessage::ObjectIds { first, count });
@@ -228,7 +272,20 @@ impl Server {
                 self.update_world();
             }
             Command::Despawn(id) => match self.world.remove(id) {
-                Some(_) => say!("server entity {id} forgotten"),
+                Some(entity) => {
+                    // The owner deletes it, which removes it for everyone.
+                    let owner = entity.object_id.and_then(|object_id| {
+                        let owner = self.entities.entities.get(&object_id).map(|e| e.owner);
+                        owner.or(entity.creator.map(|(c, _)| c)).map(|owner| (owner, object_id))
+                    });
+                    match owner.and_then(|(owner, object_id)| Some((self.lobby.clients.get(&owner)?.addr, owner, object_id))) {
+                        Some((addr, owner, object_id)) => {
+                            self.send(addr, &ServerMessage::Despawn { kind: entity.kind, object_id });
+                            say!("server entity {id} deleted (asked client {owner})");
+                        }
+                        None => say!("server entity {id} forgotten (nobody has it)"),
+                    }
+                }
                 None => say!("no server entity {id}"),
             },
             Command::Entities => {
@@ -252,10 +309,14 @@ impl Server {
     }
 
     fn remove(&mut self, id: ClientId, why: &str) {
+        if let Some(host) = self.host.as_mut() {
+            host.remove(id);
+        }
         let Some((client, new_host)) = self.lobby.leave(id) else { return };
         say!("{} ({}) {why}", client.nickname, virtual_ip(id));
         self.broadcast(None, &ServerMessage::PeerLeft { id });
-        if let Some(host) = new_host {
+        // With the server hosting, the session host never changes.
+        if let Some(host) = new_host.filter(|_| self.host.is_none()) {
             say!("host is now {}", self.lobby.clients[&host].nickname);
             self.broadcast(None, &ServerMessage::HostChanged { host });
         }

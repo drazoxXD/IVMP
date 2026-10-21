@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -73,6 +73,8 @@ pub enum ServerMessage {
     /// Create a server-owned entity: `model` is the model name hash, `heading` in degrees. The
     /// client answers with [`ClientMessage::Spawned`].
     Spawn { request: u32, kind: SpawnKind, model: u32, position: [f32; 3], heading: f32 },
+    /// Delete a server-owned entity; sent to the client that owns it.
+    Despawn { kind: SpawnKind, object_id: u16 },
     /// A game packet from another client's engine, to hand to the local engine.
     Tunnel { from: Ipv4Addr, from_port: u16, to_port: u16, payload: Vec<u8> },
 }
@@ -99,6 +101,18 @@ const S_HOST_CHANGED: u8 = 0x85;
 const S_TUNNEL: u8 = 0x86;
 const S_OBJECT_IDS: u8 = 0x87;
 const S_SPAWN: u8 = 0x88;
+const S_DESPAWN: u8 = 0x89;
+
+fn kind_byte(kind: SpawnKind) -> u8 {
+    match kind {
+        SpawnKind::Vehicle => 0,
+        SpawnKind::Ped => 1,
+    }
+}
+
+fn byte_kind(byte: u8) -> SpawnKind {
+    if byte == 0 { SpawnKind::Vehicle } else { SpawnKind::Ped }
+}
 
 struct Writer(Vec<u8>);
 
@@ -236,16 +250,16 @@ impl ServerMessage {
             ServerMessage::ObjectIds { first, count } => Writer::new(S_OBJECT_IDS).u16(*first).u16(*count).done(),
             ServerMessage::Spawn { request, kind, model, position, heading } => Writer::new(S_SPAWN)
                 .u32(*request)
-                .u8(match kind {
-                    SpawnKind::Vehicle => 0,
-                    SpawnKind::Ped => 1,
-                })
+                .u8(kind_byte(*kind))
                 .u32(*model)
                 .f32(position[0])
                 .f32(position[1])
                 .f32(position[2])
                 .f32(*heading)
                 .done(),
+            ServerMessage::Despawn { kind, object_id } => {
+                Writer::new(S_DESPAWN).u8(kind_byte(*kind)).u16(*object_id).done()
+            }
             ServerMessage::Tunnel { from, from_port, to_port, payload } => {
                 Writer::new(S_TUNNEL).ip(*from).u16(*from_port).u16(*to_port).rest(payload)
             }
@@ -267,11 +281,12 @@ impl ServerMessage {
             S_OBJECT_IDS => ServerMessage::ObjectIds { first: r.u16()?, count: r.u16()? },
             S_SPAWN => ServerMessage::Spawn {
                 request: r.u32()?,
-                kind: if r.u8()? == 0 { SpawnKind::Vehicle } else { SpawnKind::Ped },
+                kind: byte_kind(r.u8()?),
                 model: r.u32()?,
                 position: [r.f32()?, r.f32()?, r.f32()?],
                 heading: r.f32()?,
             },
+            S_DESPAWN => ServerMessage::Despawn { kind: byte_kind(r.u8()?), object_id: r.u16()? },
             S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
             other => return Err(DecodeError::UnknownTag(other)),
         })
@@ -312,6 +327,7 @@ mod tests {
                 position: [1.0, -2.5, 30.0],
                 heading: 90.0,
             },
+            ServerMessage::Despawn { kind: SpawnKind::Vehicle, object_id: 491 },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));

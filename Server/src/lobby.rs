@@ -21,6 +21,8 @@ pub struct Lobby {
     /// Ordered by id, which is also join order, so the first entry is the oldest client.
     pub clients: BTreeMap<ClientId, Client>,
     pub host: Option<ClientId>,
+    /// Ids to hand out first, in join order (`--ids`).
+    pub preset_ids: Vec<ClientId>,
 }
 
 impl Lobby {
@@ -39,8 +41,13 @@ impl Lobby {
         if nickname.is_empty() || nickname.len() > 32 {
             return Err(RejectReason::BadNickname);
         }
-        let id = (1..=MAX_CLIENTS as ClientId)
-            .find(|id| !self.clients.contains_key(id))
+        if self.clients.len() >= MAX_CLIENTS {
+            return Err(RejectReason::ServerFull);
+        }
+        let preset = (!self.preset_ids.is_empty()).then(|| self.preset_ids.remove(0));
+        let id = preset
+            .filter(|id| !self.clients.contains_key(id))
+            .or_else(|| (1..=MAX_CLIENTS as ClientId).find(|id| !self.clients.contains_key(id)))
             .ok_or(RejectReason::ServerFull)?;
         self.clients.insert(id, Client { addr, nickname: nickname.to_string(), last_seen: Instant::now() });
         self.host.get_or_insert(id);

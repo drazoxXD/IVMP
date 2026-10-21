@@ -7,9 +7,10 @@
 /// Ids per client; 32 blocks after the reserved range stay below 0x4000.
 pub const BLOCK: u16 = 490;
 
-/// The ids client `id` (1..=32) may use: `first..first + count`.
+/// The ids client `id` (1..=32) may use: `first..first + count`. Higher ids (the server host's
+/// 254 while recording) share the last block.
 pub fn block(client: u8) -> (u16, u16) {
-    (client as u16 * BLOCK, BLOCK)
+    (client.min(32) as u16 * BLOCK, BLOCK)
 }
 
 /// The client whose block holds `object_id`, if any.

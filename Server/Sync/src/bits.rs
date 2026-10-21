@@ -31,6 +31,11 @@ impl<'a> BitReader<'a> {
         self.pos = pos.min(self.end);
     }
 
+    /// Bit position from the start of the data.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     pub fn remaining(&self) -> usize {
         self.end - self.pos
     }

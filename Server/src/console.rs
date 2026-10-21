@@ -2,7 +2,7 @@
 //!
 //! * `spawn car <model> [x y z [heading]]`, `spawn ped <model> [x y z [heading]]`: a
 //!   server-owned entity; without a position it goes next to the first player.
-//! * `despawn <id>`: forget a server entity (the game keeps it until it's cleaned up).
+//! * `despawn <id>`: delete a server entity (its owner deletes it for everyone).
 //! * `entities`: list the server entities.
 //! * `help`
 
