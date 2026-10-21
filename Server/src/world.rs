@@ -29,6 +29,9 @@ pub struct ServerEntity {
     pub creator: Option<(ClientId, Instant)>,
     /// When the registry last had it.
     pub last_seen: Instant,
+    /// The registry has seen it. It only does once another player gets it as a clone, so an
+    /// entity nobody else sees yet is never taken for missing.
+    pub confirmed: bool,
 }
 
 /// A spawn the server should send.
@@ -76,6 +79,7 @@ impl World {
             object_id: None,
             creator: None,
             last_seen: Instant::now(),
+            confirmed: false,
         };
         self.entities.insert(self.next_request, entity);
         self.next_request
@@ -97,6 +101,7 @@ impl World {
         } else {
             entity.object_id = Some(object_id);
             entity.last_seen = Instant::now();
+            entity.confirmed = false;
         }
         Some(entity)
     }
@@ -106,27 +111,38 @@ impl World {
     /// clients with their player's position when known; `host` is the fallback.
     pub fn orders(&mut self, registry: &Registry, clients: &[(ClientId, Option<[f32; 3]>)]) -> Vec<SpawnOrder> {
         let mut orders = Vec::new();
+        let connected = |id: ClientId| clients.iter().any(|(c, _)| *c == id);
         for (request, entity) in &mut self.entities {
+            let creator = entity.creator.map(|(c, _)| c);
             if let Some(object_id) = entity.object_id {
                 match registry.entities.get(&object_id) {
                     Some(seen) => {
                         entity.last_seen = Instant::now();
+                        entity.confirmed = true;
                         if let Some(position) = seen.position {
                             entity.position = position;
                         }
                         continue;
                     }
-                    None if entity.last_seen.elapsed() < MISSING_TIMEOUT => continue,
+                    // Nobody got it as a clone yet: it lives as long as its creator is here.
+                    None if !entity.confirmed && creator.is_some_and(connected) => continue,
+                    None if entity.confirmed && entity.last_seen.elapsed() < MISSING_TIMEOUT => continue,
                     None => {
                         entity.object_id = None;
                         entity.creator = None;
                     }
                 }
             }
-            if entity.creator.is_some_and(|(_, at)| at.elapsed() < SPAWN_TIMEOUT) {
-                continue;
-            }
-            let Some(client) = nearest(clients, entity.position) else { continue };
+            // A spawn in progress is asked again of the same client (it ignores repeats); only
+            // a client that left is replaced.
+            let client = match entity.creator {
+                Some((c, at)) if connected(c) && at.elapsed() < SPAWN_TIMEOUT => continue,
+                Some((c, _)) if connected(c) => c,
+                _ => match nearest(clients, entity.position) {
+                    Some(c) => c,
+                    None => continue,
+                },
+            };
             entity.creator = Some((client, Instant::now()));
             orders.push(SpawnOrder { request: *request, client, entity: entity.clone() });
         }

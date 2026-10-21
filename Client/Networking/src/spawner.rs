@@ -15,7 +15,7 @@
 //!   networked, mission)
 //! * add to the world 0x93E2D0 (entity, false)
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -68,6 +68,9 @@ struct Pending {
 
 static QUEUE: Mutex<VecDeque<Request>> = Mutex::new(VecDeque::new());
 static LOADING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Requests we created, with the object id, so a repeated request isn't created twice.
+static CREATED: Mutex<Option<HashMap<u32, u16>>> = Mutex::new(None);
+
 /// Since when our networked player exists.
 static READY: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -87,8 +90,19 @@ fn local_player_networked() -> bool {
     }
 }
 
-/// Queues a spawn from the server (any thread); done by [`tick`].
+/// Queues a spawn from the server (any thread); done by [`tick`]. The server repeats a request
+/// it has no answer for yet: a repeat of one in progress is dropped, one already done is
+/// answered again.
 pub fn request(request: Request) {
+    if let Some(object_id) = CREATED.lock().unwrap().as_ref().and_then(|c| c.get(&request.id).copied()) {
+        answer(request.id, object_id);
+        return;
+    }
+    let busy = QUEUE.lock().unwrap().iter().any(|r| r.id == request.id)
+        || LOADING.lock().unwrap().iter().any(|p| p.request.id == request.id);
+    if busy {
+        return;
+    }
     log!(
         "spawner: server asks for {:?} {:#010x} at {:?} (request {})",
         request.kind,
@@ -131,6 +145,9 @@ pub fn tick() {
         pending.frames += 1;
         if unsafe { is_loaded(pending.model_index) } {
             let object_id = unsafe { spawn(&pending.request, pending.model_index) };
+            if object_id != 0 {
+                CREATED.lock().unwrap().get_or_insert_with(HashMap::new).insert(pending.request.id, object_id);
+            }
             answer(pending.request.id, object_id);
             return false;
         }
