@@ -7,10 +7,10 @@ use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconFromResourceEx, EnumWindows, GW_OWNER, GetWindow, GetWindowTextW, GetWindowThreadProcessId, HICON, ICON_BIG,
-    ICON_SMALL, IsWindowVisible, LR_DEFAULTCOLOR, SendMessageW, SetWindowTextW, WM_SETICON,
+    CreateIconFromResourceEx, DefWindowProcW, EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, HICON, ICON_BIG,
+    ICON_SMALL, InternalGetWindowText, IsWindowVisible, LR_DEFAULTCOLOR, SendMessageW, WM_SETICON, WM_SETTEXT,
 };
-use windows::core::{BOOL, HSTRING};
+use windows::core::BOOL;
 
 use crate::log;
 
@@ -65,10 +65,21 @@ fn main_window() -> Option<HWND> {
     (!found.0.is_null()).then_some(found)
 }
 
+/// The title as Windows stores it (InternalGetWindowText sends no message to the window).
 fn window_title(window: HWND) -> String {
     let mut buffer = [0u16; 256];
-    let len = unsafe { GetWindowTextW(window, &mut buffer) }.max(0) as usize;
+    let len = unsafe { InternalGetWindowText(window, &mut buffer) }.max(0) as usize;
     String::from_utf16_lossy(&buffer[..len])
+}
+
+/// Sets the title without going through the game's window procedure: the window is ANSI and
+/// its WM_SETTEXT reached a Unicode default handler with ANSI text, so the title showed our
+/// bytes read as UTF-16 ("IV" -> U+5649). DefWindowProcW stores the text itself.
+fn set_window_title(window: HWND, title: &str) {
+    let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        DefWindowProcW(window, WM_SETTEXT, WPARAM(0), LPARAM(wide.as_ptr() as isize));
+    }
 }
 
 /// Starts the thread that brands the game window.
@@ -96,9 +107,7 @@ pub fn install() {
                         }
                     }
                     if window_title(w) != title {
-                        unsafe {
-                            let _ = SetWindowTextW(w, &HSTRING::from(title.as_str()));
-                        }
+                        set_window_title(w, &title);
                     }
                     std::thread::sleep(CHECK_EVERY);
                 }

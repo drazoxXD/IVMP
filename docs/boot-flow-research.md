@@ -176,7 +176,7 @@ The engine never knows it is "online", so nothing depends on Rockstar's session 
    readable `.text` pages; scanning the protection sections crashed the game once.
 5. **Control the spawn.** Set `g_PlayerSpawnPointIndex` to -1 and teleport the player from our code after the fade, or hook
    `Game_SpawnPlayerAfterLoad` and fire the event bus "world ready" event when it returns.
-6. **Skip the legal / Rockstar logo intro (not applied: suspected of crashing).** These are entries in `common:/DATA/LOADINGSCREENS_PC.DAT`
+6. **Skip the legal / Rockstar logo intro (not applied: suspected of crashing; with it enabled the multiplayer lobby / session doesn't start, seen 2026-10-22).** These are entries in `common:/DATA/LOADINGSCREENS_PC.DAT`
    (parsed by `LoadingScreens_LoadDat` `0x5CE120`, ticked by `LoadingScreens_Update` `0x5CC760`). `GameThread_Main`
    waits `while (g_LoadingScreensActive && g_LoadingIntroPlaying)`. Patch `0x0059D5A7` `74 74` -> `EB 74`
    (sig `80 3D ?? ?? ?? ?? 00 74 74 80 3D ?? ?? ?? ?? 00 74 6B E8`, +7) to not wait. The loading screen may still

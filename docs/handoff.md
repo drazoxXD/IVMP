@@ -22,7 +22,8 @@ are just players). Later: server scripting for game mode -2 (IVMP freeroam).
 * No client-only spawns: every ped/vehicle must be networked (the factories are patched).
 * An unfocused (alt-tabbed) game must not throttle or slow down (desync); it keeps rendering and
   ignores input.
-* Intros stay on (the intro-skip patch is disabled).
+* Intros stay on (the intro-skip patch is disabled): with it enabled the multiplayer lobby / session
+  doesn't start.
 * `server.cfg` comments use Drazox's wording for `host` (see below).
 
 ## Layout
