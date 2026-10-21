@@ -9,6 +9,7 @@
 //! * [`lobby`]: Free Mode host arguments.
 //! * [`instance`]: second client on one PC (`-cl2`).
 //! * [`netobjects`]: network object fixes (no duplicate player registration).
+//! * [`spawner`]: creates the entities the server owns, when it asks us to.
 //! * [`jointrace`]: diagnostics for the join path.
 
 use std::sync::OnceLock;
@@ -26,6 +27,7 @@ pub mod netobjects;
 pub mod peer;
 pub mod relay;
 pub mod session;
+pub mod spawner;
 
 static NICKNAME: OnceLock<String> = OnceLock::new();
 

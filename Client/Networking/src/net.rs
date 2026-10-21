@@ -157,8 +157,18 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 inbox.push_back(Packet { from, from_port, payload });
             }
+            Ok(ServerMessage::Spawn { request, kind, model, position, heading }) => {
+                crate::spawner::request(crate::spawner::Request { id: request, kind, model, position, heading });
+            }
             Err(e) => log!("net: bad packet from server: {e:?}"),
         }
+    }
+}
+
+/// Sends a message to the server (any thread). Dropped when not connected yet.
+pub fn send(message: &ClientMessage) {
+    if let Some(connection) = connected() {
+        let _ = connection.socket.send(&message.encode());
     }
 }
 

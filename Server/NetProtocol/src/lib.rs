@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -40,6 +40,16 @@ pub enum ClientMessage {
     Tunnel { from_port: u16, to: Ipv4Addr, to_port: u16, payload: Vec<u8> },
     KeepAlive,
     Bye,
+    /// Answer to [`ServerMessage::Spawn`]: the network object id of the created entity, or 0 if
+    /// it couldn't be created.
+    Spawned { request: u32, object_id: u16 },
+}
+
+/// What a [`ServerMessage::Spawn`] creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnKind {
+    Vehicle,
+    Ped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +59,7 @@ pub enum RejectReason {
     BadNickname,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ServerMessage {
     /// Accepted: your virtual address, and who hosts the engine session.
     Welcome { id: ClientId, host: ClientId },
@@ -60,6 +70,9 @@ pub enum ServerMessage {
     /// The network object ids this client's engine may use: `first..first + count`. The server
     /// gives every client its own block, so entities never collide (docs/onesync-plan.md).
     ObjectIds { first: u16, count: u16 },
+    /// Create a server-owned entity: `model` is the model name hash, `heading` in degrees. The
+    /// client answers with [`ClientMessage::Spawned`].
+    Spawn { request: u32, kind: SpawnKind, model: u32, position: [f32; 3], heading: f32 },
     /// A game packet from another client's engine, to hand to the local engine.
     Tunnel { from: Ipv4Addr, from_port: u16, to_port: u16, payload: Vec<u8> },
 }
@@ -77,6 +90,7 @@ const C_HELLO: u8 = 0x01;
 const C_TUNNEL: u8 = 0x02;
 const C_KEEPALIVE: u8 = 0x03;
 const C_BYE: u8 = 0x04;
+const C_SPAWNED: u8 = 0x05;
 const S_WELCOME: u8 = 0x81;
 const S_REJECT: u8 = 0x82;
 const S_PEER_JOINED: u8 = 0x83;
@@ -84,6 +98,7 @@ const S_PEER_LEFT: u8 = 0x84;
 const S_HOST_CHANGED: u8 = 0x85;
 const S_TUNNEL: u8 = 0x86;
 const S_OBJECT_IDS: u8 = 0x87;
+const S_SPAWN: u8 = 0x88;
 
 struct Writer(Vec<u8>);
 
@@ -101,6 +116,13 @@ impl Writer {
     fn u16(mut self, v: u16) -> Self {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
+    }
+    fn u32(mut self, v: u32) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    fn f32(self, v: f32) -> Self {
+        self.u32(v.to_bits())
     }
     fn ip(mut self, v: Ipv4Addr) -> Self {
         self.0.extend_from_slice(&v.octets());
@@ -139,6 +161,13 @@ impl<'a> Reader<'a> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     }
+    fn u32(&mut self) -> Result<u32, DecodeError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn f32(&mut self) -> Result<f32, DecodeError> {
+        Ok(f32::from_bits(self.u32()?))
+    }
     fn ip(&mut self) -> Result<Ipv4Addr, DecodeError> {
         let b = self.take(4)?;
         Ok(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
@@ -171,6 +200,9 @@ impl ClientMessage {
             }
             ClientMessage::KeepAlive => Writer::new(C_KEEPALIVE).done(),
             ClientMessage::Bye => Writer::new(C_BYE).done(),
+            ClientMessage::Spawned { request, object_id } => {
+                Writer::new(C_SPAWNED).u32(*request).u16(*object_id).done()
+            }
         }
     }
 
@@ -181,6 +213,7 @@ impl ClientMessage {
             C_TUNNEL => ClientMessage::Tunnel { from_port: r.u16()?, to: r.ip()?, to_port: r.u16()?, payload: r.rest() },
             C_KEEPALIVE => ClientMessage::KeepAlive,
             C_BYE => ClientMessage::Bye,
+            C_SPAWNED => ClientMessage::Spawned { request: r.u32()?, object_id: r.u16()? },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -201,6 +234,18 @@ impl ServerMessage {
             ServerMessage::PeerLeft { id } => Writer::new(S_PEER_LEFT).u8(*id).done(),
             ServerMessage::HostChanged { host } => Writer::new(S_HOST_CHANGED).u8(*host).done(),
             ServerMessage::ObjectIds { first, count } => Writer::new(S_OBJECT_IDS).u16(*first).u16(*count).done(),
+            ServerMessage::Spawn { request, kind, model, position, heading } => Writer::new(S_SPAWN)
+                .u32(*request)
+                .u8(match kind {
+                    SpawnKind::Vehicle => 0,
+                    SpawnKind::Ped => 1,
+                })
+                .u32(*model)
+                .f32(position[0])
+                .f32(position[1])
+                .f32(position[2])
+                .f32(*heading)
+                .done(),
             ServerMessage::Tunnel { from, from_port, to_port, payload } => {
                 Writer::new(S_TUNNEL).ip(*from).u16(*from_port).u16(*to_port).rest(payload)
             }
@@ -220,6 +265,13 @@ impl ServerMessage {
             S_PEER_LEFT => ServerMessage::PeerLeft { id: r.u8()? },
             S_HOST_CHANGED => ServerMessage::HostChanged { host: r.u8()? },
             S_OBJECT_IDS => ServerMessage::ObjectIds { first: r.u16()?, count: r.u16()? },
+            S_SPAWN => ServerMessage::Spawn {
+                request: r.u32()?,
+                kind: if r.u8()? == 0 { SpawnKind::Vehicle } else { SpawnKind::Ped },
+                model: r.u32()?,
+                position: [r.f32()?, r.f32()?, r.f32()?],
+                heading: r.f32()?,
+            },
             S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
             other => return Err(DecodeError::UnknownTag(other)),
         })
@@ -238,6 +290,7 @@ mod tests {
             ClientMessage::Tunnel { from_port: 1, to: BROADCAST, to_port: 2, payload: vec![] },
             ClientMessage::KeepAlive,
             ClientMessage::Bye,
+            ClientMessage::Spawned { request: 7, object_id: 500 },
         ] {
             assert_eq!(ClientMessage::decode(&m.encode()), Ok(m));
         }
@@ -251,6 +304,14 @@ mod tests {
             ServerMessage::PeerJoined { id: 4, nickname: "Roman".into() },
             ServerMessage::PeerLeft { id: 4 },
             ServerMessage::HostChanged { host: 2 },
+            ServerMessage::ObjectIds { first: 490, count: 490 },
+            ServerMessage::Spawn {
+                request: 1,
+                kind: SpawnKind::Ped,
+                model: 0x1234_5678,
+                position: [1.0, -2.5, 30.0],
+                heading: 90.0,
+            },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));

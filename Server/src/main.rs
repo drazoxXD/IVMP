@@ -8,6 +8,8 @@
 //! * [`lobby`]: who is connected, client ids, which client hosts the engine session.
 //! * [`relay`]: forwards the engine's game packets between clients.
 //! * [`capture`]: records game packets for analysis (`--capture`).
+//! * [`world`]: server-owned entities (a client creates them on request, the server keeps them).
+//! * [`console`]: commands typed into the server window (`spawn`, `entities`, ...).
 //! * [`server`]: the main loop tying them together, plus the entity registry (`ivmp_sync`).
 //!
 //! Crates: `NetProtocol` (wire protocol shared with the client), `Sync` (decodes the game's
@@ -17,9 +19,11 @@
 mod log;
 mod capture;
 mod config;
+mod console;
 mod lobby;
 mod relay;
 mod server;
+mod world;
 
 fn main() -> std::io::Result<()> {
     log::open();

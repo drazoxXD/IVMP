@@ -193,6 +193,9 @@ impl HostSystem {
                         log!("host: no object ids from the server yet");
                     }
                 }
+                if network_state == NETWORK_STATE_IN_GAME {
+                    crate::spawner::tick();
+                }
                 if natives::invoke_bool(LOCAL_PLAYER_READY_TO_START, &[]) {
                     natives::invoke(LAUNCH_LOCAL_PLAYER_IN_NETWORK_GAME, &[]);
                     log!("host: launched local player into the network game");
