@@ -1,4 +1,4 @@
-![](https://github.com/drazoxXD/IVMP/blob/main/Icons/logo.png)
+![](https://raw.githubusercontent.com/drazoxXD/IVMP/a4180cf9466a1b8862f157d2d35b2ad8afbd5687/.github/media/banner.svg)
 ## IVMP
 Based on the works of [LibertyM](https://github.com/citizenfx/fivem) and [IV-Network](https://github.com/GTA-Network/IV-Network).\
 This client is made only for the Steam version of the game and it won't work with any other version.\
