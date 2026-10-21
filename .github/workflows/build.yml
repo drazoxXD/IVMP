@@ -1,6 +1,6 @@
-# Builds the client (IVMP_Client.dll + ivmp_launcher.exe) and the server (Server.exe), zips each
-# and publishes them as a pre-release. Never a full release: every build is marked pre-release
-# and not latest.
+# Builds the client (IVMP_Client.dll + ivmp_launcher.exe) and the server (Server.exe, and a
+# Linux `Server` for hosting panels like Pelican), zips each and publishes them as a pre-release.
+# Never a full release: every build is marked pre-release and not latest.
 name: Build
 
 on:
@@ -69,3 +69,33 @@ jobs:
             --title "Build ${{ github.run_number }} ($sha)" `
             --notes "Automatic build of $sha. Pre-release only." `
             --prerelease --latest=false
+
+  # The Linux server, added to the same pre-release (the Pelican egg downloads it).
+  server-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Server
+
+      - name: Build server
+        working-directory: Server
+        run: cargo build --release --locked
+
+      - name: Zip
+        run: |
+          mkdir -p dist
+          cp Server/target/release/Server dist/
+          chmod +x dist/Server
+          (cd dist && zip -9 ../IVMP_Server_Linux.zip Server)
+
+      - name: Add to the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "build-${{ github.run_number }}" IVMP_Server_Linux.zip --repo "${{ github.repository }}"
