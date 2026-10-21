@@ -307,7 +307,38 @@ static ORIGINAL_COMMIT: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_SPAWN: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_GAME_PROCESS: AtomicUsize = AtomicUsize::new(0);
 
+/// The CREATE_PLAYER native's handler (0xBB3370) calls CreatePlayer here.
+const CREATE_PLAYER_NATIVE_CALL: usize = 0x00BB_339D;
+/// The local player's index.
+const LOCAL_PLAYER_INDEX: usize = 0x0103_6F14;
+
+/// CREATE_PLAYER from a script when we already made the player: with `gamemode = -1` a joiner
+/// starts network_startup after joining, its CREATE_PLAYER made a second player and the game
+/// crashed in CreatePlayer (write to null + 0xA60 at 0x9F19C8). Hand back the player we have.
+extern "C" fn create_player_from_script(position: *mut [f32; 3]) -> i32 {
+    unsafe {
+        let find_player_ped: extern "C" fn() -> usize = std::mem::transmute(memory::from_ghidra(FIND_PLAYER_PED));
+        if find_player_ped() != 0 {
+            let index = *(memory::from_ghidra(LOCAL_PLAYER_INDEX) as *const i32);
+            log!("boot: a script asked for the player again, keeping player {index}");
+            return index;
+        }
+        let create_player: extern "C" fn(*mut [f32; 3]) -> i32 = std::mem::transmute(memory::from_ghidra(CREATE_PLAYER));
+        create_player(position)
+    }
+}
+
 fn install_spawn_hook() {
+    let site = memory::from_ghidra(CREATE_PLAYER_NATIVE_CALL);
+    if unsafe { *(site as *const u8) } == 0xE8 {
+        match unsafe { memory::redirect_call(site, create_player_from_script as usize) } {
+            Ok(_) => log!("boot: scripts get the existing player from CREATE_PLAYER"),
+            Err(e) => log!("boot: CREATE_PLAYER hook failed: {e}"),
+        }
+    } else {
+        log!("boot: no call at {CREATE_PLAYER_NATIVE_CALL:#x}, CREATE_PLAYER not hooked");
+    }
+
     // Safety net for paths that skip Game_SpawnPlayerAfterLoad (e.g. a new-game reload):
     // make sure a player ped exists before every frame's world update.
     match memory::find(GAME_PROCESS_CALL_PATTERN).map(|a| a + 8) {

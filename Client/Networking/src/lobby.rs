@@ -98,6 +98,50 @@ extern "C" fn host_game(mode: i32, ranked: u32, slots: i32, private: u32, episod
     original(mode, ranked, slots, private, episode, max_teams)
 }
 
+// --- Starting network_startup by hand ------------------------------------------------------------
+// CTheScripts_InitAndLaunchStartup (0x94C63B, launch at 0x94CA43..0x94CAA4) starts
+// "network_startup" in a network game: index by name (0x94B5A0), request (0x94EC40 (index, 0),
+// 0x8D8870 (index, module 0x10475B8)), load what was requested (0x8D8570 (0)), start a thread
+// on the program (0xBDE840 (index)) with 0x400 bytes of stack (0x86EE60 (program, 0, 0, 0x400)),
+// release the request (0x8D8830 (index, module)). All cdecl. With `gamemode = -1` a joiner
+// boots without it (its session calls collided with IVMP's join) and starts it here once it
+// is in the host's session, so it gets the lobby too.
+
+const SCRIPT_INDEX_BY_NAME: usize = 0x0094_B5A0;
+const SCRIPT_REQUEST: usize = 0x0094_EC40;
+const SCRIPT_ADD_REF: usize = 0x008D_8870;
+const LOAD_REQUESTED: usize = 0x008D_8570;
+const SCRIPT_PROGRAM: usize = 0x00BD_E840;
+const START_SCRIPT_THREAD: usize = 0x0086_EE60;
+const SCRIPT_RELEASE: usize = 0x008D_8830;
+const SCRIPT_MODULE: usize = 0x0104_75B8;
+const NETWORK_STARTUP: &[u8] = b"network_startup\0";
+
+/// Starts `network_startup` the way the game's startup code does. Game thread only.
+pub fn start_network_startup() {
+    unsafe {
+        let index_by_name: extern "C" fn(*const u8) -> i32 = std::mem::transmute(memory::from_ghidra(SCRIPT_INDEX_BY_NAME));
+        let request: extern "C" fn(i32, i32) = std::mem::transmute(memory::from_ghidra(SCRIPT_REQUEST));
+        let add_ref: extern "C" fn(i32, u32) = std::mem::transmute(memory::from_ghidra(SCRIPT_ADD_REF));
+        let load_requested: extern "C" fn(i32) = std::mem::transmute(memory::from_ghidra(LOAD_REQUESTED));
+        let program: extern "C" fn(i32) -> usize = std::mem::transmute(memory::from_ghidra(SCRIPT_PROGRAM));
+        let start: extern "C" fn(usize, usize, i32, i32) -> i32 = std::mem::transmute(memory::from_ghidra(START_SCRIPT_THREAD));
+        let release: extern "C" fn(i32, u32) = std::mem::transmute(memory::from_ghidra(SCRIPT_RELEASE));
+        let module = *(memory::from_ghidra(SCRIPT_MODULE) as *const u32);
+        let index = index_by_name(NETWORK_STARTUP.as_ptr());
+        if index < 0 {
+            log!("lobby: network_startup not found ({index})");
+            return;
+        }
+        request(index, 0);
+        add_ref(index, module);
+        load_requested(0);
+        let thread = start(program(index), 0, 0, 0x400);
+        release(index, module);
+        log!("lobby: started network_startup (script {index}, thread {thread})");
+    }
+}
+
 unsafe fn config_field(offset: usize) -> *mut i32 {
     (memory::from_ghidra(MATCH_CONFIG) + offset) as *mut i32
 }

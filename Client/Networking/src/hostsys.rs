@@ -81,15 +81,16 @@ static SYSTEM: Mutex<HostSystem> = Mutex::new(HostSystem { state: State::Idle, a
 impl HostSystem {
     /// Network object ids come from the server, host and joiner alike: the host's grant never
     /// reaches joiners, and the host's own ids would collide with theirs. Taken straight away
-    /// (waiting let the game spawn people and cars it couldn't network), and again once the game
-    /// is running if starting the session emptied them (it does on the joiner).
+    /// (waiting let the game spawn people and cars it couldn't network), and again whenever the
+    /// network state moved on and that emptied them: the joiner's session start does, and in a
+    /// lobby game the joiner stays in the lobby (state 8), where an empty ring left its player
+    /// ped queued for networking for good, so no lobby listed it.
     /// Refilling a ring that still has ids would hand out ids already in use.
     fn give_object_ids(&mut self, network_state: u32) {
-        let in_game = network_state == NETWORK_STATE_IN_GAME;
-        if in_game && self.ids_given != 0 && self.ids_given != NETWORK_STATE_IN_GAME && object_id_count() != 0 {
-            self.ids_given = NETWORK_STATE_IN_GAME;
+        if self.ids_given != 0 && network_state > self.ids_given && object_id_count() != 0 {
+            self.ids_given = network_state;
         }
-        if self.ids_given == 0 || (in_game && self.ids_given != NETWORK_STATE_IN_GAME) {
+        if self.ids_given == 0 || network_state > self.ids_given {
             if let Some((first, count)) = net::object_ids() {
                 use_object_ids(first, count);
                 self.ids_given = network_state.max(1);
@@ -207,14 +208,30 @@ impl HostSystem {
                     self.set(State::Fatal);
                 }
             }
+            // A lobby game (`gamemode = -1`): in the host's session, start our own lobby
+            // script (network_startup) so we show up in the host's lobby; it and the host's
+            // lobby start the game and launch us. We keep the server's object ids in the engine.
+            State::Joined if net::lobby_mode() => {
+                let network_state = unsafe { *(crate::memory::from_ghidra(0x017F_5EA4) as *const u32) };
+                if !self.started {
+                    self.started = true;
+                    log!("host: in the host's session (network state {network_state}), starting the lobby script");
+                    crate::lobby::start_network_startup();
+                }
+                self.frames += 1;
+                if self.frames % 600 == 1 {
+                    log!("host: in the host's lobby, network state {network_state}");
+                }
+                if self.frames % 300 == 1 {
+                    log_players();
+                }
+                self.give_object_ids(network_state);
+                if network_state == NETWORK_STATE_IN_GAME {
+                    crate::spawner::tick();
+                }
+            }
             State::Hosted | State::Joined => {
                 let network_state = unsafe { *(crate::memory::from_ghidra(0x017F_5EA4) as *const u32) };
-                // In a lobby game (`gamemode = -1`) the host's lobby starts the game when the
-                // host picked it; the joiner waits in the lobby state until then.
-                if net::lobby_mode() && !self.started && network_state == NETWORK_STATE_LOBBY {
-                    self.started = true;
-                    log!("host: in the host's lobby, waiting for the host to start the game");
-                }
                 if !self.started && network_state == NETWORK_STATE_LOBBY {
                     self.started = true;
                     let ok = natives::invoke_bool(NETWORK_START_SESSION, &[]);
@@ -251,6 +268,9 @@ impl HostSystem {
                 self.frames += 1;
                 if self.frames % 600 == 1 {
                     log!("host: lobby, network state {network_state}");
+                }
+                if self.frames % 300 == 1 {
+                    log_players();
                 }
                 if network_state >= NETWORK_STATE_LOBBY {
                     self.give_object_ids(network_state);
@@ -448,6 +468,94 @@ fn use_object_ids(first: u16, count: u16) {
             *free += 1;
         }
         log!("host: using the server's object ids {first}..{} (dropped {dropped} engine ids)", first + count);
+    }
+}
+
+/// NETWORK_JOIN_GAME's game handler, while scripts' calls are overridden.
+static ORIGINAL_JOIN_GAME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// NETWORK_JOIN_GAME from a script. In a lobby game (`gamemode = -1`) a joiner is already in the
+/// host's session (IVMP joined it) when it starts its lobby script; that script's network_main
+/// then joins again, the join refuses (already in a session) and its failure path (0x47D9F1 ->
+/// 0x47CDF0) deadlocked the game thread. Report success instead; the join pending / succeeded
+/// natives then answer for IVMP's join, which succeeded.
+extern "C" fn script_join_game(context: *mut u32) {
+    let joined = net::lobby_mode() && SYSTEM.try_lock().is_ok_and(|s| s.state == State::Joined);
+    if joined {
+        unsafe {
+            let ret = *context as *mut u32;
+            if !ret.is_null() {
+                *ret = 1;
+            }
+        }
+        log!("host: a script joined again; we already are in the host's session");
+        return;
+    }
+    let original: extern "C" fn(*mut u32) = unsafe { std::mem::transmute(ORIGINAL_JOIN_GAME.load(std::sync::atomic::Ordering::SeqCst)) };
+    original(context);
+}
+
+static ORIGINAL_WANTS_TO_JOIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORIGINAL_TELL_START: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Last PLAYER_WANTS_TO_JOIN answer per player (bit set = true), to log changes only.
+static WANTS_TO_JOIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WANTS_TO_JOIN_ASKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Diagnostics for the lobby: the host's lobby script lets players in with
+/// PLAYER_WANTS_TO_JOIN(player) and TELL_NET_PLAYER_TO_START_PLAYING(player, ...); log which
+/// players it asks about and the answers (on change).
+extern "C" fn script_wants_to_join(context: *mut u32) {
+    use std::sync::atomic::Ordering;
+    let original: extern "C" fn(*mut u32) = unsafe { std::mem::transmute(ORIGINAL_WANTS_TO_JOIN.load(Ordering::SeqCst)) };
+    original(context);
+    unsafe {
+        let (ret, args) = (*context as *const u32, *context.add(2) as *const u32);
+        if ret.is_null() || args.is_null() {
+            return;
+        }
+        let (player, answer) = (*args, *ret & 0xFF != 0);
+        if player >= 32 {
+            return;
+        }
+        let bit = 1 << player;
+        let first = WANTS_TO_JOIN_ASKED.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+        let before = WANTS_TO_JOIN.load(Ordering::Relaxed) & bit != 0;
+        if first || before != answer {
+            if answer {
+                WANTS_TO_JOIN.fetch_or(bit, Ordering::Relaxed);
+            } else {
+                WANTS_TO_JOIN.fetch_and(!bit, Ordering::Relaxed);
+            }
+            log!("host: lobby script asked PLAYER_WANTS_TO_JOIN({player}) -> {answer}");
+        }
+    }
+}
+
+extern "C" fn script_tell_start(context: *mut u32) {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        let args = *context.add(2) as *const u32;
+        if !args.is_null() {
+            log!("host: lobby script TELL_NET_PLAYER_TO_START_PLAYING({}, {})", *args, *args.add(1));
+        }
+    }
+    let original: extern "C" fn(*mut u32) = unsafe { std::mem::transmute(ORIGINAL_TELL_START.load(Ordering::SeqCst)) };
+    original(context);
+}
+
+/// Overrides natives scripts must not run in a lobby game, and traces the lobby's player
+/// natives. Call after the native table is built.
+pub fn install_lobby_natives() {
+    use std::sync::atomic::Ordering;
+    use ivmp_natives::nativelog::set_override;
+    if let Some(original) = set_override(NETWORK_JOIN_GAME, script_join_game as usize) {
+        ORIGINAL_JOIN_GAME.store(original, Ordering::SeqCst);
+    }
+    if let Some(original) = set_override(PLAYER_WANTS_TO_JOIN, script_wants_to_join as usize) {
+        ORIGINAL_WANTS_TO_JOIN.store(original, Ordering::SeqCst);
+    }
+    if let Some(original) = set_override(TELL_NET_PLAYER_TO_START_PLAYING, script_tell_start as usize) {
+        ORIGINAL_TELL_START.store(original, Ordering::SeqCst);
     }
 }
 

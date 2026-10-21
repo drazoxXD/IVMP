@@ -94,6 +94,7 @@ fn on_attach() {
             nativelog::install();
             nativelog::install_script_names();
             lobby::install_host_override();
+            ivmp_networking::hostsys::install_lobby_natives();
             peer::install();
             instance::install_bind_hook();
             ivmp_networking::jointrace::install();

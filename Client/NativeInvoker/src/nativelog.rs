@@ -7,7 +7,7 @@
 //! are replaced by a call to [`native_thunk`], which logs and then jumps to the handler.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::{log, memory};
@@ -68,12 +68,37 @@ pub fn enable() {
     log!("natives: logging enabled");
 }
 
-extern "C" fn record(handler: usize) {
+/// Natives scripts call that go to our function instead: (game handler, replacement).
+static OVERRIDES: [(AtomicUsize, AtomicUsize); 4] = [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; 4];
+
+/// Script calls of native `hash` go to `replacement` (`extern "C" fn(context)`, the handler's
+/// signature) from now on; it can call the game's handler, which this returns. Our own
+/// [`crate::natives::invoke`] calls aren't redirected.
+pub fn set_override(hash: u32, replacement: usize) -> Option<usize> {
+    let handler = handler_for(hash)?;
+    for (from, to) in &OVERRIDES {
+        if from.load(Ordering::SeqCst) == 0 || from.load(Ordering::SeqCst) == handler {
+            to.store(replacement, Ordering::SeqCst);
+            from.store(handler, Ordering::SeqCst);
+            log!("natives: script calls of {hash:#010x} are overridden");
+            return Some(handler);
+        }
+    }
+    log!("natives: no room to override {hash:#010x}");
+    None
+}
+
+/// Logs the first call of each native; returns the handler to run.
+extern "C" fn record(handler: usize) -> usize {
+    let handler_to_run = OVERRIDES
+        .iter()
+        .find(|(from, _)| from.load(Ordering::Relaxed) == handler)
+        .map_or(handler, |(_, to)| to.load(Ordering::Relaxed));
     if !ENABLED.load(Ordering::Relaxed) {
-        return;
+        return handler_to_run;
     }
     let mut seen = SEEN.lock().unwrap();
-    let Some(seen) = seen.as_mut() else { return };
+    let Some(seen) = seen.as_mut() else { return handler_to_run };
     if seen.insert(handler) {
         let ghidra = handler - memory::game_image().as_ptr() as usize + memory::GHIDRA_BASE;
         match HASHES.get().and_then(|h| h.get(&handler)) {
@@ -81,6 +106,7 @@ extern "C" fn record(handler: usize) {
             None => log!("natives: first call ? (handler {ghidra:#x})"),
         }
     }
+    handler_to_run
 }
 
 /// Entered by `call` from the VM with ECX = native handler and the native context pushed.
@@ -94,6 +120,8 @@ extern "C" fn native_thunk() {
         "push ecx",
         "call {record}",
         "add esp, 4",
+        // ECX in the saved registers (flags at [esp], then EDI..EAX) = the handler to run.
+        "mov [esp + 0x1C], eax",
         "popfd",
         "popad",
         // Tail-jump: the handler returns straight to the VM.

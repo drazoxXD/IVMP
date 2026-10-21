@@ -182,5 +182,27 @@ lobby host and pick the game (`lobby.rs` passes the script's own host arguments)
 joins that session through hostsys as in peer to peer, with no lobby script of its own (in the
 first test cl2's network_startup ran alongside IVMP's join, the join failed and the game thread
 hung in the join code at 0x47CF9F), and doesn't start the session: the host's lobby does. The host
-is forced unranked (the script passed ranked 44037632). Object ids and the spawner still run. If the mode arrives after the session started loading the
-log says "no lobby this time".
+is forced unranked (the script passed ranked 44037632). Object ids and the spawner still run.
+Second test: the joiner joined the host's session but stayed out of the lobby (1/32): the lobby's
+player list needs the joiner's own lobby script. Now the joiner starts network_startup by hand
+(`lobby.rs start_network_startup`, the game's own launch calls from 0x94CA43) once it is in the
+host's session; its host call stays blocked and IVMP no longer launches it into the world.
+Third test: the joiner's network_startup called CREATE_PLAYER although IVMP had made the player
+at load; the second CreatePlayer crashed (null + 0xA60 at 0x9F19C8). The native's CreatePlayer call
+(0xBB339D) now returns the existing player when there is one (boot.rs create_player_from_script).
+Fourth test: network_main on the joiner called NETWORK_JOIN_GAME again; the join refused (already
+in a session) and its failure path (0x47D9F1 -> 0x47CDF0) deadlocked. Script calls of
+NETWORK_JOIN_GAME now report success while IVMP has joined (hostsys script_join_game, via
+`nativelog::set_override`, which redirects a native for scripts only).
+Fifth test: both games reach the Free Mode lobby (network state 8, freemode_cr on both, "Peer X
+has joined" both ways) but neither lists the other: host 1/32, joiner 0/32 (not even itself). The
+host's engine log dirties PLAYERINFO element 0 at start, the joiner never dirties its element
+(31). Only the host's scripts called PLAYER_WANTS_TO_JOIN (0x7D99343C) and
+TELL_NET_PLAYER_TO_START_PLAYING (0x465D424D). Next build logs both (args, answers) and the
+players (`log_players`) in the lobby states.
+Sixth test: the host's lobby did let the joiner in (PLAYER_WANTS_TO_JOIN(1) -> true,
+TELL_NET_PLAYER_TO_START_PLAYING(31, 0)), but the joiner had no network object ids: they came at
+state 6, entering the lobby (state 8) emptied the ring and hostsys only refilled at state 10, so
+the joiner's player ped stayed queued for networking (no net object) and no lobby listed it.
+`give_object_ids` now refills whenever the network state moved on and the ring is empty.
+If the mode arrives after the session started loading the log says "no lobby this time".
