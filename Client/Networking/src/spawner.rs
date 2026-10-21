@@ -39,6 +39,13 @@ const ENTITY_NET_OBJECT: usize = 0x6C;
 const NET_OBJECT_ID: usize = 0xC;
 /// Frames to wait for a model to stream in.
 const LOAD_TIMEOUT_FRAMES: u32 = 600;
+/// Frames our networked player must exist before we spawn anything: the factories touch the
+/// local player (spawning right as the session started crashed in 0x5DA990 -> 0xA31B10).
+const READY_FRAMES: u32 = 300;
+/// Local player: index 0x1036F14 into the CPlayerInfo pointers at 0x11A8808; info +0x598 = ped.
+const LOCAL_PLAYER_INDEX: usize = 0x0103_6F14;
+const PLAYER_INFOS: usize = 0x011A_8808;
+const PLAYER_INFO_PED: usize = 0x598;
 
 pub struct Request {
     pub id: u32,
@@ -56,6 +63,24 @@ struct Pending {
 
 static QUEUE: Mutex<VecDeque<Request>> = Mutex::new(VecDeque::new());
 static LOADING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Frames our networked player has existed for.
+static READY: Mutex<u32> = Mutex::new(0);
+
+/// Our player's ped exists and is networked.
+fn local_player_networked() -> bool {
+    unsafe {
+        let index = *(memory::from_ghidra(LOCAL_PLAYER_INDEX) as *const u32);
+        if index >= 32 {
+            return false;
+        }
+        let info = *(memory::from_ghidra(PLAYER_INFOS + 4 * index as usize) as *const usize);
+        if info == 0 {
+            return false;
+        }
+        let ped = *((info + PLAYER_INFO_PED) as *const usize);
+        ped != 0 && *((ped + ENTITY_NET_OBJECT) as *const usize) != 0
+    }
+}
 
 /// Queues a spawn from the server (any thread); done by [`tick`].
 pub fn request(request: Request) {
@@ -71,6 +96,13 @@ pub fn request(request: Request) {
 
 /// Game thread, every frame once we are in the session.
 pub fn tick() {
+    {
+        let mut ready = READY.lock().unwrap();
+        *ready = if local_player_networked() { ready.saturating_add(1) } else { 0 };
+        if *ready < READY_FRAMES {
+            return;
+        }
+    }
     let new: Vec<Request> = QUEUE.lock().unwrap().drain(..).collect();
     let mut loading = LOADING.lock().unwrap();
     for request in new {
