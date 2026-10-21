@@ -193,3 +193,120 @@ with its object id. The server follows it in the registry and has it created aga
 gone for 10 s. Console: `spawn car|ped <model> [x y z [heading]]`, `entities`, `despawn <id>`.
 Native hashes in 1.2.0.59 don't match the public lists (old ones are joaat of the lowercase
 name), so the factories are called directly.
+
+Despawn: the server sends `ServerMessage::Despawn` to the entity's owner; the client looks the
+network object up (0x4913C0 on the object manager at 0x1908EF0) and destroys the entity with
+its factory (vehicles 0xB59180, peds 0xB58EA0), which unregisters it for everyone.
+
+
+## Server as the session host (in progress, 2026-10-21)
+
+Goal: the server is the permanent session host; every game joins it, none hosts, no migration.
+
+Join, in order (capture of a join, joiner 2 -> host 1):
+1. 2 bytes `11 10`, answered the same (connection check, not a frame packet).
+2. netKeyExchangeOffer / Answer (packet flag 1: not frames).
+3. rlSessionDetailRequest -> rlSessionDetailResponse (session attributes `MMATTR_*`), out of band.
+4. Key exchange again, then snMsgJoinRequest + CMsgJoinRequest (reliable, channel 13).
+5. Host: snMsgJoinResponse, CMsgPeerData, CMsgHostData, snMsgAddGamerToSessionCmd, CMsgPeerData,
+   snMsgStartMatchCmd; then snMsgChangeSessionAttributesCmd, netTimeSyncMsg (out of band),
+   CMsgInformObjectIDs, CMsgGetReadyToStartPlaying; joiner answers CMsgStartedLocalPlayerPlaying.
+6. Keep-alive: every second, an ack-only frame per channel (13, 7, 15).
+
+Frame header (9 bytes, bits MSB first; receive 0x6CF560, per connection 0x6F60B0):
+size 10 | out-of-band 1 | direct 1 | has ack 1 | has seq 1 | channel 4 | seq 16 | ack 16 | 22 bits.
+`ack` is the next reliable sequence expected. Out-of-band frames carry one message directly.
+Chunks inside a connection frame (0x6F50E0): size 10 | reliable 1 | 16 bits (previous seq) |
+seq 16 if reliable; header 6 bytes reliable, 4 otherwise; then the messages. Session messages
+start with an 8-byte envelope (`8c 25 30 00 00 00 <len>`) before the message magic.
+`cargo run -p Sync --example frames -- capture.bin` dumps all of this.
+
+Implementation (`Server/Host`, `Server --host`): the server answers as client 254. `frame.rs` is the
+packet/frame/chunk codec (every packet of a recording re-encodes byte for byte); `session.rs`
+keeps one connection per client with reliable channels 13/7/15 (SYN chunk, acks = next expected,
+unreliable chunks also use a sequence number, resend after 250 ms, SYN resend after 500 ms, ack
+keep-alive every second); `templates/` holds the host's join messages from a recording hosted as
+254. Time sync answers are live (netTimeSyncMsg 0x6BE7E0: type 2 bits, sequence, token, client
+time, host time). Clients skip the packet MAC check (crypt.rs).
+
+### How to use and test
+
+* `Server.exe --host [--capture file]`: the server hosts, every client joins it (client
+  `Welcome.host` = 254). Without `--host` the first player hosts as before.
+* `Server.exe --ids 254,2 --capture hostA.bin`: hands out client ids in join order, used to
+  record a session hosted by a game as id 254 (where the templates come from).
+* Tools (`Server/`): `cargo run -p Host --example extract -- hostA.bin 441a7b8ee505d6c6 DrazoxXD_HUN`
+  (write templates, swapping the recording host's gamer handle and name for the server's
+  `IVMPSRV\xFE` / `IVMP_Server`), `--example roundtrip` (codec check), `--example diff a.bin b.bin`
+  (host join messages of two recordings), `--example chunks capture.bin <from id>` (what one side
+  sent), `--example simulate capture.bin <client>` (feed a client's packets to the server host),
+  `cargo run -p Sync --example frames|handshake -- capture.bin` (frame / message dumps).
+
+### Templates (from recording A, host 254 and joiner 2)
+
+* `key_answer.bin`: key exchange answer packet (flag 1); identical for any joiner.
+* `session_detail.bin`: rlSessionDetailResponse (out of band, ch13); 9 bytes at 14..22 differ
+  per session.
+* ch13, in order: `ch13_0` snMsgJoinResponse + CMsgPeerData (the joiner's) + CMsgHostData;
+  `ch13_1` snMsgAddGamerToSessionCmd (the host gamer) + CMsgPeerData (host's); `ch13_2`
+  snMsgStartMatchCmd; `ch13_3` snMsgChangeSessionAttributesCmd.
+* ch7, in order: CMsgInformObjectIDs (empty: ids come from the IVMP server), CMsgVoiceStatus,
+  CMsgTextStatus, CMsgGetReadyToStartPlaying (203 bytes of game state). Sent once the client
+  talks on ch7.
+* Session messages on ch13 start with a 7-byte envelope `8c 25 30 00 00 00 XX` (XX = 1f, 20, 39
+  in the recording); it is stripped before the message handlers see the message (+0x1C/+0x20 of
+  the received message = data/length without it).
+
+### Findings
+
+* Identity: the recording's host was a real player (DrazoxXD_HUN, gamer handle
+  `44 1a 7b 8e e5 05 d6 c6`). Replaying it unchanged made the server look like that player; a
+  client logged into the same account ignored the host, never opened ch7, and later made itself
+  host ("DrazoxXD_HUN has become the new host" in IVMP_Engine.log). With the server's own handle
+  and name the client opens ch7, gets the game state, lists the server as player (slot 1 in its
+  player list) and plays normally. Working since test host3.
+* Player slots: CMsgPeerData's first byte is the player slot (host's 1, joiner's 31 in the
+  recording). The server gives client `id` slot `32 - id` (in the joiner's own peer data in
+  ch13_0) and the client creates its player there when the host is 254 (`boot.rs player_slot`).
+* snMsgJoinRequest (0x41) and snMsgAddGamerToSessionCmd (0x64) have the same body (both read by
+  0x626E70): session part 0x627640 (session id u32,u32 via 0x627780 = 2:0 in IVMP, handle 0x628030,
+  0x628110, 0x48AC50, 10-bit length + bytes), 6-bit gamer count (< 33), per gamer 0x4E0800. A join
+  request is `0x41 + body` then CMsgJoinRequest (0x68); the first 121 bits of 0x68's body look
+  like the player's CMsgPeerData (slot 0, second field 0000001 instead of 1000001).
+* CMsgPeerData (0x90), read by 0x48A980: slot 8 bits (0x48AB70), 0x48ABE0, 5 bits, 32 bits,
+  32+32, 0x48AB00, flag (0x48A940) and optional fields; 121 bits for a joiner.
+* AddGamer handling on a member (0x6245C0): validation 0x623D80 = session state (+0x50) 2..3,
+  message connection (+0x18) == host's (peer id +0xC30/+0xC34 looked up by 0x622EA0), parse
+  (0x61D300 -> 0x626E70), session id == +0x540/+0x544; then join-to-rline task (0x623490),
+  gamers added (0x660B00), task start (0x626B70).
+
+### Where it stands (2026-10-21)
+
+* One player: joins the server host and plays (tests host3..host9).
+* Two players: both join; the server sends each an AddGamer for the other ("introduced clients 2
+  and 1"), built as envelope (message number counted up from 0x41) + 0x64 + the other player's
+  join body (session id forced to 2:0) + CMsgPeerData (from the other player's 0x68, slot set,
+  bit 8 set). Both clients ack it, but the client rejects it at the validation step (trace:
+  "add gamer: message valid -> 0"). Logged values: state 2, message connection == host
+  connection (0x10000), session id 2:0 on both sides. So the parse fails (0x61D300), or the
+  parsed session id differs. The DLL now parses the message itself and logs the result and the
+  bytes (`jointrace.rs install_add_gamer_trace`) to find out which.
+* No traffic between the two clients yet, so no player, NPC or vehicle sync in --host mode.
+* Not done: players leaving (snMsgRemoveGamersFromSessionCmd), more than one recorded template
+  session, object id grants from the host (clients use the IVMP server's ids).
+
+### Notes on recordings
+
+* Recording B (`--ids 254,3`): the joiner with id 3 didn't see the host (host was slot 1 for it),
+  a client-hosting side issue with ids above 2; irrelevant once the server hosts.
+* The diff of A and B shows the host's join messages depend on the session, not on the joiner.
+
+### Next (2026-10-21, after host9)
+
+* host9 showed the client's own parse of the intro AddGamer fails (0x61D300 -> 0), while the
+  server's own AddGamer parses. The intro's gamer block is bit for bit the other player's join
+  request block (748 bits); the parse must depend on content (gamer info import 0x6BDB70 via
+  0x628030, peer address import 0x6C70C0 via 0x628110, 0x48AC50, 6-bit count, 0x4E0800 per gamer).
+* The DLL (14:52 build) traces each field read of the block (`jointrace.rs`, "gamer block: ..."
+  lines). Next test: `Server.exe --host --capture host10.bin`, two clients, then read which field
+  returns 0 for the intro.
