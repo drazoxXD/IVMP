@@ -22,9 +22,9 @@ static CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
 /// Last display size, for centring the raw cursor.
 static DISPLAY_SIZE: (AtomicU32, AtomicU32) = (AtomicU32::new(0), AtomicU32::new(0));
 
-/// The game gets no keyboard or mouse input: the console or the web page is up.
+/// The game gets no keyboard or mouse input: the console is open or the web page has them (F2).
 pub fn capturing() -> bool {
-    CONSOLE_OPEN.load(Ordering::Relaxed) || crate::web::visible()
+    CONSOLE_OPEN.load(Ordering::Relaxed) || crate::web::focused()
 }
 
 fn console_open() -> bool {
@@ -56,6 +56,7 @@ static SHOW_FPS: AtomicBool = AtomicBool::new(false);
 static SHOW_PING: AtomicBool = AtomicBool::new(false);
 static SHOW_NET: AtomicBool = AtomicBool::new(false);
 static SHOW_PERF: AtomicBool = AtomicBool::new(false);
+static SHOW_MEMORY: AtomicBool = AtomicBool::new(false);
 
 /// Microseconds the game's own update took last frame (set by `game_process` in boot.rs).
 pub static GAME_TICK_US: AtomicU32 = AtomicU32::new(0);
@@ -73,7 +74,7 @@ pub fn raw_mouse(dx: i32, dy: i32, wheel: i32) {
     position[1] = (position[1] + dy as f32).clamp(0.0, (height - 1.0).max(0.0));
     let at = *position;
     drop(position);
-    if !console_open() && crate::web::visible() {
+    if !console_open() && crate::web::focused() {
         if dx != 0 || dy != 0 {
             crate::web::mouse_move(at[0], at[1]);
         }
@@ -88,7 +89,7 @@ pub fn raw_mouse(dx: i32, dy: i32, wheel: i32) {
 pub fn raw_button(index: usize, down: bool) {
     static STATE: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
     if index < 3 && STATE[index].swap(down, Ordering::Relaxed) != down {
-        if !console_open() && crate::web::visible() {
+        if !console_open() && crate::web::focused() {
             crate::web::mouse_button(index, down);
             return;
         }
@@ -271,6 +272,7 @@ fn menu_bar(ui: &imgui::Ui) -> f32 {
             wip_menu(ui, "NetGraph", "Real-time graph of ping, packets, bytes and routing");
             ui.menu("Performance", || {
                 flag_menu(ui, "Draw Performance", &SHOW_PERF);
+                flag_menu(ui, "Memory", &SHOW_MEMORY);
             });
         });
         ui.menu("Launch", || {
@@ -340,7 +342,7 @@ fn wip_menu(ui: &imgui::Ui, label: &str, about: &str) {
     }
 }
 
-/// Keyboard and mouse messages while the web page is up: forwarded to it, hidden from the game.
+/// Keyboard and mouse messages while the web page has them (F2): forwarded to it, hidden from the game.
 fn web_message(message: u32, wparam: usize, lparam: isize) -> bool {
     let modifiers = unsafe {
         (if GetKeyState(VK_SHIFT.0 as i32) < 0 { 2 } else { 0 })
@@ -621,7 +623,8 @@ impl Ui {
     }
 
     fn overlay_command(&mut self, args: &[&str]) {
-        let panels: [(&str, &AtomicBool); 4] = [("fps", &SHOW_FPS), ("ping", &SHOW_PING), ("net", &SHOW_NET), ("perf", &SHOW_PERF)];
+        let panels: [(&str, &AtomicBool); 5] =
+            [("fps", &SHOW_FPS), ("ping", &SHOW_PING), ("net", &SHOW_NET), ("perf", &SHOW_PERF), ("mem", &SHOW_MEMORY)];
         let Some(which) = args.first().map(|a| a.to_lowercase()) else {
             let state: Vec<String> =
                 panels.iter().map(|(n, f)| format!("{n} {}", if f.load(Ordering::Relaxed) { "on" } else { "off" })).collect();
@@ -641,7 +644,7 @@ impl Ui {
             }
         }
         if !found {
-            self.print(ERROR_COLOR, "usage: overlay <fps|ping|net|perf|all> [on|off]");
+            self.print(ERROR_COLOR, "usage: overlay <fps|ping|net|perf|mem|all> [on|off]");
         }
     }
 
@@ -915,13 +918,14 @@ fn draw_overlay(ui: &imgui::Ui, stats: &Stats, top: f32) {
                 ui.text_wrapped(&problem);
             });
     }
-    let (fps, ping, net, perf) = (
+    let (fps, ping, net, perf, memory) = (
         SHOW_FPS.load(Ordering::Relaxed),
         SHOW_PING.load(Ordering::Relaxed),
         SHOW_NET.load(Ordering::Relaxed),
         SHOW_PERF.load(Ordering::Relaxed),
+        SHOW_MEMORY.load(Ordering::Relaxed),
     );
-    if !(fps || ping || net || perf) {
+    if !(fps || ping || net || perf || memory) {
         return;
     }
     ui.window("##overlay")
@@ -968,6 +972,19 @@ fn draw_overlay(ui: &imgui::Ui, stats: &Stats, top: f32) {
             if perf {
                 ui.text(format!("Frame {:.1} ms (min {:.1}, max {:.1})", stats.avg_ms, stats.min_ms, stats.max_ms));
                 ui.text(format!("Game update {:.1} ms", stats.game_ms));
+            }
+            if memory {
+                use crate::memstats::format;
+                match crate::memstats::usage() {
+                    None => ui.text("Memory: measuring..."),
+                    Some(m) => {
+                        ui.text(format!("GAME: {}", format(m.game)));
+                        ui.text(format!("CEF: {} ({} processes)", format(m.cef), m.cef_processes));
+                        ui.text(format!("Client: {}", format(m.client)));
+                        ui.text(format!("Mods: {} ({})", format(m.mods), m.mod_count));
+                        ui.text(format!("Total: {}", format(m.total)));
+                    }
+                }
             }
         });
 }

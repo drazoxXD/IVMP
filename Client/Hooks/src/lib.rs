@@ -18,9 +18,14 @@ mod ui;
 mod web;
 mod focus;
 mod hang;
+mod memstats;
 mod mods;
 mod scripts;
 mod window;
+
+/// Counts the client's heap for the Memory overlay.
+#[global_allocator]
+static ALLOCATOR: memstats::Counting = memstats::Counting;
 
 pub(crate) use ivmp_core::{log, memory};
 use ivmp_natives::nativelog;

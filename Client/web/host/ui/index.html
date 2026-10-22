@@ -3,32 +3,16 @@
 <title>IVMP web layer</title>
 <style>
   html, body { margin: 0; background: transparent; font: 18px Segoe UI, sans-serif; color: #e8eef5; overflow: hidden; }
-  .panel { position: absolute; right: 40px; top: 60px; width: 420px; padding: 18px 24px;
-           background: rgba(22, 24, 28, .85); border-left: 4px solid #51b3ec; }
-  h1 { margin: 0 0 10px; font-size: 24px; font-weight: 600; }
-  .row { margin: 8px 0; }
-  button { font: inherit; padding: 6px 14px; background: #51b3ec; color: #101418; border: 0; cursor: pointer; }
-  button:hover { background: #7cc6f2; }
-  input { font: inherit; padding: 5px 8px; width: 240px; background: #323232; color: #fff; border: 1px solid #51b3ec; }
-  code { color: #9fd3f5; }
+  .version { position: absolute; right: 16px; bottom: 12px; font-size: 15px; font-weight: 600;
+             color: rgba(255, 255, 255, .8); text-shadow: 0 1px 3px rgba(0, 0, 0, .9); pointer-events: none; }
 </style>
-<div class="panel">
-  <h1>IVMP web layer</h1>
-  <div class="row">Page <code id="origin"></code></div>
-  <div class="row">Clicks: <code id="clicks">0</code> <button id="btn">Send to game</button></div>
-  <div class="row"><input id="text" placeholder="type here (keyboard test)"></div>
-  <div class="row">From the game: <code id="fromgame">-</code></div>
-  <div class="row">Frame: <code id="tick">0</code></div>
-</div>
+<div class="version" id="version">IVMP</div>
 <script src="ivmp.js"></script>
 <script>
-  document.getElementById('origin').textContent = location.href;
-  let clicks = 0;
-  document.getElementById('btn').addEventListener('click', () => {
-    document.getElementById('clicks').textContent = ++clicks;
-    ivmp.send('web.click', { clicks, text: document.getElementById('text').value });
+  // Bottom right: "IVMP", or "IVMP - N Mods loaded" when the client loaded mods.
+  ivmp.on('game.info', ({ mods }) => {
+    const label = mods > 0 ? `IVMP - ${mods} ${mods === 1 ? 'Mod' : 'Mods'} loaded` : 'IVMP';
+    document.getElementById('version').textContent = label;
   });
-  ivmp.on('game.hello', (data) => { document.getElementById('fromgame').textContent = JSON.stringify(data); });
-  let n = 0;
-  setInterval(() => { document.getElementById('tick').textContent = ++n; }, 500);
+  ivmp.send('page.ready');
 </script>

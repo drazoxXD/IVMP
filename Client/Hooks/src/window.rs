@@ -112,7 +112,7 @@ fn make_borderless(window: HWND) {
             screen.bottom - screen.top,
             SWP_FRAMECHANGED | SWP_NOZORDER,
         );
-        log!("window: borderless, {}x{} at {},{}", screen.right - screen.left, screen.bottom - screen.top, screen.left, screen.top);
+        // log!("window: borderless, {}x{} at {},{}", screen.right - screen.left, screen.bottom - screen.top, screen.left, screen.top);
     }
 }
 

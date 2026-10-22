@@ -1,11 +1,12 @@
 //! The web layer: CEF runs in its own process (`IVMP_Web.exe` in the `cef` folder next to
 //! IVMP_Client.dll), so no CEF thread or window lives in the game (the Steam overlay's hooks
 //! crashed on those). The game talks to it over a named pipe and reads the page's frames from a
-//! shared-memory mapping, copies them into a Direct3D 9 texture and draws that under imgui.
-//! See docs/web-engine-research.md.
+//! shared-memory mapping, copies them into a Direct3D 9 texture and draws that over the game and
+//! under imgui. See docs/web-engine-research.md.
 //!
-//! F2 shows or hides the page (and gives it the keyboard and mouse); the first F2 starts the
-//! process. Without the `cef` folder (it ships in IVMP_Client.zip) nothing happens.
+//! The process starts with the game and the page is always drawn; F2 only gives it the keyboard
+//! and mouse, or takes them back. Without the `cef` folder (it ships in IVMP_Client.zip) nothing
+//! happens.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -58,7 +59,7 @@ struct Host {
     frame: Frame,
 }
 
-/// The connected web process (None before the first F2 and after it ended).
+/// The connected web process (None while it starts and after it ended).
 static HOST: RwLock<Option<Arc<Host>>> = RwLock::new(None);
 
 fn host() -> Option<Arc<Host>> {
@@ -72,7 +73,8 @@ const PROTOCOL: u32 = 1;
 /// When the web process was (re)started, to give up on a crash loop.
 static STARTS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
 const MAX_STARTS_PER_MINUTE: usize = 3;
-static VISIBLE: AtomicBool = AtomicBool::new(false);
+/// The page has the keyboard and mouse (F2); it is drawn either way.
+static FOCUSED: AtomicBool = AtomicBool::new(false);
 static LAST_X: AtomicU32 = AtomicU32::new(0);
 static LAST_Y: AtomicU32 = AtomicU32::new(0);
 /// 0 not started, 1 starting, 2 ready, 3 failed.
@@ -80,8 +82,9 @@ static LAST_Y: AtomicU32 = AtomicU32::new(0);
 static DEVTOOLS_PENDING: AtomicBool = AtomicBool::new(false);
 static STATE: AtomicU8 = AtomicU8::new(0);
 
-pub fn visible() -> bool {
-    VISIBLE.load(Ordering::Relaxed) && host().is_some()
+/// The page has the keyboard and mouse: the game gets none.
+pub fn focused() -> bool {
+    FOCUSED.load(Ordering::Relaxed) && host().is_some()
 }
 
 fn send(kind: u8, payload: &[u8]) {
@@ -97,11 +100,14 @@ fn ints(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// Notes whether the cef folder is there. CEF itself starts on the first F2, not with the game.
+/// Starts the web process with the game when the cef folder is there.
 pub fn install() {
     let folder = crate::dll_dir().join("cef");
     if folder.join("IVMP_Web.exe").exists() {
-        log!("web: cef folder found, F2 starts the web layer");
+        log!("web: cef folder found, starting the web layer");
+        if STATE.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            std::thread::spawn(|| start(false));
+        }
     } else {
         log!("web: no cef folder next to the client ({}), the web layer is off", folder.display());
     }
@@ -114,9 +120,35 @@ fn fail(why: &str) {
 
 /// A job object that kills everything in it when the game (its last handle) goes away, so the web
 /// process and CEF's helper processes never outlive the game, even after a crash.
+/// The job object holding the web process and CEF's helpers (0 = none).
+static JOB: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+/// Process ids of the web process and CEF's helper processes (all in the job object).
+pub fn process_ids() -> Vec<u32> {
+    use windows::Win32::System::JobObjects::{JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList, QueryInformationJobObject};
+    let Some(&job) = JOB.get().filter(|job| **job != 0) else { return Vec::new() };
+    // The list struct with room for 64 ids after its header.
+    let mut buffer = [0usize; 2 + 64];
+    let ok = unsafe {
+        QueryInformationJobObject(Some(HANDLE(job as *mut _)), JobObjectBasicProcessIdList, buffer.as_mut_ptr() as *mut _, size_of_val(&buffer) as u32, None)
+    };
+    if ok.is_err() {
+        return Vec::new();
+    }
+    let list = unsafe { &*(buffer.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+    let count = (list.NumberOfProcessIdsInList as usize).min(64);
+    let ids = unsafe { std::slice::from_raw_parts(list.ProcessIdList.as_ptr(), count) };
+    ids.iter().map(|id| *id as u32).collect()
+}
+
+/// Bytes of the page's texture in the game process (a managed texture: a system memory copy too).
+pub fn texture_bytes() -> usize {
+    let (width, height) = LAYER.lock().unwrap().0.size;
+    width as usize * height as usize * 4
+}
+
 fn put_in_job(child: &std::process::Child) {
     use std::os::windows::io::AsRawHandle;
-    static JOB: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
     let job = *JOB.get_or_init(|| unsafe {
         let Ok(job) = CreateJobObjectW(None, None) else { return 0 };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -137,8 +169,9 @@ fn put_in_job(child: &std::process::Child) {
 }
 
 /// Starts IVMP_Web.exe, connects to its pipe and maps its frame. Runs on its own thread.
-/// Starts IVMP_Web.exe. `show`: open the page once connected (the first F2), not after a restart.
-fn start(show: bool) {
+/// Starts IVMP_Web.exe. `focus`: give the page the keyboard and mouse once connected (F2 pressed
+/// while it was not running), not at launch or after a restart.
+fn start(focus: bool) {
     let folder = crate::dll_dir().join("cef");
     let exe = folder.join("IVMP_Web.exe");
     if !exe.exists() {
@@ -200,13 +233,14 @@ fn start(show: bool) {
     }
     *HOST.write().unwrap() = Some(Arc::new(Host { pipe: Mutex::new(pipe), frame: Frame { base: view.Value as *const u8 } }));
     std::thread::spawn(move || read_messages(reader));
-    // Hidden until shown (the first F2 asked for it, so show it now).
-    send(TO_VISIBLE, &ints(&[0]));
+    // Always drawn; the keyboard and mouse stay with the game until F2.
+    send(TO_VISIBLE, &ints(&[1]));
+    send(TO_FOCUS, &ints(&[0]));
     STATE.store(2, Ordering::SeqCst);
     log!("web: connected to IVMP_Web.exe");
     if DEVTOOLS_PENDING.swap(false, Ordering::SeqCst) {
         send(TO_DEVTOOLS, &[]);
-    } else if show {
+    } else if focus {
         toggle();
     }
 }
@@ -219,7 +253,7 @@ fn read_messages(mut pipe: File) {
         if pipe.read_exact(&mut length).is_err() {
             log!("web: the web process closed the pipe");
             *HOST.write().unwrap() = None;
-            VISIBLE.store(false, Ordering::Relaxed);
+            FOCUSED.store(false, Ordering::Relaxed);
             restart();
             return;
         }
@@ -234,13 +268,16 @@ fn read_messages(mut pipe: File) {
         let text = String::from_utf8_lossy(&body[1..]).to_string();
         match body[0] {
             FROM_LOG => log!("{text}"),
+            // The page asks for the client info once it has loaded (a game.info sent before that
+            // would be lost).
+            FROM_BRIDGE if text.starts_with(r#"{"name":"page.ready""#) => send_client_info(),
             FROM_BRIDGE => log!("web: bridge: {text}"),
             FROM_READY => {
                 let version = body.get(1..5).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0);
                 if version != PROTOCOL {
                     log!("web: IVMP_Web.exe speaks protocol {version}, the client {PROTOCOL}: the cef folder does not match this client, the web layer is off");
                     *HOST.write().unwrap() = None;
-                    VISIBLE.store(false, Ordering::Relaxed);
+                    FOCUSED.store(false, Ordering::Relaxed);
                     STATE.store(3, Ordering::SeqCst);
                     return;
                 }
@@ -288,31 +325,34 @@ pub fn open_devtools() {
     send(TO_DEVTOOLS, &[]);
 }
 
-/// F2: show or hide the page (and give it, or take back, the keyboard and mouse).
+/// F2: give the page the keyboard and mouse, or take them back. The page stays drawn.
 pub fn toggle() {
     if host().is_none() {
-        // First use: start the process (on its own thread); the page opens when it is connected.
+        // Not running (it could not start with the game): start it, focused once connected.
         if STATE.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             std::thread::spawn(|| start(true));
         }
         return;
     }
-    let show = !VISIBLE.load(Ordering::Relaxed);
-    VISIBLE.store(show, Ordering::Relaxed);
-    send(TO_VISIBLE, &ints(&[show as i32]));
-    send(TO_FOCUS, &ints(&[show as i32]));
-    if show {
+    let focus = !FOCUSED.load(Ordering::Relaxed);
+    FOCUSED.store(focus, Ordering::Relaxed);
+    send(TO_FOCUS, &ints(&[focus as i32]));
+    if focus {
         crate::ui::reset_raw_cursor();
-        // Tell the page the game is here (the other direction of the bridge).
-        let mut payload = b"game.hello\0".to_vec();
-        payload.extend_from_slice(br#"{"from":"IVMP client"}"#);
-        send(TO_EMIT, &payload);
+        send_client_info();
     }
 }
 
+/// Tells the page about the client (`game.info`: how many mods are loaded, for the corner label).
+fn send_client_info() {
+    let mut payload = b"game.info\0".to_vec();
+    payload.extend_from_slice(format!(r#"{{"mods":{}}}"#, crate::mods::loaded_count()).as_bytes());
+    send(TO_EMIT, &payload);
+}
+
+/// Takes the keyboard and mouse back from the page (Escape, loading screens); it stays drawn.
 pub fn close() {
-    if VISIBLE.swap(false, Ordering::Relaxed) {
-        send(TO_VISIBLE, &ints(&[0]));
+    if FOCUSED.swap(false, Ordering::Relaxed) {
         send(TO_FOCUS, &ints(&[0]));
     }
 }
@@ -413,12 +453,10 @@ pub fn device_lost() {
     layer.0.size = (0, 0);
 }
 
-/// Copies a new frame into the texture and draws it over the screen. Call before the UI, at Present.
+/// Copies a new frame into the texture and draws it over the game, every frame. Call before the
+/// UI (imgui), so imgui draws on top of the page.
 pub fn draw(device: &IDirect3DDevice9) {
     let Some(host) = host() else { return };
-    if !VISIBLE.load(Ordering::Relaxed) {
-        return;
-    }
     let mut viewport = D3DVIEWPORT9::default();
     if unsafe { device.GetViewport(&mut viewport) }.is_err() || viewport.Width == 0 {
         return;

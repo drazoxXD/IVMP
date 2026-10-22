@@ -181,12 +181,28 @@ class Client : public CefClient, public CefRenderHandler, public CefRequestHandl
     router_->OnBeforeClose(browser);
     g_browser = nullptr;
   }
-  bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t, const CefString& message, const CefString&, int) override {
-    Log("web: page: %s", message.ToString().c_str());
-    return false;
+  // The page's console (console.log, warnings, errors and uncaught exceptions) goes to the game's
+  // log as the `cef` channel, which the in-game console shows; errors read "error" (shown in red).
+  bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level, const CefString& message, const CefString& source, int line) override {
+    std::string text = message.ToString();
+    if (level >= LOGSEVERITY_ERROR) {
+      Log("cef: error: %s (%s:%d)", text.c_str(), source.ToString().c_str(), line);
+    } else if (level == LOGSEVERITY_WARNING) {
+      Log("cef: warning: %s", text.c_str());
+    } else {
+      Log("cef: %s", text.c_str());
+    }
+    return true;
   }
   void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int status) override {
     if (frame->IsMain()) Log("web: page loaded (status %d)", status);
+  }
+  void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, ErrorCode code, const CefString& text, const CefString& url) override {
+    Log("cef: error: %s could not load: %s (%d)", url.ToString().c_str(), text.ToString().c_str(), (int)code);
+  }
+  void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser, TerminationStatus status, int code, const CefString& text) override {
+    Log("cef: error: the page's render process ended (status %d, code %d) %s", (int)status, code, text.ToString().c_str());
+    router_->OnRenderProcessTerminated(browser);
   }
 
   IMPLEMENT_REFCOUNTING(Client);

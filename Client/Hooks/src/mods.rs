@@ -44,6 +44,31 @@ struct Roots {
 
 static ROOTS: OnceLock<Roots> = OnceLock::new();
 static REDIRECTS: AtomicU32 = AtomicU32::new(0);
+/// Plugins (.asi) loaded, by us or by the ASI loader; the web page shows the count.
+static LOADED_PLUGINS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many plugins (.asi) were loaded.
+pub fn loaded_count() -> usize {
+    LOADED_PLUGINS.load(Ordering::Relaxed)
+}
+
+/// The .asi files in `folders`, each name once (the first folder holding it wins).
+fn plugin_files(folders: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for folder in folders {
+        let Ok(entries) = std::fs::read_dir(folder) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("asi"))
+                && seen.insert(entry.file_name().to_string_lossy().to_lowercase())
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
 
 static ORIGINALS: [AtomicUsize; 9] = [const { AtomicUsize::new(0) }; 9];
 const I_CREATE_W: usize = 0;
@@ -248,28 +273,17 @@ fn log_asi_loaders(when: &str) {
 /// Loads every `.asi` in `folders` (the first folder holding a file name wins, so the same plugin
 /// isn't loaded twice). Returns how many were loaded.
 fn load_plugins(folders: &[PathBuf]) -> usize {
-    let mut seen = std::collections::HashSet::new();
     let mut loaded = 0;
-    for folder in folders {
-        let Ok(entries) = std::fs::read_dir(folder) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("asi")) {
-                continue;
+    for path in plugin_files(folders) {
+        match unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) } {
+            Ok(_) => {
+                loaded += 1;
+                log!("mods: loaded {}", path.display());
             }
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            if !seen.insert(name) {
-                continue;
-            }
-            match unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) } {
-                Ok(_) => {
-                    loaded += 1;
-                    log!("mods: loaded {}", path.display());
-                }
-                Err(e) => log!("mods: could not load {}: {e}", path.display()),
-            }
+            Err(e) => log!("mods: could not load {}: {e}", path.display()),
         }
     }
+    LOADED_PLUGINS.store(loaded, Ordering::Relaxed);
     loaded
 }
 
@@ -307,6 +321,9 @@ pub fn install(dll_dir: &Path) {
         match unsafe { LoadLibraryW(&HSTRING::from(asi_loader.as_os_str())) } {
             Ok(_) => {
                 log!("mods: loaded the ASI loader {}, it loads the plugins", asi_loader.display());
+                // It loads from its own folder, `scripts` and `plugins` next to it.
+                let plugins = plugin_files(&[mods.clone(), mods.join("scripts"), mods.join("plugins")]);
+                LOADED_PLUGINS.store(plugins.len(), Ordering::Relaxed);
                 log_asi_loaders("after loading the ASI loader");
                 return;
             }
