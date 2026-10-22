@@ -329,7 +329,6 @@ fn flag_menu(ui: &imgui::Ui, label: &str, flag: &AtomicBool) {
     let mut value = flag.load(Ordering::Relaxed);
     if ui.menu_item_config(label).build_with_ref(&mut value) {
         flag.store(value, Ordering::Relaxed);
-        log!("ui: overlay {label} {}", if value { "on" } else { "off" });
     }
 }
 
