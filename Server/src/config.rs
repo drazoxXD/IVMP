@@ -141,7 +141,7 @@ impl Config {
         (config, notes)
     }
 
-    /// Applies `key = value` lines; returns warnings.
+    /// Applies `key = value` lines (`key value` works too); returns warnings.
     fn apply_file(&mut self, text: &str) -> Vec<String> {
         let mut warnings = Vec::new();
         for (number, line) in text.lines().enumerate() {
@@ -149,11 +149,16 @@ impl Config {
             if line.is_empty() {
                 continue;
             }
-            let Some((key, value)) = line.split_once('=') else {
+            // The key ends at the first `=` or space; the value is the rest, without that `=`.
+            let split = line.find(|c: char| c == '=' || c.is_whitespace()).unwrap_or(line.len());
+            let (key, rest) = line.split_at(split);
+            let value = rest.trim();
+            let value = value.strip_prefix('=').unwrap_or(value).trim();
+            if value.is_empty() && !rest.contains('=') {
                 warnings.push(format!("{FILE} line {}: expected `key = value`", number + 1));
                 continue;
-            };
-            let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+            }
+            let key = key.to_ascii_lowercase();
             let ok = match key.as_str() {
                 "bind" => {
                     self.bind = value.to_string();
@@ -247,5 +252,21 @@ mod tests {
         assert!(config.host);
         assert_eq!(config.gamemode, -2);
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn a_space_works_like_an_equals_sign() {
+        let mut config = Config::defaults();
+        let warnings = config.apply_file("start example
+start  =  chat
+bind 127.0.0.1:25568
+slots=8
+upnp
+capture =");
+        assert_eq!(config.start, ["example", "chat"]);
+        assert_eq!(config.bind, "127.0.0.1:25568");
+        assert_eq!(config.slots, 8);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("line 5"));
     }
 }
