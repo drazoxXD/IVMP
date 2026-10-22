@@ -44,9 +44,9 @@ Based on the works of [LibertyM](https://github.com/citizenfx/fivem) and [IV-Net
 
 The window title shows `IVMP - Build: …` once the client is loaded.
 
-**Web layer (optional):** download `IVMP_CEF.zip` from the same release and unzip it next to
-`IVMP_Client.dll`, so the folder is called `cef`. It adds IVMP's web UI (CEF in its own process,
-locked to `ivmp://` pages). Press F2 in game to open it, F1 for the console.
+**Web layer:** the `cef` folder in `IVMP_Client.zip` (keep it next to `IVMP_Client.dll`) is
+IVMP's web UI (CEF in its own process, locked to `ivmp://` pages). Press F2 in game to open it,
+F1 for the console. Without the folder the client runs without the web UI.
 
 
 ## Running a server

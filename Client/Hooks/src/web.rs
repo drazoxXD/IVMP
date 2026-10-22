@@ -5,7 +5,7 @@
 //! See docs/web-engine-research.md.
 //!
 //! F2 shows or hides the page (and gives it the keyboard and mouse); the first F2 starts the
-//! process. Without the `cef` folder nothing happens: the web layer is an optional download.
+//! process. Without the `cef` folder (it ships in IVMP_Client.zip) nothing happens.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};

@@ -3,8 +3,9 @@
 # Runs when code changes (Client, Server or this file; not for README, docs, images or icons),
 # or by hand from the Actions tab. The release is a normal "latest" release; its notes list
 # every commit since the previous release, and a build log with the time each part took.
-# The web runtime (CEF, the `cef` folder next to the client DLL) is its own release asset,
-# IVMP_CEF.zip, built from the CEF version pinned in Client/web/cef-version.json.
+# IVMP_Client.zip is laid out like Client/out/debug: IVMP_Client.dll, ivmp_launcher.exe and the
+# `cef` folder (IVMP_Web.exe, CEF's runtime and the ui pages, built from the CEF version pinned in
+# Client/web/cef-version.json), so one unzip gives a working client with the web layer.
 name: Build
 
 on:
@@ -62,22 +63,22 @@ jobs:
           Step "Client-launcher(win64)" "Client" "-p Launcher"
           Step "Client-Dll(win32)" "Client" "--target i686-pc-windows-msvc -p Hooks"
 
-      - name: Zip
+      # The client files go up unzipped: the release job adds the cef folder and zips them.
+      - name: Collect
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/client, dist/server | Out-Null
           Copy-Item Client/target/i686-pc-windows-msvc/release/IVMP_Client.dll dist/client/
           Copy-Item Client/target/release/ivmp_launcher.exe dist/client/
           Copy-Item Server/target/release/Server.exe dist/server/
-          Compress-Archive -Path dist/client/* -DestinationPath IVMP_Client.zip
-          Compress-Archive -Path dist/server/* -DestinationPath IVMP_Server.zip
+          Compress-Archive -Path dist/server/* -DestinationPath dist/IVMP_Server.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: win
           path: |
-            IVMP_Client.zip
-            IVMP_Server.zip
+            dist/client
+            dist/IVMP_Server.zip
             log/win.txt
 
   # The Linux server (the Pelican egg downloads it).
@@ -117,8 +118,8 @@ jobs:
             IVMP_Server_Linux.zip
             log/linux.txt
 
-  # The optional web layer: IVMP_Web.exe (CEF in its own process) and CEF's runtime, in a `cef`
-  # folder that is unzipped next to IVMP_Client.dll.
+  # The web layer: IVMP_Web.exe (CEF in its own process), CEF's runtime and the ui pages, in the
+  # `cef` folder that sits next to IVMP_Client.dll.
   web:
     runs-on: windows-latest
     steps:
@@ -137,6 +138,12 @@ jobs:
         with:
           path: cef-download
           key: cef-${{ steps.cef.outputs.sha1 }}
+
+      # CEF's wrapper library takes most of the build; build.bat skips it when it is there.
+      - uses: actions/cache@v4
+        with:
+          path: Client/web/host/obj/libcef_dll_wrapper.lib
+          key: cef-wrapper-${{ steps.cef.outputs.sha1 }}-${{ hashFiles('Client/web/host/build.bat') }}
 
       - name: Download CEF
         shell: pwsh
@@ -163,15 +170,11 @@ jobs:
           $t = if ($s -ge 60) { "{0}min {1}sec" -f [int][math]::Floor($s / 60), ($s % 60) } else { "${s}sec" }
           Add-Content log/web.txt "Web-cef(win32): built in $t"
 
-      - name: Zip
-        shell: pwsh
-        run: Compress-Archive -Path Client/web/host/out/cef -DestinationPath IVMP_CEF.zip
-
       - uses: actions/upload-artifact@v4
         with:
           name: web
           path: |
-            IVMP_CEF.zip
+            Client/web/host/out/cef
             log/web.txt
 
   release:
@@ -186,6 +189,15 @@ jobs:
         with:
           path: out
           merge-multiple: true
+
+      # Same layout as Client/out/debug: the DLL, the launcher and the cef folder.
+      - name: Client zip
+        run: |
+          cp -r out/Client/web/host/out/cef out/dist/client/cef
+          (cd out/dist/client && zip -r -9 -q ../../../IVMP_Client.zip .)
+          for f in IVMP_Client.dll ivmp_launcher.exe cef/IVMP_Web.exe cef/libcef.dll cef/ui/index.html; do
+            unzip -l IVMP_Client.zip "$f" > /dev/null || { echo "IVMP_Client.zip has no $f"; exit 1; }
+          done
 
       - name: Release
         env:
@@ -215,7 +227,7 @@ jobs:
             echo '```'
           } > notes.md
 
-          gh release create "$tag" out/IVMP_Client.zip out/IVMP_Server.zip out/IVMP_Server_Linux.zip out/IVMP_CEF.zip \
+          gh release create "$tag" IVMP_Client.zip out/dist/IVMP_Server.zip out/IVMP_Server_Linux.zip \
             --repo "$REPO" \
             --target "$sha" \
             --title "Build ${{ github.run_number }} (${sha:0:7})" \
