@@ -81,27 +81,42 @@ fn locate() -> Option<(Functions, usize, usize)> {
     ))
 }
 
-/// Binds the game socket and marks the relay active. Once, on the game thread, when the
-/// network session has loaded.
+static BIND_FN: AtomicUsize = AtomicUsize::new(0);
+static RELAY_ACTIVE_FLAG: AtomicUsize = AtomicUsize::new(0);
+
+/// Binds the game socket and marks the relay active, on the game thread whenever a network
+/// session has loaded. Again after a reload (a lobby game type change loads the network game
+/// again): the joiner's join to the host's new session got no answer, the host still read its
+/// packets but sent nothing back, so the flag or the binding may not survive the shutdown.
+/// Bind skips a socket that's already bound (flag 0x20 at +0xA0).
 pub fn start() {
-    if STARTED.swap(true, Ordering::SeqCst) {
-        return;
+    if !STARTED.swap(true, Ordering::SeqCst) {
+        let Some((functions, bind, relay_active)) = locate() else {
+            log!("relay: game socket functions not found");
+            STARTED.store(false, Ordering::SeqCst);
+            return;
+        };
+        SOCKET.store(functions.socket, Ordering::SeqCst);
+        MANAGER.store(functions.manager, Ordering::SeqCst);
+        RECEIVE_FN.store(functions.receive, Ordering::SeqCst);
+        ON_RELAY_FN.store(functions.on_relay_received, Ordering::SeqCst);
+        ON_TICKED_FN.store(functions.on_receive_ticked, Ordering::SeqCst);
+        BIND_FN.store(bind, Ordering::SeqCst);
+        RELAY_ACTIVE_FLAG.store(relay_active, Ordering::SeqCst);
+    } else {
+        let socket = SOCKET.load(Ordering::SeqCst);
+        let (flag, socket_flags) = unsafe {
+            (*(RELAY_ACTIVE_FLAG.load(Ordering::SeqCst) as *const u8), *((socket + 0xA0) as *const u32))
+        };
+        log!("relay: session loaded again; relay active was {flag}, socket flags {socket_flags:#x}");
     }
-    let Some((functions, bind, relay_active)) = locate() else {
-        log!("relay: game socket functions not found");
-        return;
-    };
+    let socket = SOCKET.load(Ordering::SeqCst);
     unsafe {
-        let bind: extern "fastcall" fn(usize, u16) = std::mem::transmute(bind);
-        bind(functions.socket, GAME_PORT);
-        *(relay_active as *mut u8) = 1;
+        let bind: extern "fastcall" fn(usize, u16) = std::mem::transmute(BIND_FN.load(Ordering::SeqCst));
+        bind(socket, GAME_PORT);
+        *(RELAY_ACTIVE_FLAG.load(Ordering::SeqCst) as *mut u8) = 1;
     }
-    SOCKET.store(functions.socket, Ordering::SeqCst);
-    MANAGER.store(functions.manager, Ordering::SeqCst);
-    RECEIVE_FN.store(functions.receive, Ordering::SeqCst);
-    ON_RELAY_FN.store(functions.on_relay_received, Ordering::SeqCst);
-    ON_TICKED_FN.store(functions.on_receive_ticked, Ordering::SeqCst);
-    log!("relay: game socket {:#x} bound, relay marked active", functions.socket);
+    log!("relay: game socket {socket:#x} bound, relay marked active");
 }
 
 /// Every frame: hand what arrived to the connection manager.

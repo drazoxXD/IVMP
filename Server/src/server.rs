@@ -177,6 +177,13 @@ impl Server {
                     self.broadcast(Some(id), &ServerMessage::SessionRestart { host: id });
                 }
             }
+            // The host's new session is in its lobby: the others may join it now.
+            (ClientMessage::SessionReady, Some(id)) => {
+                if self.lobby.host == Some(id) {
+                    say!("client {id} (the host) has its new session ready; telling the others");
+                    self.broadcast(Some(id), &ServerMessage::SessionReady { host: id });
+                }
+            }
             (ClientMessage::KeepAlive, Some(_)) => {}
             (ClientMessage::Bye, Some(id)) => self.remove(id, "left"),
             // Anything but hello from an unknown address is ignored.

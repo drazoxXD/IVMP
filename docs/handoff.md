@@ -220,5 +220,41 @@ noticed only ~30 s later (session timeout), then left and reloaded by itself; it
 host's new session then failed at step 1 and the join stayed pending. Now (protocol 6): the host's
 reload sends ClientMessage::SessionRestart, the server passes ServerMessage::SessionRestart { host }
 to the others, and a joiner in the host's lobby leaves (NETWORK_LEAVE_GAME 0x55D66E24) and reloads
-(GameMode_Request(1)) right away, then finds and joins again; a join pending for more than 10 s is
-retried.
+(GameMode_Request(1)) right away, then finds and joins again.
+Ninth test: following worked up to the join (left, reloaded, found and joined within ~5 s), but the
+join stayed pending at step 1: the host read the joiner's packets and answered nothing, and the
+joiner received nothing more. The relay was only set up once (`relay::start` returned on later
+loads); it now re-binds the socket and sets "relay active" on every load and logs both before. The
+10 s join retry started a second join on top of the first, which was refused and deadlocked
+(0x47CDF0); a stuck join now leaves first (NETWORK_LEAVE_GAME) and StartJoining waits while the
+network state is 12/13 (leaving).
+Tenth test (capture lobby1.bin): the relay was fine (still active after the reload). The rejoin's
+connection check and key exchange were answered, but the host never answered rlSessionDetailRequest
+(five tries, then the join fails at step 1). Its handler (0x6CACC0) stays silent while the flag
+0x18B82CF is clear: rline's shutdown (0x6DB9B0 -> 0x6CA2C0) clears it when the network game is torn
+down for the reload, and rline's init (0x6DB890, from network init 0x480DD0) only runs at game start.
+After every session load hostsys now calls the service's init (0x6CA1B0) again if the flag is clear;
+the network update (0x6CA3D0) then registers the handlers by itself.
+Eleventh test: the flag was still set after the reload (no shutdown), and the capture shows the same:
+connection check and key exchange answered, every session detail request ignored, even one byte for
+byte like the answered first one. So the handler isn't reached: the teardown seems to drop the
+connection manager's handler registrations while the service's slots stay marked as registered
+(0x19F33A8 + 0x30n, manager at 0x19F36A0 + 0x1Cn), and 0x6CA3D0 never registers them again. On
+every reload hostsys clears those markers (logging them and the manager at 0x18B82E4) so it does.
+Drazox: the joiner tries to join before the host's new lobby exists. Now (protocol 7) the host
+sends ClientMessage::SessionReady once its new session has been in the lobby (network state 8) for
+2 s after a restart; the server passes ServerMessage::SessionReady { host } on, and a joiner that
+followed waits for it (up to 60 s) before finding and joining.
+Twelfth test: the follow works (re-registration + ready signal): cl2 left, reloaded, waited, found and
+joined the host's new session (`join task finished, success 1`, host engine: "Peer Test2 has joined").
+But cl2's lobby was its own: the host admits the joiner in a new slot each time (TELL_NET_PLAYER_TO_
+START_PLAYING 31, 30, 29, 28) while cl2's game always creates its player in slot 31 (boot.rs
+`player_slot`), so the host lists cl2 where no player exists. The host picks the slot in 0x93F3C0: it sorts the 32
+slots by a "last used" stamp (`[0x11A8888 + 4 * slot] = ++[0x11A4FC4]`, written when a CPlayerInfo is
+created in the slot by 0x93E8C0 / 0x93E960) and takes the first slot with no CPlayerInfo (or one marked
+left, +0x4E8 == 6). So a slot that held a player counts as recently used and the next joiner gets the
+next one down, although 31 is empty again (confirmed: the host's table held only slot 0 at each
+admission; an earlier guess, the reservation table at 0x19392E0, was always empty). hostsys now
+resets the stamps of slots without a CPlayerInfo whenever we host a freshly loaded session
+(`host: player slot stamps [...] -> [...]`) and logs the stamps in the players line, so the first
+joiner gets slot 31 again, which is what the joiner's player uses (boot.rs `player_slot`).

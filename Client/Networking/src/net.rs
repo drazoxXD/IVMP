@@ -76,12 +76,38 @@ pub fn take_session_restart() -> bool {
     SESSION_RESTART.swap(false, Ordering::SeqCst)
 }
 
+/// The host's new session is in its lobby ([`ServerMessage::SessionReady`]); taken by the host
+/// system before it joins.
+static SESSION_READY: AtomicBool = AtomicBool::new(false);
+/// We host and told the server we start a new session; [`tell_session_ready`] is due.
+static RESTART_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// True once after the host's new session became ready.
+pub fn take_session_ready() -> bool {
+    SESSION_READY.swap(false, Ordering::SeqCst)
+}
+
+/// Forgets a ready notice from before (the host is restarting again).
+pub fn clear_session_ready() {
+    SESSION_READY.store(false, Ordering::SeqCst);
+}
+
 /// We host and our game ends its session for a new one: the server tells the others
 /// ([`ServerMessage::SessionRestart`]).
 pub fn tell_session_restart() {
     if is_host() {
         log!("net: telling the server we start a new session");
+        RESTART_ANNOUNCED.store(true, Ordering::SeqCst);
         send(&ClientMessage::SessionRestart);
+    }
+}
+
+/// Our new session (after [`tell_session_restart`]) is in its lobby: the others may join now.
+/// Sent once per restart.
+pub fn tell_session_ready() {
+    if RESTART_ANNOUNCED.swap(false, Ordering::SeqCst) {
+        log!("net: telling the server our new session is ready");
+        send(&ClientMessage::SessionReady);
     }
 }
 
@@ -226,7 +252,12 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             }
             Ok(ServerMessage::SessionRestart { host }) => {
                 log!("net: the host {} starts a new session", virtual_ip(host));
+                SESSION_READY.store(false, Ordering::SeqCst);
                 SESSION_RESTART.store(true, Ordering::SeqCst);
+            }
+            Ok(ServerMessage::SessionReady { host }) => {
+                log!("net: the host {}'s new session is ready", virtual_ip(host));
+                SESSION_READY.store(true, Ordering::SeqCst);
             }
             Ok(ServerMessage::Tunnel { from, from_port, to_port: _, payload }) => {
                 if RECEIVED.fetch_add(1, Ordering::Relaxed) < LOG_PACKETS {

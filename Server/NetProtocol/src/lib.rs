@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -46,6 +46,9 @@ pub enum ClientMessage {
     /// The session host's game is ending its session to start a new one (`gamemode = -1`:
     /// the game type was changed in the lobby).
     SessionRestart,
+    /// The session host's new session (after [`ClientMessage::SessionRestart`]) is up and in its
+    /// lobby: the others can join it now.
+    SessionReady,
 }
 
 /// What a [`ServerMessage::Spawn`] creates.
@@ -85,6 +88,8 @@ pub enum ServerMessage {
     Tunnel { from: Ipv4Addr, from_port: u16, to_port: u16, payload: Vec<u8> },
     /// The session host (`host`) is starting a new session: leave the old one and join the new.
     SessionRestart { host: ClientId },
+    /// The session host's new session is in its lobby: join it now.
+    SessionReady { host: ClientId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +107,7 @@ const C_KEEPALIVE: u8 = 0x03;
 const C_BYE: u8 = 0x04;
 const C_SPAWNED: u8 = 0x05;
 const C_SESSION_RESTART: u8 = 0x06;
+const C_SESSION_READY: u8 = 0x07;
 const S_WELCOME: u8 = 0x81;
 const S_REJECT: u8 = 0x82;
 const S_PEER_JOINED: u8 = 0x83;
@@ -113,6 +119,7 @@ const S_SPAWN: u8 = 0x88;
 const S_DESPAWN: u8 = 0x89;
 const S_GAME_SETTINGS: u8 = 0x8A;
 const S_SESSION_RESTART: u8 = 0x8B;
+const S_SESSION_READY: u8 = 0x8C;
 
 fn kind_byte(kind: SpawnKind) -> u8 {
     match kind {
@@ -229,6 +236,7 @@ impl ClientMessage {
                 Writer::new(C_SPAWNED).u32(*request).u16(*object_id).done()
             }
             ClientMessage::SessionRestart => Writer::new(C_SESSION_RESTART).done(),
+            ClientMessage::SessionReady => Writer::new(C_SESSION_READY).done(),
         }
     }
 
@@ -241,6 +249,7 @@ impl ClientMessage {
             C_BYE => ClientMessage::Bye,
             C_SPAWNED => ClientMessage::Spawned { request: r.u32()?, object_id: r.u16()? },
             C_SESSION_RESTART => ClientMessage::SessionRestart,
+            C_SESSION_READY => ClientMessage::SessionReady,
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -280,6 +289,7 @@ impl ServerMessage {
                 Writer::new(S_TUNNEL).ip(*from).u16(*from_port).u16(*to_port).rest(payload)
             }
             ServerMessage::SessionRestart { host } => Writer::new(S_SESSION_RESTART).u8(*host).done(),
+            ServerMessage::SessionReady { host } => Writer::new(S_SESSION_READY).u8(*host).done(),
         }
     }
 
@@ -307,6 +317,7 @@ impl ServerMessage {
             S_DESPAWN => ServerMessage::Despawn { kind: byte_kind(r.u8()?), object_id: r.u16()? },
             S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
             S_SESSION_RESTART => ServerMessage::SessionRestart { host: r.u8()? },
+            S_SESSION_READY => ServerMessage::SessionReady { host: r.u8()? },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -326,6 +337,7 @@ mod tests {
             ClientMessage::Bye,
             ClientMessage::Spawned { request: 7, object_id: 500 },
             ClientMessage::SessionRestart,
+            ClientMessage::SessionReady,
         ] {
             assert_eq!(ClientMessage::decode(&m.encode()), Ok(m));
         }
@@ -350,6 +362,7 @@ mod tests {
             ServerMessage::Despawn { kind: SpawnKind::Vehicle, object_id: 491 },
             ServerMessage::GameSettings { mode: -2, slots: 32 },
             ServerMessage::SessionRestart { host: 1 },
+            ServerMessage::SessionReady { host: 1 },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));

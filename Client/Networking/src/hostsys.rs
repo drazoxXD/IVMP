@@ -30,6 +30,11 @@ const NETWORK_LEAVE_GAME: u32 = 0x55D6_6E24;
 const GAME_MODE_REQUEST: usize = 0x0094_2B20;
 /// Frames a join may stay pending before it counts as failed (10 s at 60 fps).
 const JOIN_TIMEOUT_FRAMES: u32 = 600;
+/// The host's new session must be in the lobby this long before the others are told to join
+/// (2 s): the lobby script sets the session up right after hosting.
+const LOBBY_SETTLE_FRAMES: u32 = 120;
+/// How long a joiner waits for the host's "ready" before it tries anyway (60 s).
+const HOST_READY_TIMEOUT_FRAMES: u32 = 3600;
 /// NETWORK_START_SESSION (handler 0xBD8E20 -> 0x47BBD0): the host marks the session started
 /// (0x6203C0, session +0xC38); everyone's network state then goes lobby (8) -> in game (10).
 /// Normally the game mode script calls it; we run no scripts.
@@ -83,10 +88,25 @@ struct HostSystem {
     ids_given: u32,
     /// Frames the current join has been pending.
     join_frames: u32,
+    /// We followed the host to a new session: wait for its "ready" before finding it.
+    wait_for_host: bool,
+    /// Frames spent waiting for the host's "ready" / frames our new lobby has been up.
+    wait_ready_frames: u32,
 }
 
 static SYSTEM: Mutex<HostSystem> =
-    Mutex::new(HostSystem { state: State::Idle, attempts: 0, wait_frames: 0, told: 0, frames: 0, started: false, ids_given: 0, join_frames: 0 });
+    Mutex::new(HostSystem {
+        state: State::Idle,
+        attempts: 0,
+        wait_frames: 0,
+        told: 0,
+        frames: 0,
+        started: false,
+        ids_given: 0,
+        join_frames: 0,
+        wait_for_host: false,
+        wait_ready_frames: 0,
+    });
 
 impl HostSystem {
     /// Network object ids come from the server, host and joiner alike: the host's grant never
@@ -124,6 +144,19 @@ impl HostSystem {
             // hosts and picks the game; everyone else joins that player's session as in peer to
             // peer (no lobby script there, see boot.rs use_game_lobby).
             State::Loaded if net::lobby_mode() => match (net::our_id(), net::host_id()) {
+                // After following the host, its new lobby must exist before we join it.
+                (Some(us), Some(host)) if us != host && self.wait_for_host => {
+                    self.wait_ready_frames += 1;
+                    if net::take_session_ready() {
+                        self.wait_for_host = false;
+                        log!("host: the host's new lobby is ready, joining it");
+                    } else if self.wait_ready_frames > HOST_READY_TIMEOUT_FRAMES {
+                        self.wait_for_host = false;
+                        log!("host: no word from the host's new lobby after {HOST_READY_TIMEOUT_FRAMES} frames, trying anyway");
+                    } else if self.wait_ready_frames % 300 == 1 {
+                        log!("host: waiting for the host's new lobby");
+                    }
+                }
                 (Some(us), Some(host)) if us != host => {
                     log!("host: gamemode -1, joining the lobby of {}", NetProtocol::virtual_ip(host));
                     self.set(State::StartFinding);
@@ -168,6 +201,15 @@ impl HostSystem {
                     self.set(State::StartFinding);
                 }
             }
+            // Not while a session is still being left (network state 12 / 13, as 0x47B900 checks):
+            // on top of it the join is refused and its failure path deadlocks.
+            State::StartJoining if matches!(unsafe { *(crate::memory::from_ghidra(0x017F_5EA4) as *const u32) }, 12 | 13) => {
+                self.frames += 1;
+                if self.frames % 120 == 1 {
+                    let state = unsafe { *(crate::memory::from_ghidra(0x017F_5EA4) as *const u32) };
+                    log!("host: waiting for the old session to end before joining (network state {state})");
+                }
+            }
             State::StartJoining => {
                 ensure_gamer_id();
                 log_join_state("before join");
@@ -181,8 +223,11 @@ impl HostSystem {
                     self.set(State::JoiningNetGame);
                 } else if self.join_frames > JOIN_TIMEOUT_FRAMES {
                     // Seen after following a host to its new session: the join gave up but
-                    // stayed pending, and nothing tried again.
-                    log!("host: the join is still pending after {JOIN_TIMEOUT_FRAMES} frames, finding again");
+                    // stayed pending. Joining again on top of it was refused and the game thread
+                    // deadlocked in the join failure path (0x47D9F1 -> 0x47CDF0), so leave the
+                    // half-made session first; StartJoining waits until it's gone.
+                    log!("host: the join is still pending after {JOIN_TIMEOUT_FRAMES} frames; leaving it, then finding again");
+                    natives::invoke(NETWORK_LEAVE_GAME, &[]);
                     self.wait_frames = FIND_RETRY_FRAMES;
                     self.set(State::FindRetryWait);
                 }
@@ -236,6 +281,8 @@ impl HostSystem {
                 // old session times out, ~30 s later), then find and join its new session.
                 if net::take_session_restart() {
                     log!("host: the host starts a new session; leaving and loading the network game again");
+                    self.wait_for_host = true;
+                    self.wait_ready_frames = 0;
                     natives::invoke(NETWORK_LEAVE_GAME, &[]);
                     unsafe {
                         let request: extern "C" fn(i32) = std::mem::transmute(crate::memory::from_ghidra(GAME_MODE_REQUEST));
@@ -305,6 +352,16 @@ impl HostSystem {
                 }
                 if network_state >= NETWORK_STATE_LOBBY {
                     self.give_object_ids(network_state);
+                }
+                // After a restart (lobby game type change), tell the others once our new lobby
+                // has been up a moment: joining before that failed.
+                if network_state == NETWORK_STATE_LOBBY {
+                    self.wait_ready_frames += 1;
+                    if self.wait_ready_frames == LOBBY_SETTLE_FRAMES {
+                        net::tell_session_ready();
+                    }
+                } else {
+                    self.wait_ready_frames = 0;
                 }
                 if network_state == NETWORK_STATE_IN_GAME {
                     crate::spawner::tick();
@@ -451,7 +508,8 @@ fn log_players() {
         .map(|ped| format!("{ped:#x}"))
         .collect();
     log!(
-        "host: players: local index {local_index}, manager local {manager_local}, network state {state}, free object ids {free_ids} {:?}, queued peds [{}], {}",
+        "host: players: local index {local_index}, manager local {manager_local}, network state {state}, slot stamps {:?}, free object ids {free_ids} {:?}, queued peds [{}], {}",
+        slot_stamps(),
         first_object_ids(),
         queued.join(" "),
         infos.join(" ")
@@ -590,12 +648,103 @@ pub fn install_lobby_natives() {
     }
 }
 
+/// rline's session detail service: its init (0x6CA1B0, `bool ()`) fills the message handler
+/// table (rlSessionDetailRequest -> 0x6CACC0) and sets the flag at 0x18B82CF; the network update
+/// (0x6CA3D0 from 0x481B20) then registers the handlers with the connection manager while the
+/// flag is set. rline's shutdown (0x6DB9B0 -> 0x6CA2C0) clears it when the network game is torn
+/// down for a reload, and rline's init only runs once at game start, so after a lobby game type
+/// change the host never answered a joiner's session detail request (seen in a capture: five
+/// requests, no answer, the join failed at step 1).
+const SESSION_DETAIL_ACTIVE: usize = 0x018B_82CF;
+const SESSION_DETAIL_INIT: usize = 0x006C_A1B0;
+/// The service's 16 handler slots: "registered" marker at 0x19F33A8 + 0x30 * n (non-zero once
+/// 0x6CA3D0 registered it) and the connection manager it was registered with at
+/// 0x19F36A0 + 0x1C * n. The manager in use is at 0x18B82E4.
+const SESSION_DETAIL_REGISTERED: usize = 0x019F_33A8;
+const SESSION_DETAIL_SLOT_MANAGER: usize = 0x019F_36A0;
+const SESSION_DETAIL_MANAGER: usize = 0x018B_82E4;
+const SESSION_DETAIL_SLOTS: usize = 16;
+/// Network sessions loaded so far (the first load needs nothing).
+static SESSION_LOADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// After a reload the host still didn't answer although the service flag stayed set (capture:
+/// connection check and key exchange answered, every rlSessionDetailRequest ignored, even one
+/// byte for byte like the answered first one), so its handler isn't reached: the network game
+/// teardown drops the connection manager's handler registrations, but the service's slots stay
+/// marked as registered and 0x6CA3D0 never registers them again. Clear the markers so it does.
+fn restore_session_detail_service() {
+    unsafe {
+        if *(crate::memory::from_ghidra(SESSION_DETAIL_ACTIVE) as *const u8) == 0 {
+            let init: extern "C" fn() -> bool = std::mem::transmute(crate::memory::from_ghidra(SESSION_DETAIL_INIT));
+            let ok = init();
+            log!("host: rline's session detail service was shut down by the reload, started it again ({ok})");
+            return;
+        }
+        if SESSION_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        let manager = *(crate::memory::from_ghidra(SESSION_DETAIL_MANAGER) as *const usize);
+        let mut slots = Vec::new();
+        for n in 0..SESSION_DETAIL_SLOTS {
+            let registered = (crate::memory::from_ghidra(SESSION_DETAIL_REGISTERED) + 0x30 * n) as *mut usize;
+            let slot_manager = (crate::memory::from_ghidra(SESSION_DETAIL_SLOT_MANAGER) + 0x1C * n) as *mut usize;
+            if *registered != 0 || *slot_manager != 0 {
+                slots.push(format!("{n}: {:#x}/{:#x}", *registered, *slot_manager));
+                *registered = 0;
+                *slot_manager = 0;
+            }
+        }
+        log!("host: session loaded again, connection manager {manager:#x}; re-registering the session detail handlers [{}]", slots.join(", "));
+    }
+}
+
+/// The host picks a joiner's player slot with 0x93F3C0: it sorts the 32 slots by a "last used"
+/// stamp and takes the first one with no CPlayerInfo (or one marked left, +0x4E8 == 6). Creating a
+/// CPlayerInfo in a slot (0x93E8C0 / 0x93E960) stamps it: `[0x11A8888 + 4 * slot] = ++[0x11A4FC4]`.
+/// So a slot that held a player counts as recently used and the next joiner gets the next slot
+/// down (31, 30, 29, 28, as seen after every reload) while the joiner's game always creates its
+/// player in slot 31 (boot.rs `player_slot`): the host then listed the joiner where no player
+/// exists and the joiner's lobby showed only itself. (An earlier guess, the table at 0x19392E0, was
+/// always empty.)
+const SLOT_STAMPS: usize = 0x011A_8888;
+const PLAYER_INFOS: usize = 0x011A_8808;
+const SLOT_COUNT: usize = 32;
+
+/// The stamps of the slots that have one: (slot, stamp).
+fn slot_stamps() -> Vec<(usize, u32)> {
+    (0..SLOT_COUNT)
+        .filter_map(|slot| {
+            let stamp = unsafe { *((crate::memory::from_ghidra(SLOT_STAMPS) + slot * 4) as *const u32) };
+            (stamp != 0).then_some((slot, stamp))
+        })
+        .collect()
+}
+
+/// A new session of ours: slots without a player go back to "never used", like in a fresh game,
+/// so the first joiner gets slot 31 again.
+fn reset_slot_stamps() {
+    let before = slot_stamps();
+    unsafe {
+        for slot in 0..SLOT_COUNT {
+            let info = *((crate::memory::from_ghidra(PLAYER_INFOS) + slot * 4) as *const usize);
+            if info == 0 {
+                *((crate::memory::from_ghidra(SLOT_STAMPS) + slot * 4) as *mut u32) = 0;
+            }
+        }
+    }
+    log!("host: player slot stamps {before:?} -> {:?} (slots without a player are free again)", slot_stamps());
+}
+
 /// The network session has loaded: start hosting on the next frame.
 pub fn on_network_loaded() {
     if let Some(id) = net::our_id() {
         crate::peer::set_online_address(id);
     }
     crate::relay::start();
+    restore_session_detail_service();
+    if net::is_host() {
+        reset_slot_stamps();
+    }
     let mut system = SYSTEM.lock().unwrap();
     system.attempts = 0;
     // A reload (changing the game type in the lobby loads the network game again) starts over:
@@ -604,6 +753,9 @@ pub fn on_network_loaded() {
     system.told = 0;
     system.frames = 0;
     system.ids_given = 0;
+    if !system.wait_for_host {
+        system.wait_ready_frames = 0;
+    }
     // A restart notice from before this load is about the old session.
     let _ = net::take_session_restart();
     system.set(State::Loaded);
