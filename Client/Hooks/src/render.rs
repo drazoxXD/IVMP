@@ -285,10 +285,17 @@ unsafe extern "system" fn vtable_present(device: *mut c_void, source: *const REC
 }
 
 unsafe extern "system" fn vtable_reset(device: *mut c_void, parameters: *mut D3DPRESENT_PARAMETERS) -> i32 {
+    // Everything of ours in the default pool has to go before the game resets the device.
     ui::device_lost();
+    crate::web::device_lost();
     events::emit(events::GameEvent::DeviceReset);
+    if let Some(p) = unsafe { parameters.as_ref() } {
+        log!("render: Reset to {}x{}, windowed {}", p.BackBufferWidth, p.BackBufferHeight, p.Windowed.as_bool());
+    }
     let original: Reset = unsafe { std::mem::transmute(VTABLE_RESET.load(Ordering::SeqCst)) };
-    unsafe { original(device, parameters) }
+    let result = unsafe { original(device, parameters) };
+    log!("render: Reset returned {result:#x}");
+    result
 }
 
 unsafe extern "system" fn end_scene(device: *mut c_void) -> i32 {
