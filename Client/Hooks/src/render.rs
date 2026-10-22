@@ -309,7 +309,7 @@ fn draw(device: *mut c_void, only_back_buffer: bool) {
     {
         let mut last = LAST.lock().unwrap();
         let now = std::time::Instant::now();
-        if last.is_some_and(|l| now.duration_since(l) < std::time::Duration::from_millis(4)) {
+        if last.is_some_and(|l| now.duration_since(l) < std::time::Duration::from_micros(200)) {
             return;
         }
         *last = Some(now);
@@ -331,32 +331,16 @@ unsafe extern "system" fn present(device: *mut c_void, source: *const RECT, dest
     unsafe { original(device, source, dest, window, dirty) }
 }
 
-/// Patches the device's own vtable (Present and Reset), once, from the first EndScene.
+/// Patches the device's own vtable (Reset only), once, from the first EndScene. Present is NOT
+/// hooked: the Steam overlay hooks it too and, after a Reset, the two hooks called each other
+/// until the stack overflowed (gameoverlayrenderer.dll). The UI draws from EndScene instead.
 fn hook_device_vtable(device: *mut c_void) {
     let vtable = unsafe { *(device as *const usize) };
-    for (slot, hook, original) in [
-        (PRESENT_SLOT, vtable_present as usize, &VTABLE_PRESENT),
-        (RESET_SLOT, vtable_reset as usize, &VTABLE_RESET),
-    ] {
-        let address = vtable + slot * 4;
-        original.store(unsafe { *(address as *const usize) }, Ordering::SeqCst);
-        if let Err(e) = unsafe { memory::patch(address, &(hook as u32).to_le_bytes()) } {
-            log!("render: could not hook the device vtable slot {slot}: {e}");
-            return;
-        }
-    }
-    log!("render: hooked the game device's own vtable {vtable:#x} (Present, Reset)");
-    // The game may present through its swap chain instead of the device.
-    if let Some(d3d) = unsafe { IDirect3DDevice9::from_raw_borrowed(&device) } {
-        if let Ok(chain) = unsafe { d3d.GetSwapChain(0) } {
-            let chain_vtable = unsafe { *(chain.as_raw() as *const usize) };
-            let address = chain_vtable + 3 * 4;
-            SWAP_CHAIN_PRESENT.store(unsafe { *(address as *const usize) }, Ordering::SeqCst);
-            match unsafe { memory::patch(address, &(swap_chain_present as u32).to_le_bytes()) } {
-                Ok(()) => log!("render: hooked the swap chain's Present too (vtable {chain_vtable:#x})"),
-                Err(e) => log!("render: could not hook the swap chain's Present: {e}"),
-            }
-        }
+    let address = vtable + RESET_SLOT * 4;
+    VTABLE_RESET.store(unsafe { *(address as *const usize) }, Ordering::SeqCst);
+    match unsafe { memory::patch(address, &(vtable_reset as u32).to_le_bytes()) } {
+        Ok(()) => log!("render: hooked the game device's Reset (vtable {vtable:#x})"),
+        Err(e) => log!("render: could not hook the device's Reset: {e}"),
     }
 }
 
