@@ -15,9 +15,15 @@ pub enum Command {
     Despawn(u32),
     Entities,
     Help,
+    /// `start`, `stop`, `restart` or `ensure` a resource.
+    Resource { action: String, name: String },
+    /// `resources`: what is running and what is available.
+    Resources,
+    /// Anything else: a command a resource registered, or unknown.
+    Other(String),
 }
 
-pub const HELP: &str = "commands: spawn car|ped <model> [x y z [heading]], despawn <id>, entities, help";
+pub const HELP: &str = "commands: spawn car|ped <model> [x y z [heading]], despawn <id>, entities, start|stop|restart|ensure <resource>, resources, help (and the commands resources register)";
 
 /// Starts reading stdin; commands arrive on the receiver.
 pub fn start() -> Receiver<Result<Command, String>> {
@@ -60,7 +66,10 @@ pub fn parse(line: &str) -> Result<Command, String> {
         ["despawn", id] => id.parse().map(Command::Despawn).map_err(|_| format!("not an id: {id:?}")),
         ["entities"] => Ok(Command::Entities),
         ["help"] => Ok(Command::Help),
-        _ => Err(format!("unknown command; {HELP}")),
+        ["resources"] => Ok(Command::Resources),
+        [action @ ("start" | "stop" | "restart" | "ensure"), name] => Ok(Command::Resource { action: action.to_string(), name: name.to_string() }),
+        [action @ ("start" | "stop" | "restart" | "ensure")] => Err(format!("{action} what? e.g. `{action} example`")),
+        _ => Ok(Command::Other(line.trim().to_string())),
     }
 }
 

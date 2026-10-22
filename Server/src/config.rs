@@ -39,6 +39,10 @@ pub struct Config {
     pub slots: u8,
     /// Also log debugging detail (entities, game events).
     pub verbose: bool,
+    /// Where the resource folders are (`resources` in server.cfg), next to the executable by default.
+    pub resources: Option<String>,
+    /// Resources to start, in order (`start = name` lines).
+    pub start: Vec<String>,
 }
 
 const DEFAULT_FILE: &str = "\
@@ -83,6 +87,11 @@ slots = 32
 # game events, summaries.
 verbose = 0
 
+# Resources (scripts and UI, see docs/scripting-plan.md): the folder that holds them, and which to
+# start, one `start` line each, in order. Console: start / stop / restart / ensure <name>, resources.
+resources = resources
+# start = example
+
 # Record game packets to this file (empty = off).
 capture =
 ";
@@ -97,6 +106,8 @@ impl Config {
             gamemode: -2,
             slots: 32,
             verbose: false,
+            resources: None,
+            start: Vec::new(),
         }
     }
 
@@ -165,6 +176,16 @@ impl Config {
                     }
                     _ => false,
                 },
+                "resources" => {
+                    self.resources = (!value.is_empty()).then(|| value.to_string());
+                    true
+                }
+                "start" => {
+                    if !value.is_empty() {
+                        self.start.push(value.to_string());
+                    }
+                    true
+                }
                 "capture" => {
                     self.capture = (!value.is_empty()).then(|| value.to_string());
                     true

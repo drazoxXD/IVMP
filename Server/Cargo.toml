@@ -12,6 +12,7 @@ path = "src/main.rs"
 NetProtocol = { path = "NetProtocol" }
 Sync = { path = "Sync" }
 Host = { path = "Host" }
+Scripting = { path = "Scripting" }
 
 [workspace]
 members = [".", "NetProtocol", "Sync", "Host", "Auth", "Natives", "Scripting"]

@@ -6,6 +6,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use ivmp_host::session::HostSession;
+use ivmp_scripting::Scripting;
 use ivmp_sync::{events::EventLog, ids, nodes, registry::Registry};
 use NetProtocol::reliable::Accept;
 use NetProtocol::{ClientId, ClientMessage, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
@@ -43,6 +44,8 @@ pub struct Server {
     console: Receiver<Result<Command, String>>,
     /// The game session host, when the server hosts (`--host`).
     host: Option<HostSession>,
+    /// The resources (Lua scripts), docs/scripting-plan.md.
+    scripting: Scripting,
     /// What clients host and join (server.cfg `gamemode`, `slots`).
     gamemode: i32,
     slots: u8,
@@ -71,7 +74,18 @@ impl Server {
         }
         say!("game mode {}, {} slots", config.gamemode, config.slots);
         say!("{}", console::HELP);
+        let resources_dir = match &config.resources {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join("resources"))).unwrap_or_else(|| "resources".into()),
+        };
+        let scripting = Scripting::new(resources_dir.clone(), |line| say!("{line}"));
+        for name in &config.start {
+            if let Err(e) = scripting.start(name) {
+                say!("could not start resource {name}: {e}");
+            }
+        }
         Ok(Server {
+            scripting,
             socket,
             lobby: Lobby { preset_ids: config.ids.clone(), ..Lobby::default() },
             capture,
@@ -102,6 +116,8 @@ impl Server {
             }
             self.host_tick();
             self.resend_reliable();
+            self.scripting.tick();
+            self.script_requests();
             for id in self.lobby.timed_out() {
                 self.remove(id, "timed out");
             }
@@ -144,6 +160,20 @@ impl Server {
         let ids: Vec<ClientId> = self.lobby.clients.keys().copied().filter(|id| Some(*id) != except).collect();
         for id in ids {
             self.reliable(id, message);
+        }
+    }
+
+    /// What scripts asked for: players dropped, events for clients (stage 2 delivers those).
+    fn script_requests(&mut self) {
+        for (id, reason) in self.scripting.take_drops() {
+            if let Ok(client) = ClientId::try_from(id) {
+                if self.lobby.clients.contains_key(&client) {
+                    self.remove(client, &format!("was dropped by a script: {reason}"));
+                }
+            }
+        }
+        for event in self.scripting.take_client_events() {
+            debug!("script event '{}' for {} is not delivered yet (client scripts come in a later stage)", event.name, event.target);
         }
     }
 
@@ -307,6 +337,7 @@ impl Server {
             None => match self.lobby.join(from, nickname) {
                 Ok(id) => {
                     say!("{nickname} joined from {from} as {} (id {id}), object ids {:?}", virtual_ip(id), ids::block(id));
+                    self.scripting.player_joined(id as u32, nickname);
                     self.reliable_broadcast(Some(id), &ServerMessage::PeerJoined { id, nickname: nickname.to_string() });
                     let others: Vec<(ClientId, String)> =
                         self.lobby.clients.iter().filter(|(other, _)| **other != id).map(|(other, c)| (*other, c.nickname.clone())).collect();
@@ -415,6 +446,33 @@ impl Server {
                 }
             }
             Command::Help => say!("{}", console::HELP),
+            Command::Resources => {
+                let running = self.scripting.running();
+                for name in self.scripting.available() {
+                    say!("{name}: {}", if running.contains(&name) { "started" } else { "stopped" });
+                }
+                for name in running {
+                    if !self.scripting.available().contains(&name) {
+                        say!("{name}: started (its folder is gone)");
+                    }
+                }
+            }
+            Command::Resource { action, name } => {
+                let result = match action.as_str() {
+                    "start" => self.scripting.start(&name),
+                    "stop" => self.scripting.stop(&name),
+                    "restart" => self.scripting.restart(&name),
+                    _ => self.scripting.ensure(&name),
+                };
+                if let Err(e) = result {
+                    say!("{action} {name}: {e}");
+                }
+            }
+            Command::Other(line) => {
+                if !self.scripting.run_command(0, &line) {
+                    say!("unknown command; {}", console::HELP);
+                }
+            }
         }
     }
 
@@ -424,6 +482,7 @@ impl Server {
         }
         let Some((client, new_host)) = self.lobby.leave(id) else { return };
         say!("{} ({}) {why}", client.nickname, virtual_ip(id));
+        self.scripting.player_dropped(id as u32, why);
         self.reliable_broadcast(None, &ServerMessage::PeerLeft { id });
         // With the server hosting, the session host never changes.
         if let Some(host) = new_host.filter(|_| self.host.is_none()) {
