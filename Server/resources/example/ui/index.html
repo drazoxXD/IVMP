@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Example UI</title>
+<script src="ivmp://ui/nui.js"></script>
+<style>
+  html, body { margin: 0; background: transparent; font: 16px Segoe UI, sans-serif; color: #e8eef5; }
+  #box { position: fixed; top: 80px; right: 24px; width: 260px; padding: 14px 18px;
+         background: rgba(22, 24, 28, .85); border-left: 4px solid #51b3ec; }
+  h1 { margin: 0 0 8px; font-size: 18px; }
+  button { font: inherit; padding: 5px 12px; background: #51b3ec; color: #101418; border: 0; cursor: pointer; }
+  #answer { margin-top: 8px; color: #9fd3f5; min-height: 1.2em; }
+</style>
+<div id="box">
+  <h1>Example UI</h1>
+  <div>Type <code>ui</code> in the F1 console to use the mouse (Escape gives it back).</div>
+  <p><button id="ping">Ping the server</button></p>
+  <div id="answer"></div>
+</div>
+<script>
+  const answer = document.getElementById('answer');
+  let n = 0;
+  document.getElementById('ping').onclick = async () => {
+    n += 1;
+    // RegisterNUICallback('ping', ...) in client.lua answers with { ok = true }.
+    const reply = await ivmpNui.post('ping', { n });
+    answer.textContent = reply && reply.ok ? `sent ${n}, waiting for the server...` : 'no answer';
+  };
+  // SendNUIMessage({ type = 'pong', n = ... }) from client.lua.
+  window.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'pong') answer.textContent = `the server answered ${event.data.n}`;
+  });
+</script>

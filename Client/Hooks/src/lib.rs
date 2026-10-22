@@ -20,6 +20,7 @@ mod focus;
 mod hang;
 mod memstats;
 mod luanatives;
+mod luaui;
 mod mods;
 mod scripts;
 mod window;

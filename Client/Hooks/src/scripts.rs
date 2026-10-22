@@ -37,7 +37,10 @@ fn with_runtime<R>(f: impl FnOnce(&Scripting) -> R) -> R {
         let mut slot = cell.borrow_mut();
         let runtime = slot.get_or_insert_with(|| {
             let runtime = Scripting::client(crate::dll_dir().join("cache"), |line| log!("script: {line}"));
-            runtime.set_extra_api(crate::luanatives::install);
+            runtime.set_extra_api(|lua| {
+                crate::luanatives::install(lua)?;
+                crate::luaui::install(lua)
+            });
             runtime
         });
         f(runtime)
@@ -51,7 +54,8 @@ pub fn tick() {
     // Nothing downloaded and nothing running: nothing to do, and no Lua state is made.
     let commands: Vec<String> = PENDING.lock().unwrap().drain(..).collect();
     let lua_lines: Vec<String> = PENDING_LUA.lock().unwrap().drain(..).collect();
-    let idle = changes.is_empty() && events.is_empty() && commands.is_empty() && lua_lines.is_empty();
+    let ui_calls = crate::web::take_ui_callbacks();
+    let idle = changes.is_empty() && events.is_empty() && commands.is_empty() && lua_lines.is_empty() && ui_calls.is_empty();
     let started = RUNTIME.with(|cell| cell.borrow().is_some());
     if idle && !started {
         return;
@@ -62,12 +66,18 @@ pub fn tick() {
         let mut stops: Vec<String> = Vec::new();
         for change in changes {
             match change {
-                Change::Start(name) => {
-                    if let Err(e) = runtime.start(&name) {
-                        log!("script: cannot start {name}: {e}");
+                Change::Start(name) => match runtime.start(&name) {
+                    Ok(()) => {
+                        if let Some(page) = runtime.manifest_of(&name).and_then(|m| m.ui_page) {
+                            crate::web::open_ui(&name, &page);
+                        }
                     }
+                    Err(e) => log!("script: cannot start {name}: {e}"),
+                },
+                Change::Stop(name) => {
+                    crate::web::close_ui(&name);
+                    stops.push(name);
                 }
-                Change::Stop(name) => stops.push(name),
             }
         }
         for _ in 0..8 {
@@ -79,6 +89,12 @@ pub fn tick() {
         for (name, json) in events {
             if let Err(e) = runtime.client_event_json(&name, json.as_bytes()) {
                 log!("script: event '{name}' from the server: {e}");
+            }
+        }
+        for call in ui_calls {
+            let args = format!("[{},{}]", call.data, call.id);
+            if let Err(e) = runtime.client_event_to(&call.resource, &format!("__nui:{}", call.name), args.as_bytes()) {
+                log!("script: UI callback '{}' of {}: {e}", call.name, call.resource);
             }
         }
         for line in commands {

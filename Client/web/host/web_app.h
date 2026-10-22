@@ -32,6 +32,8 @@ inline const char* kHost = "ui";
 
 // Where the page files are (set by the DLL; the helper never serves pages).
 inline std::string g_ui_dir;
+// Where the files of the resources the server sent are: <dir>/<resource>/<path>.
+inline std::string g_resource_dir;
 // The log sink (a callback into the game's log); null in helpers.
 inline void (*g_log)(const char*) = nullptr;
 
@@ -54,10 +56,28 @@ inline std::string MimeOf(const std::string& path) {
   if (ends(".svg")) return "image/svg+xml";
   if (ends(".json")) return "application/json";
   if (ends(".woff2")) return "font/woff2";
+  if (ends(".woff")) return "font/woff";
+  if (ends(".ttf")) return "font/ttf";
+  if (ends(".jpg") || ends(".jpeg")) return "image/jpeg";
+  if (ends(".gif")) return "image/gif";
+  if (ends(".webp")) return "image/webp";
+  if (ends(".mp3")) return "audio/mpeg";
+  if (ends(".ogg")) return "audio/ogg";
+  if (ends(".wav")) return "audio/wav";
   return "application/octet-stream";
 }
 
-// ivmp://ui/<path>: files from the ui folder, nothing else.
+// A resource's name in a URL host: letters, digits, '_', '-' and '.', nothing that is a path.
+inline bool ValidResourceName(const std::string& name) {
+  if (name.empty() || name[0] == '.') return false;
+  for (char c : name) {
+    if (!isalnum((unsigned char)c) && c != '_' && c != '-' && c != '.') return false;
+  }
+  return name.find("..") == std::string::npos;
+}
+
+// ivmp://ui/<path>: files from the ui folder. ivmp://<resource>/<path>: files of that resource from
+// the folder the server's files were downloaded to. Nothing else.
 class SchemeFactory : public CefSchemeHandlerFactory {
  public:
   CefRefPtr<CefResourceHandler> Create(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, const CefString&, CefRefPtr<CefRequest> request) override {
@@ -65,12 +85,18 @@ class SchemeFactory : public CefSchemeHandlerFactory {
     CefParseURL(request->GetURL(), parts);
     std::string host = CefString(&parts.host).ToString();
     std::string path = CefString(&parts.path).ToString();
-    if (host != kHost || path.find("..") != std::string::npos || path.find('\\') != std::string::npos) {
+    std::string base;
+    if (host == kHost) {
+      base = g_ui_dir;
+    } else if (ValidResourceName(host) && !g_resource_dir.empty()) {
+      base = g_resource_dir + "\\" + host;
+    }
+    if (base.empty() || path.find("..") != std::string::npos || path.find('\\') != std::string::npos) {
       Log("web: scheme refused %s", request->GetURL().ToString().c_str());
       return nullptr;
     }
     if (path.empty() || path == "/") path = "/index.html";
-    std::ifstream file(g_ui_dir + path, std::ios::binary);
+    std::ifstream file(base + path, std::ios::binary);
     if (!file) {
       Log("web: scheme: not found %s", path.c_str());
       return nullptr;
@@ -92,7 +118,8 @@ class WebApp : public CefApp, public CefRenderProcessHandler {
    public:
     explicit BrowserSide(WebApp* app) : app_(app) {}
     void OnContextInitialized() override {
-      CefRegisterSchemeHandlerFactory(kScheme, kHost, new SchemeFactory());
+      // Every host of the scheme: "ui" and one per resource.
+      CefRegisterSchemeHandlerFactory(kScheme, "", new SchemeFactory());
       if (app_->on_context_initialized) app_->on_context_initialized();
     }
     IMPLEMENT_REFCOUNTING(BrowserSide);

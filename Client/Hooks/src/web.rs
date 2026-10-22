@@ -87,6 +87,96 @@ pub fn focused() -> bool {
     FOCUSED.load(Ordering::Relaxed) && host().is_some()
 }
 
+/// A call from a resource's page (`ivmpNui.post`), for the script runtime.
+#[derive(Debug, PartialEq)]
+pub struct UiCallback {
+    pub resource: String,
+    pub name: String,
+    /// The page's data as JSON.
+    pub data: String,
+    pub id: i64,
+}
+
+static UI_CALLBACKS: Mutex<std::collections::VecDeque<UiCallback>> = Mutex::new(std::collections::VecDeque::new());
+const MAX_QUEUED_CALLBACKS: usize = 256;
+
+/// The UIs shown right now (resource, page): sent again when the page loads, which is also what
+/// happens when the web process restarts.
+static OPEN_UIS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// What the page sent through `ivmp.send`. `ui.callback` is a resource page calling its script.
+fn bridge_message(text: &str) {
+    match parse_callback(text) {
+        Some(callback) => {
+            let mut queue = UI_CALLBACKS.lock().unwrap();
+            if queue.len() >= MAX_QUEUED_CALLBACKS {
+                queue.pop_front();
+            }
+            queue.push_back(callback);
+        }
+        None => log!("web: bridge: {text}"),
+    }
+}
+
+fn parse_callback(text: &str) -> Option<UiCallback> {
+    let message: serde_json::Value = serde_json::from_str(text).ok()?;
+    if message.get("name")?.as_str()? != "ui.callback" {
+        return None;
+    }
+    let data = message.get("data")?;
+    Some(UiCallback {
+        resource: data.get("resource")?.as_str()?.to_string(),
+        name: data.get("name")?.as_str()?.to_string(),
+        data: data.get("data").map_or("null".to_string(), |d| d.to_string()),
+        id: data.get("id").and_then(|i| i.as_i64()).unwrap_or(0),
+    })
+}
+
+/// The calls resource pages made since the last call.
+pub fn take_ui_callbacks() -> Vec<UiCallback> {
+    UI_CALLBACKS.lock().unwrap().drain(..).collect()
+}
+
+/// Sends an event to the page (`ivmp.on(name, ...)`): `json` is its data.
+pub fn emit(name: &str, json: &str) {
+    let mut payload = format!("{name}\0").into_bytes();
+    payload.extend_from_slice(json.as_bytes());
+    send(TO_EMIT, &payload);
+}
+
+/// Shows a resource's `ui_page`.
+pub fn open_ui(resource: &str, page: &str) {
+    {
+        let mut open = OPEN_UIS.lock().unwrap();
+        open.retain(|(r, _)| r != resource);
+        open.push((resource.to_string(), page.to_string()));
+    }
+    emit("ui.open", &serde_json::json!({ "resource": resource, "page": page }).to_string());
+}
+
+pub fn close_ui(resource: &str) {
+    OPEN_UIS.lock().unwrap().retain(|(r, _)| r != resource);
+    emit("ui.close", &serde_json::json!({ "resource": resource }).to_string());
+}
+
+fn resend_uis() {
+    let open = OPEN_UIS.lock().unwrap().clone();
+    for (resource, page) in open {
+        emit("ui.open", &serde_json::json!({ "resource": resource, "page": page }).to_string());
+    }
+}
+
+/// Gives the page the keyboard and mouse, or takes them back (SetNuiFocus, like F2).
+pub fn set_focus(focus: bool) {
+    if host().is_none() || FOCUSED.swap(focus, Ordering::Relaxed) == focus {
+        return;
+    }
+    send(TO_FOCUS, &ints(&[focus as i32]));
+    if focus {
+        crate::ui::reset_raw_cursor();
+    }
+}
+
 fn send(kind: u8, payload: &[u8]) {
     let Some(host) = host() else { return };
     let mut message = Vec::with_capacity(5 + payload.len());
@@ -189,6 +279,7 @@ fn start(focus: bool) {
         .arg(format!("--ivmp-frame={frame_name}"))
         .arg(format!("--ivmp-game-pid={pid}"))
         .arg(format!("--ivmp-url={START_URL}"))
+        .arg(format!("--ivmp-resources={}", crate::dll_dir().join("cache").display()))
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
     let mut child = match child {
@@ -270,8 +361,11 @@ fn read_messages(mut pipe: File) {
             FROM_LOG => log!("{text}"),
             // The page asks for the client info once it has loaded (a game.info sent before that
             // would be lost).
-            FROM_BRIDGE if text.starts_with(r#"{"name":"page.ready""#) => send_client_info(),
-            FROM_BRIDGE => log!("web: bridge: {text}"),
+            FROM_BRIDGE if text.starts_with(r#"{"name":"page.ready""#) => {
+                send_client_info();
+                resend_uis();
+            }
+            FROM_BRIDGE => bridge_message(&text),
             FROM_READY => {
                 let version = body.get(1..5).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0);
                 if version != PROTOCOL {
@@ -493,5 +587,23 @@ pub fn draw(device: &IDirect3DDevice9) {
     }
     if layer.version != 0 {
         imgui_dx9::draw_texture(device, &texture, width as f32, height as f32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_callback_is_parsed() {
+        let text = r#"{"name":"ui.callback","data":{"resource":"chat","name":"send","data":{"text":"hi"},"id":4}}"#;
+        assert_eq!(
+            parse_callback(text),
+            Some(UiCallback { resource: "chat".into(), name: "send".into(), data: r#"{"text":"hi"}"#.into(), id: 4 })
+        );
+        assert_eq!(parse_callback(r#"{"name":"page.ready"}"#), None);
+        assert_eq!(parse_callback("not json"), None);
+        let no_data = r#"{"name":"ui.callback","data":{"resource":"r","name":"n"}}"#;
+        assert_eq!(parse_callback(no_data).map(|c| (c.data, c.id)), Some(("null".into(), 0)));
     }
 }

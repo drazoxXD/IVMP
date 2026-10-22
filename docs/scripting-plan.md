@@ -81,8 +81,14 @@ Client: `TriggerServerEvent(name, ...)`, natives (`Citizen.InvokeNative`-style p
    [seconds]` logs every native the scripts call, with name and arguments.)
    Original plan: Name to hash table for GTA IV's natives (generated), typed wrappers, a safe
    `InvokeNative` on the game thread, a script debug panel in the F1 console (the WIP entry).
-5. **UI.** A resource's `ui_page` is served to the web layer as `ivmp://<resource>/...`;
-   `SendNUIMessage` / `RegisterNUICallback` use the existing `ivmp.send` / `ivmp.on` bridge.
+5. **UI.** (Done. A resource's `ui_page` is shown as a frame of the always-on web page, loaded from
+   `ivmp://<resource>/<page>` out of the client cache (the host serves `ivmp://ui/` from its ui
+   folder and any other host from `cache/<resource>/`); `shell.js` there opens and closes the frames
+   and relays messages. Client Lua: `SendNUIMessage(table)` (the page gets a `message` event with
+   the table), `RegisterNUICallback(name, function(data, cb) ... end)` (the page calls it with
+   `ivmpNui.post(name, data)` from `<script src="ivmp://ui/nui.js">`, `cb(result)` answers the
+   promise), `SetNuiFocus(true)` (keyboard and mouse to the page, Escape gives them back). The
+   example resource has a page.)
 6. **Server list and extras.** Server list in the F1 menu, master list later, name tags and
    blips/checkpoints/labels for scripts, `GetPlayers` details, a resource manager command set.
 

@@ -40,6 +40,13 @@ impl Scripting {
         self.world.eval(code)
     }
 
+    /// An event for one resource only (a page of its UI called back): the arguments are a JSON array.
+    pub fn client_event_to(&self, resource: &str, name: &str, json: &[u8]) -> Result<(), String> {
+        let args = args_from_json(json)?;
+        self.world.dispatch(name, &args, None, Some(resource));
+        Ok(())
+    }
+
     /// What client scripts asked the server for (`TriggerServerEvent`), as (name, JSON arguments).
     pub fn take_server_events(&self) -> Vec<(String, String)> {
         self.world.take_server_events().into_iter().map(|(name, args)| (name, args_to_json(&args))).collect()

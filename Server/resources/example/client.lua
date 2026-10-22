@@ -6,6 +6,7 @@ print('example client script started')
 -- The server answers `triggerserver ping 5` (F1 console) with this event.
 RegisterNetEvent('pong', function(n)
     print('the server answered: ' .. tostring(n))
+    SendNUIMessage({ type = 'pong', n = n }) -- the page shows it
 end)
 
 -- Type `hello` into the F1 console.
@@ -29,4 +30,15 @@ RegisterCommand('where', function()
     local ped = Natives.GET_PLAYER_CHAR(0)
     local x, y, z = Natives.GET_CHAR_COORDINATES(ped)
     print(string.format('you are at %.1f, %.1f, %.1f (ped %d)', x, y, z, ped))
+end)
+
+-- The page (ui/index.html) calls this with ivmpNui.post('ping', { n = 1 }); cb answers the page.
+RegisterNUICallback('ping', function(data, cb)
+    TriggerServerEvent('ping', data.n)
+    cb({ ok = true })
+end)
+
+-- `ui` in the F1 console: the page gets the mouse and keyboard (Escape gives them back).
+RegisterCommand('ui', function()
+    SetNuiFocus(true, true)
 end)

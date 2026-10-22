@@ -386,6 +386,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
   std::string folder = ExeDir();
   ivmp::g_ui_dir = folder + "\\ui";
+  ivmp::g_resource_dir = ArgValue(line, "ivmp-resources");
 
   app->on_context_initialized = [url]() {
     CefWindowInfo window;

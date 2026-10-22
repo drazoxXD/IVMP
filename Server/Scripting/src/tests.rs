@@ -343,3 +343,22 @@ fn extra_api_and_the_console_line() {
     assert!(scripting.eval("error('boom')").unwrap_err().contains("boom"));
     assert!(scripting.eval("this is not lua").is_err());
 }
+
+#[test]
+fn an_event_can_go_to_one_resource() {
+    let folder = Folder::new("to_one");
+    for name in ["a", "b"] {
+        folder.resource(
+            name,
+            "client_script 'c.lua'",
+            &[("c.lua", "AddEventHandler('__nui:go', function(data, id) print('got', GetCurrentResourceName(), data.x, id) end)")],
+        );
+    }
+    let (scripting, log) = client_scripting(&folder);
+    scripting.start("a").unwrap();
+    scripting.start("b").unwrap();
+    scripting.client_event_to("b", "__nui:go", br#"[{"x": 3}, 7]"#).unwrap();
+    let out = lines(&log);
+    assert!(out.contains(&"[b] got\tb\t3\t7".to_string()), "{out:?}");
+    assert!(!out.iter().any(|l| l.starts_with("[a] got")), "only the named resource gets it");
+}
