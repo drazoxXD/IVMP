@@ -3,6 +3,8 @@
 # Runs when code changes (Client, Server or this file; not for README, docs, images or icons),
 # or by hand from the Actions tab. The release is a normal "latest" release; its notes list
 # every commit since the previous release, and a build log with the time each part took.
+# The web runtime (CEF, the `cef` folder next to the client DLL) is its own release asset,
+# IVMP_CEF.zip, built from the CEF version pinned in Client/web/cef-version.json.
 name: Build
 
 on:
@@ -115,8 +117,65 @@ jobs:
             IVMP_Server_Linux.zip
             log/linux.txt
 
+  # The optional web layer: IVMP_Web.exe (CEF in its own process) and CEF's runtime, in a `cef`
+  # folder that is unzipped next to IVMP_Client.dll.
+  web:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pinned CEF version
+        id: cef
+        shell: pwsh
+        run: |
+          $v = Get-Content Client/web/cef-version.json | ConvertFrom-Json
+          "file=$($v.file)" >> $env:GITHUB_OUTPUT
+          "url=$($v.url)" >> $env:GITHUB_OUTPUT
+          "sha1=$($v.sha1)" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        with:
+          path: cef-download
+          key: cef-${{ steps.cef.outputs.sha1 }}
+
+      - name: Download CEF
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force cef-download | Out-Null
+          $archive = "cef-download/${{ steps.cef.outputs.file }}"
+          if (-not (Test-Path $archive)) {
+            Invoke-WebRequest -Uri "${{ steps.cef.outputs.url }}" -OutFile $archive
+          }
+          $hash = (Get-FileHash $archive -Algorithm SHA1).Hash.ToLower()
+          if ($hash -ne "${{ steps.cef.outputs.sha1 }}") { throw "CEF archive checksum mismatch: $hash" }
+          New-Item -ItemType Directory -Force cef-src | Out-Null
+          tar -xjf $archive -C cef-src
+
+      - name: Build IVMP_Web.exe and assemble the cef folder
+        shell: pwsh
+        run: |
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $env:CEF_DIR = (Get-ChildItem cef-src -Directory | Select-Object -First 1).FullName
+          cmd /c "Client\web\host\build.bat"
+          if ($LASTEXITCODE -ne 0) { throw "web build failed" }
+          New-Item -ItemType Directory -Force log | Out-Null
+          $s = [int]$sw.Elapsed.TotalSeconds
+          $t = if ($s -ge 60) { "{0}min {1}sec" -f [int][math]::Floor($s / 60), ($s % 60) } else { "${s}sec" }
+          Add-Content log/web.txt "Web-cef(win32): built in $t"
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path Client/web/host/out/cef -DestinationPath IVMP_CEF.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: |
+            IVMP_CEF.zip
+            log/web.txt
+
   release:
-    needs: [build, server-linux]
+    needs: [build, server-linux, web]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -152,11 +211,11 @@ jobs:
             echo
             echo "Build log:"
             echo '```'
-            cat out/log/win.txt out/log/linux.txt
+            cat out/log/win.txt out/log/linux.txt out/log/web.txt
             echo '```'
           } > notes.md
 
-          gh release create "$tag" out/IVMP_Client.zip out/IVMP_Server.zip out/IVMP_Server_Linux.zip \
+          gh release create "$tag" out/IVMP_Client.zip out/IVMP_Server.zip out/IVMP_Server_Linux.zip out/IVMP_CEF.zip \
             --repo "$REPO" \
             --target "$sha" \
             --title "Build ${{ github.run_number }} (${sha:0:7})" \
