@@ -26,6 +26,39 @@ static VTABLE_RESET: AtomicUsize = AtomicUsize::new(0);
 /// A Present of some kind has run (so EndScene stops drawing).
 static PRESENT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SWAP_CHAIN_PRESENT: AtomicUsize = AtomicUsize::new(0);
+/// d3d9's real Present / Reset / swap chain Present code (from the throwaway device).
+static REAL_RESET: AtomicUsize = AtomicUsize::new(0);
+static REAL_PRESENT: AtomicUsize = AtomicUsize::new(0);
+static REAL_CHAIN_PRESENT: AtomicUsize = AtomicUsize::new(0);
+
+std::thread_local! {
+    /// How deep our Present / Reset hooks are on this thread. The Steam overlay keeps one global
+    /// "original" pointer per hook; when it re-hooks over ours, that pointer becomes our hook and
+    /// the two call each other until the stack is gone (a stack overflow in
+    /// gameoverlayrenderer.dll on a resolution change). A hook that finds itself already running
+    /// goes straight to d3d9's own code instead.
+    static HOOK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct DepthGuard;
+impl DepthGuard {
+    /// None when a hook is already running on this thread.
+    fn enter() -> Option<DepthGuard> {
+        HOOK_DEPTH.with(|d| {
+            if d.get() > 0 {
+                None
+            } else {
+                d.set(1);
+                Some(DepthGuard)
+            }
+        })
+    }
+}
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        HOOK_DEPTH.with(|d| d.set(0));
+    }
+}
 static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 
@@ -35,7 +68,7 @@ type Reset = unsafe extern "system" fn(*mut c_void, *mut D3DPRESENT_PARAMETERS) 
 
 /// Creates a throwaway device and returns the code addresses of its Reset and Present. The vtable
 /// is per device (heap), but the methods are shared code in d3d9.dll, so those get the hook.
-fn device_methods() -> Option<[usize; 3]> {
+fn device_methods() -> Option<[usize; 4]> {
     unsafe {
         let window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -81,7 +114,7 @@ fn device_methods() -> Option<[usize; 3]> {
                 return None;
             }
             let vtable = u32::from_le_bytes(first) as usize;
-            let mut targets = [0usize; 3];
+            let mut targets = [0usize; 4];
             for (target, slot) in targets.iter_mut().zip([RESET_SLOT, PRESENT_SLOT, END_SCENE_SLOT]) {
                 let mut entry = [0u8; 4];
                 if !memory::read(vtable + slot * 4, &mut entry) {
@@ -89,6 +122,15 @@ fn device_methods() -> Option<[usize; 3]> {
                 }
                 *target = u32::from_le_bytes(entry) as usize;
                 log!("render: dummy device method {slot} -> {:#x} ({})", *target, module_of(*target));
+            }
+            // The swap chain's Present (vtable slot 3).
+            if let Ok(chain) = unsafe { d.GetSwapChain(0) } {
+                let chain_vtable = unsafe { *(chain.as_raw() as *const usize) };
+                let mut entry = [0u8; 4];
+                if memory::read(chain_vtable + 3 * 4, &mut entry) {
+                    targets[3] = u32::from_le_bytes(entry) as usize;
+                    log!("render: dummy swap chain Present -> {:#x} ({})", targets[3], module_of(targets[3]));
+                }
             }
             Some(targets)
         });
@@ -170,7 +212,11 @@ pub fn install() {
     // hooked on the device's own vtable from there. Patching d3d9's Present / Reset code as well
     // chained into the compatibility shim (apphelp.dll) on some runs and crashed on a resolution
     // change.
-    let Some([_reset_target, _present_target, end_scene_target]) = device_methods() else { return };
+    let Some([reset_target, present_target, end_scene_target, chain_present_target]) = device_methods() else { return };
+    // d3d9's own functions: what a hook calls when it finds itself called from itself (below).
+    REAL_RESET.store(reset_target, Ordering::SeqCst);
+    REAL_PRESENT.store(present_target, Ordering::SeqCst);
+    REAL_CHAIN_PRESENT.store(chain_present_target, Ordering::SeqCst);
     match inline_hook(end_scene_target, end_scene as usize) {
         Some(stub) => ORIGINAL_END_SCENE.store(stub, Ordering::SeqCst),
         None => {
@@ -263,6 +309,10 @@ type SwapChainPresent = unsafe extern "system" fn(*mut c_void, *const RECT, *con
 
 unsafe extern "system" fn swap_chain_present(chain: *mut c_void, source: *const RECT, dest: *const RECT, window: HWND, dirty: *const c_void, flags: u32) -> i32 {
     static FIRST: std::sync::Once = std::sync::Once::new();
+    let Some(_guard) = DepthGuard::enter() else {
+        let real: SwapChainPresent = unsafe { std::mem::transmute(REAL_CHAIN_PRESENT.load(Ordering::SeqCst)) };
+        return unsafe { real(chain, source, dest, window, dirty, flags) };
+    };
     FIRST.call_once(|| log!("render: first Present through the swap chain"));
     // The swap chain knows its device.
     if let Some(chain_ref) = unsafe { IDirect3DSwapChain9::from_raw_borrowed(&chain) } {
@@ -277,6 +327,10 @@ unsafe extern "system" fn swap_chain_present(chain: *mut c_void, source: *const 
 
 unsafe extern "system" fn vtable_present(device: *mut c_void, source: *const RECT, dest: *const RECT, window: HWND, dirty: *const c_void) -> i32 {
     static FIRST: std::sync::Once = std::sync::Once::new();
+    let Some(_guard) = DepthGuard::enter() else {
+        let real: Present = unsafe { std::mem::transmute(REAL_PRESENT.load(Ordering::SeqCst)) };
+        return unsafe { real(device, source, dest, window, dirty) };
+    };
     FIRST.call_once(|| log!("render: first Present through the device vtable"));
     PRESENT_SEEN.store(true, Ordering::SeqCst);
     draw(device, false);
@@ -285,6 +339,10 @@ unsafe extern "system" fn vtable_present(device: *mut c_void, source: *const REC
 }
 
 unsafe extern "system" fn vtable_reset(device: *mut c_void, parameters: *mut D3DPRESENT_PARAMETERS) -> i32 {
+    let Some(_guard) = DepthGuard::enter() else {
+        let real: Reset = unsafe { std::mem::transmute(REAL_RESET.load(Ordering::SeqCst)) };
+        return unsafe { real(device, parameters) };
+    };
     // Everything of ours in the default pool has to go before the game resets the device.
     ui::device_lost();
     crate::web::device_lost();
