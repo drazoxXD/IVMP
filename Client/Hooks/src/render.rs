@@ -208,6 +208,17 @@ fn inline_hook(target: usize, hook: usize) -> Option<usize> {
 
 /// Hooks Present and Reset. Call once, after the game has unpacked.
 pub fn install() {
+    // HappinessMP patches the game's own call site of the device's Reset (GTAIV RVA 0x42c46a,
+    // Ghidra 0x82c46a), which is above d3d9 and the Steam overlay's hooks. Dump the bytes there
+    // (and a little before) so the call site can be studied offline.
+    {
+        let start = memory::from_ghidra(0x0082_c440);
+        let mut bytes = [0u8; 96];
+        if memory::read(start, &mut bytes) {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            log!("render: game bytes at ghidra 0x82c440: {}", hex.join(" "));
+        }
+    }
     // Debug switch: an empty file named `no_render` next to the DLL turns every D3D hook off, to
     // tell whether a crash is ours or the game's / the Steam overlay's.
     if crate::dll_dir().join("no_render").exists() {
