@@ -170,15 +170,52 @@ const NETWORK_BOOT_PATCHES: &[Patch] = &[
         original: &[0x51],
         bytes: &[0xC3],
     },
-    // GameMode_Request (0x942B20, `mov eax, [esp+4]`): ignore requests, the mode stays network.
-    Patch {
-        name: "game mode stays network",
-        pattern: "8B 44 24 04 A3 ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 C3",
-        offset: 0,
-        original: &[0x8B],
-        bytes: &[0xC3],
-    },
 ];
+
+/// GameMode_Request(mode) (0x942B20): `[0x11D6FC8] = mode; [0x11D6FCC] = 1` (mode change
+/// pending, picked up by GameMode_ProcessPendingChange).
+const GAME_MODE_REQUEST_PATTERN: &str = "8B 44 24 04 A3 ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 C3";
+static GAME_MODE_VAR: AtomicUsize = AtomicUsize::new(0);
+static GAME_MODE_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// GameMode_Request, filtered: the game stays in network mode (a request for single player, 0,
+/// is ignored), but network requests go through. Changing the game type in the lobby stores the
+/// new match settings (0x47B990) and requests the network game again (native 0x1BC5050E ->
+/// 0xBDC960 -> GameMode_Request(1)) so the session reloads with them; ignoring every request
+/// left the host on the loading screen for good.
+extern "C" fn game_mode_request(mode: i32) {
+    if mode == 0 {
+        log!("boot: ignored a request for single player, staying in network mode");
+        return;
+    }
+    log!("boot: game mode {mode} requested (network game reload)");
+    // In a lobby game the host's reload means a new session: the joiners follow it.
+    if ivmp_networking::net::lobby_mode() {
+        ivmp_networking::net::tell_session_restart();
+    }
+    unsafe {
+        *(GAME_MODE_VAR.load(Ordering::SeqCst) as *mut i32) = mode;
+        *(GAME_MODE_PENDING.load(Ordering::SeqCst) as *mut u8) = 1;
+    }
+}
+
+fn install_game_mode_filter() {
+    let Some(site) = memory::find(GAME_MODE_REQUEST_PATTERN) else {
+        log!("boot: GameMode_Request not found, mode requests not filtered");
+        return;
+    };
+    unsafe {
+        GAME_MODE_VAR.store(std::ptr::read_unaligned((site + 5) as *const u32) as usize, Ordering::SeqCst);
+        GAME_MODE_PENDING.store(std::ptr::read_unaligned((site + 11) as *const u32) as usize, Ordering::SeqCst);
+        let rel = (game_mode_request as usize as isize - (site as isize + 5)) as i32;
+        let mut jump = [0xE9u8, 0, 0, 0, 0];
+        jump[1..].copy_from_slice(&rel.to_le_bytes());
+        match memory::patch(site, &jump) {
+            Ok(()) => log!("boot: game mode stays network (single player requests ignored) at {site:#x}"),
+            Err(e) => log!("boot: game mode filter at {site:#x} failed: {e}"),
+        }
+    }
+}
 
 /// Game mode (0x011D6FC8): 1 = network game.
 const GAME_MODE: usize = 0x011D_6FC8;
@@ -230,6 +267,7 @@ fn use_mp_player_model() {
 
 fn install_network_boot() {
     apply(NETWORK_BOOT_PATCHES);
+    install_game_mode_filter();
     use_mp_player_model();
     unsafe {
         *(memory::from_ghidra(GAME_MODE) as *mut u32) = 1;

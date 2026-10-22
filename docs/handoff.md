@@ -207,3 +207,18 @@ state 6, entering the lobby (state 8) emptied the ring and hostsys only refilled
 the joiner's player ped stayed queued for networking (no net object) and no lobby listed it.
 `give_object_ids` now refills whenever the network state moved on and the ring is empty.
 If the mode arrives after the session started loading the log says "no lobby this time".
+Seventh test: the lobby works (both players listed, Free Mode played together). Changing the game
+type in the lobby (Deathmatch, Team Deathmatch) left the host on a loading screen: the lobby stores
+the new match settings (native 0x1DFF5B06 -> 0x47B990, pending config 0x18B5FE4, flag 0x17F5FCB),
+ends the session and requests the network game again (native 0x1BC5050E -> 0xBDC960 ->
+GameMode_Request(1)), which IVMP's "game mode stays network" patch ignored. GameMode_Request is now
+filtered instead (boot.rs `game_mode_request`): requests for single player (0) are ignored, network
+ones go through; hostsys starts over on the reload. The joiner stays in the old, ended session's
+lobby (network state 8); it doesn't follow the host to the new session yet.
+Eighth test: the host's reload works (new lobby in the new mode). The joiner's own lobby script
+noticed only ~30 s later (session timeout), then left and reloaded by itself; its join to the
+host's new session then failed at step 1 and the join stayed pending. Now (protocol 6): the host's
+reload sends ClientMessage::SessionRestart, the server passes ServerMessage::SessionRestart { host }
+to the others, and a joiner in the host's lobby leaves (NETWORK_LEAVE_GAME 0x55D66E24) and reloads
+(GameMode_Request(1)) right away, then finds and joins again; a join pending for more than 10 s is
+retried.

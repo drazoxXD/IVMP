@@ -23,6 +23,13 @@ const LOCAL_PLAYER_READY_TO_START: u32 = 0x5C03585C;
 const LAUNCH_LOCAL_PLAYER_IN_NETWORK_GAME: u32 = 0x70FE415C;
 const PLAYER_WANTS_TO_JOIN: u32 = 0x7D99343C;
 const TELL_NET_PLAYER_TO_START_PLAYING: u32 = 0x465D424D;
+/// NETWORK_LEAVE_GAME (handler 0xBD8A70 -> 0x47B5B0): network state 12 (leaving), the state
+/// machine then ends the session (state 0).
+const NETWORK_LEAVE_GAME: u32 = 0x55D6_6E24;
+/// GameMode_Request(mode) (0x942B20, filtered by the boot code): 1 loads the network game again.
+const GAME_MODE_REQUEST: usize = 0x0094_2B20;
+/// Frames a join may stay pending before it counts as failed (10 s at 60 fps).
+const JOIN_TIMEOUT_FRAMES: u32 = 600;
 /// NETWORK_START_SESSION (handler 0xBD8E20 -> 0x47BBD0): the host marks the session started
 /// (0x6203C0, session +0xC38); everyone's network state then goes lobby (8) -> in game (10).
 /// Normally the game mode script calls it; we run no scripts.
@@ -74,9 +81,12 @@ struct HostSystem {
     /// Network state when the server's object ids were last put in the engine's ring (0 = not
     /// yet).
     ids_given: u32,
+    /// Frames the current join has been pending.
+    join_frames: u32,
 }
 
-static SYSTEM: Mutex<HostSystem> = Mutex::new(HostSystem { state: State::Idle, attempts: 0, wait_frames: 0, told: 0, frames: 0, started: false, ids_given: 0 });
+static SYSTEM: Mutex<HostSystem> =
+    Mutex::new(HostSystem { state: State::Idle, attempts: 0, wait_frames: 0, told: 0, frames: 0, started: false, ids_given: 0, join_frames: 0 });
 
 impl HostSystem {
     /// Network object ids come from the server, host and joiner alike: the host's grant never
@@ -162,11 +172,19 @@ impl HostSystem {
                 ensure_gamer_id();
                 log_join_state("before join");
                 natives::invoke(NETWORK_JOIN_GAME, &[0]);
+                self.join_frames = 0;
                 self.set(State::Joining);
             }
             State::Joining => {
+                self.join_frames += 1;
                 if !natives::invoke_bool(NETWORK_IS_JOIN_PENDING, &[]) {
                     self.set(State::JoiningNetGame);
+                } else if self.join_frames > JOIN_TIMEOUT_FRAMES {
+                    // Seen after following a host to its new session: the join gave up but
+                    // stayed pending, and nothing tried again.
+                    log!("host: the join is still pending after {JOIN_TIMEOUT_FRAMES} frames, finding again");
+                    self.wait_frames = FIND_RETRY_FRAMES;
+                    self.set(State::FindRetryWait);
                 }
             }
             State::JoiningNetGame => {
@@ -213,6 +231,19 @@ impl HostSystem {
             // lobby start the game and launch us. We keep the server's object ids in the engine.
             State::Joined if net::lobby_mode() => {
                 let network_state = unsafe { *(crate::memory::from_ghidra(0x017F_5EA4) as *const u32) };
+                // The host changed the game type in the lobby: its game ended the session and
+                // loads the network game again. Do the same (as our lobby script would once the
+                // old session times out, ~30 s later), then find and join its new session.
+                if net::take_session_restart() {
+                    log!("host: the host starts a new session; leaving and loading the network game again");
+                    natives::invoke(NETWORK_LEAVE_GAME, &[]);
+                    unsafe {
+                        let request: extern "C" fn(i32) = std::mem::transmute(crate::memory::from_ghidra(GAME_MODE_REQUEST));
+                        request(1);
+                    }
+                    self.set(State::Idle);
+                    return;
+                }
                 if !self.started {
                     self.started = true;
                     log!("host: in the host's session (network state {network_state}), starting the lobby script");
@@ -567,6 +598,14 @@ pub fn on_network_loaded() {
     crate::relay::start();
     let mut system = SYSTEM.lock().unwrap();
     system.attempts = 0;
+    // A reload (changing the game type in the lobby loads the network game again) starts over:
+    // a new session, the engine's id ring refilled from scratch.
+    system.started = false;
+    system.told = 0;
+    system.frames = 0;
+    system.ids_given = 0;
+    // A restart notice from before this load is about the old session.
+    let _ = net::take_session_restart();
     system.set(State::Loaded);
 }
 

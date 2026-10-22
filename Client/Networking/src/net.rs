@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,24 @@ static SETTINGS_HOOK: OnceLock<fn(i32)> = OnceLock::new();
 /// Registers the function told about the server's game mode.
 pub fn on_game_settings(hook: fn(i32)) {
     let _ = SETTINGS_HOOK.set(hook);
+}
+
+/// The session host told the server it starts a new session (lobby game type change); taken
+/// by the host system on the game thread.
+static SESSION_RESTART: AtomicBool = AtomicBool::new(false);
+
+/// True once after the host started a new session ([`ServerMessage::SessionRestart`]).
+pub fn take_session_restart() -> bool {
+    SESSION_RESTART.swap(false, Ordering::SeqCst)
+}
+
+/// We host and our game ends its session for a new one: the server tells the others
+/// ([`ServerMessage::SessionRestart`]).
+pub fn tell_session_restart() {
+    if is_host() {
+        log!("net: telling the server we start a new session");
+        send(&ClientMessage::SessionRestart);
+    }
 }
 
 /// The server wants the game's own lobby (`gamemode = -1`).
@@ -205,6 +223,10 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             Ok(ServerMessage::HostChanged { host }) => {
                 HOST_ID.store(host, Ordering::SeqCst);
                 log!("net: host is now id {host}");
+            }
+            Ok(ServerMessage::SessionRestart { host }) => {
+                log!("net: the host {} starts a new session", virtual_ip(host));
+                SESSION_RESTART.store(true, Ordering::SeqCst);
             }
             Ok(ServerMessage::Tunnel { from, from_port, to_port: _, payload }) => {
                 if RECEIVED.fetch_add(1, Ordering::Relaxed) < LOG_PACKETS {

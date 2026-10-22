@@ -169,6 +169,14 @@ impl Server {
                     }
                 }
             }
+            // The session host's game ends its session for a new one (lobby game type change):
+            // tell the others now, or they only notice when the old session times out (~30 s).
+            (ClientMessage::SessionRestart, Some(id)) => {
+                if self.lobby.host == Some(id) {
+                    say!("client {id} (the host) is starting a new session; telling the others");
+                    self.broadcast(Some(id), &ServerMessage::SessionRestart { host: id });
+                }
+            }
             (ClientMessage::KeepAlive, Some(_)) => {}
             (ClientMessage::Bye, Some(id)) => self.remove(id, "left"),
             // Anything but hello from an unknown address is ignored.
