@@ -601,6 +601,8 @@ extern "C" fn game_process() {
     }
     unsafe {
         let original: extern "C" fn() = std::mem::transmute(ORIGINAL_GAME_PROCESS.load(Ordering::SeqCst));
+        let start = std::time::Instant::now();
         original();
+        crate::ui::GAME_TICK_US.store(start.elapsed().as_micros() as u32, Ordering::Relaxed);
     }
 }

@@ -148,7 +148,7 @@ unsafe extern "system" fn get_device_state(device: *mut c_void, size: u32, data:
     let Some(index) = originals_of(device) else { return DI_OK };
     let original: GetDeviceState = unsafe { std::mem::transmute(STATE_ORIGINALS[index].load(Ordering::SeqCst)) };
     let result = unsafe { original(device, size, data) };
-    if !focused() && !data.is_null() {
+    if (!focused() || crate::ui::capturing()) && !data.is_null() {
         unsafe { std::ptr::write_bytes(data, 0, size as usize) };
         return DI_OK;
     }
@@ -159,7 +159,7 @@ unsafe extern "system" fn get_device_data(device: *mut c_void, size: u32, data: 
     let Some(index) = originals_of(device) else { return DI_OK };
     let original: GetDeviceData = unsafe { std::mem::transmute(DATA_ORIGINALS[index].load(Ordering::SeqCst)) };
     let result = unsafe { original(device, size, data, count, flags) };
-    if !focused() && !count.is_null() {
+    if (!focused() || crate::ui::capturing()) && !count.is_null() {
         // Read (and so drop) the buffered events, but hand none to the game.
         unsafe { *count = 0 };
         return DI_OK;

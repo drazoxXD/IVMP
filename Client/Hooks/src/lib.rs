@@ -12,6 +12,9 @@ mod crash;
 mod dump;
 mod enginelog;
 mod events;
+mod imgui_dx9;
+mod render;
+mod ui;
 mod focus;
 mod hang;
 mod mods;
@@ -86,6 +89,7 @@ fn on_attach() {
         }
         crash::install_exit_logging();
         focus::install();
+        render::install();
         // Let another copy of the game start next to this one.
         instance::release_single_instance_mutex();
         let config = crate::config();
