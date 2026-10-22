@@ -208,6 +208,12 @@ fn inline_hook(target: usize, hook: usize) -> Option<usize> {
 
 /// Hooks Present and Reset. Call once, after the game has unpacked.
 pub fn install() {
+    // Debug switch: an empty file named `no_render` next to the DLL turns every D3D hook off, to
+    // tell whether a crash is ours or the game's / the Steam overlay's.
+    if crate::dll_dir().join("no_render").exists() {
+        log!("render: no_render file found, the D3D hooks and the UI are off");
+        return;
+    }
     // Only EndScene is hooked in d3d9's code (to learn the game's device); Present and Reset are
     // hooked on the device's own vtable from there. Patching d3d9's Present / Reset code as well
     // chained into the compatibility shim (apphelp.dll) on some runs and crashed on a resolution
