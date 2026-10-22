@@ -23,6 +23,7 @@ mod config;
 mod console;
 mod lobby;
 mod relay;
+mod upnp;
 mod server;
 mod world;
 

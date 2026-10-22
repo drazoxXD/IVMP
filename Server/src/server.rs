@@ -57,6 +57,11 @@ impl Server {
         // Short, so the session host's resends and acks go out on time.
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
         say!("IVMP server listening on {} (protocol {PROTOCOL_VERSION})", config.bind);
+        if config.upnp {
+            if let Ok(local) = socket.local_addr() {
+                crate::upnp::open(local.port());
+            }
+        }
         let capture = match &config.capture {
             Some(path) => {
                 say!("capturing game packets to {path}");

@@ -13,6 +13,7 @@ NetProtocol = { path = "NetProtocol" }
 Sync = { path = "Sync" }
 Host = { path = "Host" }
 Scripting = { path = "Scripting" }
+igd-next = "0.15"
 
 [workspace]
 members = [".", "NetProtocol", "Sync", "Host", "Auth", "Natives", "Scripting"]

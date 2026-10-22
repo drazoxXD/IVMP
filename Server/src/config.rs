@@ -39,6 +39,8 @@ pub struct Config {
     pub slots: u8,
     /// Also log debugging detail (entities, game events).
     pub verbose: bool,
+    /// Ask the router (UPnP) to forward the server port.
+    pub upnp: bool,
     /// Where the resource folders are (`resources` in server.cfg), next to the executable by default.
     pub resources: Option<String>,
     /// Resources to start, in order (`start = name` lines).
@@ -50,6 +52,10 @@ const DEFAULT_FILE: &str = "\
 
 # Address and port the server listens on.
 bind = 0.0.0.0:9999
+
+# Ask the router to forward the port (UPnP), so players outside your network can join.
+# Off by default; turn it on for a server at home. The router must have UPnP enabled.
+upnp = false
 
 # Is the server or are the clients the host?
 # The server tends to be the best, but for game modes you need peer to peer.
@@ -106,6 +112,7 @@ impl Config {
             gamemode: -2,
             slots: 32,
             verbose: false,
+            upnp: false,
             resources: None,
             start: Vec::new(),
         }
@@ -176,6 +183,7 @@ impl Config {
                     }
                     _ => false,
                 },
+                "upnp" => value.parse().map(|v| self.upnp = v).is_ok(),
                 "resources" => {
                     self.resources = (!value.is_empty()).then(|| value.to_string());
                     true
