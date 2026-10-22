@@ -6,7 +6,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use ivmp_host::session::HostSession;
-use ivmp_sync::{ids, nodes, registry::Registry};
+use ivmp_sync::{events::EventLog, ids, nodes, registry::Registry};
 use NetProtocol::reliable::Accept;
 use NetProtocol::{ClientId, ClientMessage, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
 
@@ -34,6 +34,8 @@ pub struct Server {
     capture: Option<Capture>,
     /// Every entity seen in the clients' game traffic.
     entities: Registry,
+    /// The game events the clients send (read and logged only).
+    events: EventLog,
     last_summary: Instant,
     /// Server-owned entities.
     world: World,
@@ -74,6 +76,7 @@ impl Server {
             lobby: Lobby { preset_ids: config.ids.clone(), ..Lobby::default() },
             capture,
             entities: Registry::default(),
+            events: EventLog::default(),
             last_summary: Instant::now(),
             world: World::default(),
             last_world: Instant::now(),
@@ -115,6 +118,9 @@ impl Server {
             if self.last_summary.elapsed() > SUMMARY_EVERY && self.entities.packets > 0 {
                 self.last_summary = Instant::now();
                 say!("{}", self.entities.summary());
+                if let Some(events) = self.events.summary() {
+                    say!("{events}");
+                }
             }
         }
     }
@@ -183,6 +189,9 @@ impl Server {
                     capture.record(id, if let Target::Client(to) = target { to } else { 0 }, &payload);
                 }
                 for line in self.entities.observe(id, &payload) {
+                    say!("{line}");
+                }
+                for line in self.events.observe(id, &payload) {
                     say!("{line}");
                 }
                 if to == virtual_ip(HOST_ID) && self.host.is_some() {

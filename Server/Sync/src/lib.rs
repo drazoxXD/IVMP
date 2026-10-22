@@ -6,6 +6,7 @@
 //! object id block.
 
 pub mod bits;
+pub mod events;
 pub mod ids;
 pub mod nodes;
 pub mod packet;
