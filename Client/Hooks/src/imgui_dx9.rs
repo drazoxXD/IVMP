@@ -23,15 +23,13 @@ struct Vertex {
 
 pub struct Renderer {
     font: Option<IDirect3DTexture9>,
-    vertices: Option<IDirect3DVertexBuffer9>,
-    indices: Option<IDirect3DIndexBuffer9>,
-    vertex_capacity: usize,
-    index_capacity: usize,
+    /// The current list's vertices, converted.
+    scratch: Vec<Vertex>,
 }
 
 impl Renderer {
     pub fn new() -> Self {
-        Renderer { font: None, vertices: None, indices: None, vertex_capacity: 0, index_capacity: 0 }
+        Renderer { font: None, scratch: Vec::new() }
     }
 
     /// Uploads the font atlas (RGBA32, `width` x `height`). The texture lives in the managed pool,
@@ -69,100 +67,28 @@ impl Renderer {
         true
     }
 
-    /// Drops the buffers in the default pool; call before the game resets the device.
-    pub fn invalidate(&mut self) {
-        self.vertices = None;
-        self.indices = None;
-        self.vertex_capacity = 0;
-        self.index_capacity = 0;
-    }
+    /// Nothing of ours is in the default pool, so there is nothing to release on a Reset.
+    pub fn invalidate(&mut self) {}
 
-    fn reserve(&mut self, device: &IDirect3DDevice9, vertices: usize, indices: usize) -> bool {
-        if self.vertices.is_none() || self.vertex_capacity < vertices {
-            let capacity = vertices + 5000;
-            let mut buffer: Option<IDirect3DVertexBuffer9> = None;
-            let created = unsafe {
-                device.CreateVertexBuffer(
-                    (capacity * size_of::<Vertex>()) as u32,
-                    (D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY) as u32,
-                    FVF,
-                    D3DPOOL_DEFAULT,
-                    &mut buffer,
-                    std::ptr::null_mut::<HANDLE>(),
-                )
-            };
-            if created.is_err() || buffer.is_none() {
-                return false;
-            }
-            self.vertices = buffer;
-            self.vertex_capacity = capacity;
-        }
-        if self.indices.is_none() || self.index_capacity < indices {
-            let capacity = indices + 10000;
-            let mut buffer: Option<IDirect3DIndexBuffer9> = None;
-            let created = unsafe {
-                device.CreateIndexBuffer(
-                    (capacity * size_of::<DrawIdx>()) as u32,
-                    (D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY) as u32,
-                    if size_of::<DrawIdx>() == 2 { D3DFMT_INDEX16 } else { D3DFMT_INDEX32 },
-                    D3DPOOL_DEFAULT,
-                    &mut buffer,
-                    std::ptr::null_mut::<HANDLE>(),
-                )
-            };
-            if created.is_err() || buffer.is_none() {
-                return false;
-            }
-            self.indices = buffer;
-            self.index_capacity = capacity;
-        }
-        true
-    }
-
+    /// Draws the draw lists from system memory (`DrawIndexedPrimitiveUP`), so nothing of ours lives
+    /// in the default pool: the game's Reset can't fail because of the UI, even when the Steam
+    /// overlay re-patches the device and our own Reset hook is bypassed.
     pub fn render(&mut self, device: &IDirect3DDevice9, data: &DrawData) {
         let [width, height] = data.display_size;
         if width <= 0.0 || height <= 0.0 || data.total_vtx_count == 0 {
             return;
         }
-        if self.font.is_none() || !self.reserve(device, data.total_vtx_count as usize, data.total_idx_count as usize) {
-            return;
-        }
-        let (Some(vertex_buffer), Some(index_buffer)) = (self.vertices.clone(), self.indices.clone()) else { return };
-
-        // Copy every list into the two buffers.
-        unsafe {
-            let mut vertex_ptr: *mut c_void = std::ptr::null_mut();
-            let mut index_ptr: *mut c_void = std::ptr::null_mut();
-            if vertex_buffer.Lock(0, (data.total_vtx_count as usize * size_of::<Vertex>()) as u32, &mut vertex_ptr, D3DLOCK_DISCARD as u32).is_err()
-            {
-                return;
-            }
-            if index_buffer.Lock(0, (data.total_idx_count as usize * size_of::<DrawIdx>()) as u32, &mut index_ptr, D3DLOCK_DISCARD as u32).is_err() {
-                let _ = vertex_buffer.Unlock();
-                return;
-            }
-            let mut vertices = vertex_ptr as *mut Vertex;
-            let mut indices = index_ptr as *mut DrawIdx;
-            for list in data.draw_lists() {
-                for v in list.vtx_buffer() {
-                    *vertices = convert(v);
-                    vertices = vertices.add(1);
-                }
-                let idx = list.idx_buffer();
-                std::ptr::copy_nonoverlapping(idx.as_ptr(), indices, idx.len());
-                indices = indices.add(idx.len());
-            }
-            let _ = vertex_buffer.Unlock();
-            let _ = index_buffer.Unlock();
-        }
+        let Some(font) = self.font.as_ref() else { return };
+        let texture: Option<IDirect3DBaseTexture9> = font.cast().ok();
 
         // Save everything the game had set, then set what imgui needs.
         let block = unsafe { device.CreateStateBlock(D3DSBT_ALL) }.ok();
-        unsafe { self.set_state(device, &vertex_buffer, &index_buffer, width, height) };
+        unsafe { set_common_state(device, width, height) };
 
-        let mut vertex_offset = 0usize;
-        let mut index_offset = 0usize;
         for list in data.draw_lists() {
+            self.scratch.clear();
+            self.scratch.extend(list.vtx_buffer().iter().map(convert));
+            let indices = list.idx_buffer();
             for command in list.commands() {
                 match command {
                     DrawCmd::Elements { count, cmd_params } => unsafe {
@@ -172,23 +98,23 @@ impl Renderer {
                             continue;
                         }
                         let _ = device.SetScissorRect(&rect);
-                        let texture: Option<IDirect3DBaseTexture9> = self.font.as_ref().and_then(|t| t.cast().ok());
                         let _ = device.SetTexture(0, texture.as_ref());
-                        let _ = device.DrawIndexedPrimitive(
+                        let vertices = &self.scratch[cmd_params.vtx_offset.min(self.scratch.len())..];
+                        let _ = device.DrawIndexedPrimitiveUP(
                             D3DPT_TRIANGLELIST,
-                            (vertex_offset + cmd_params.vtx_offset) as i32,
                             0,
-                            list.vtx_buffer().len() as u32,
-                            (index_offset + cmd_params.idx_offset) as u32,
+                            vertices.len() as u32,
                             (count / 3) as u32,
+                            indices[cmd_params.idx_offset..].as_ptr().cast(),
+                            if size_of::<DrawIdx>() == 2 { D3DFMT_INDEX16 } else { D3DFMT_INDEX32 },
+                            vertices.as_ptr().cast(),
+                            size_of::<Vertex>() as u32,
                         );
                     },
-                    DrawCmd::ResetRenderState => unsafe { self.set_state(device, &vertex_buffer, &index_buffer, width, height) },
+                    DrawCmd::ResetRenderState => unsafe { set_common_state(device, width, height) },
                     DrawCmd::RawCallback { .. } => {}
                 }
             }
-            vertex_offset += list.vtx_buffer().len();
-            index_offset += list.idx_buffer().len();
         }
 
         if let Some(block) = block {
@@ -196,22 +122,6 @@ impl Renderer {
         }
     }
 
-    /// Everything imgui needs on the device: shaders off, alpha blending, scissor, the pixel
-    /// projection, and the vertex / index streams.
-    unsafe fn set_state(
-        &self,
-        device: &IDirect3DDevice9,
-        vertices: &IDirect3DVertexBuffer9,
-        indices: &IDirect3DIndexBuffer9,
-        width: f32,
-        height: f32,
-    ) {
-        unsafe {
-            set_common_state(device, width, height);
-            let _ = device.SetStreamSource(0, vertices, 0, size_of::<Vertex>() as u32);
-            let _ = device.SetIndices(indices);
-        }
-    }
 }
 
 /// Render state for drawing 2D UI in pixel coordinates.
