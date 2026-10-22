@@ -5,7 +5,8 @@
 //!   path exists under `mods\`, it gets the `mods\` copy instead (e.g. `mods\update\...`).
 //! * Plugins: with `mods\dinput8.dll` (Ultimate ASI Loader) present, that loader is loaded and
 //!   runs the ASI mods itself (from `mods\plugins`, plus its update folder support); otherwise
-//!   every `mods\plugins\*.asi` (FusionFix and other ASI mods) is loaded directly.
+//!   every `.asi` (FusionFix and other ASI mods) in `mods\plugins` and in the game folder (its
+//!   `plugins`, `scripts` and the folder itself) is loaded directly.
 //!
 //! Other DLL replacements (d3d9.dll, vulkan.dll, ...) can't be overlaid: Windows loads those
 //! before we are injected.
@@ -211,52 +212,86 @@ fn hook_files() {
     }
 }
 
-fn load_plugins(mods: &Path) {
-    let Ok(entries) = std::fs::read_dir(mods.join("plugins")) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("asi")) {
-            continue;
-        }
-        match unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) } {
-            Ok(_) => log!("mods: loaded {}", path.display()),
-            Err(e) => log!("mods: could not load {}: {e}", path.display()),
+/// Loads every `.asi` in `folders` (the first folder holding a file name wins, so the same plugin
+/// isn't loaded twice). Returns how many were loaded.
+fn load_plugins(folders: &[PathBuf]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut loaded = 0;
+    for folder in folders {
+        let Ok(entries) = std::fs::read_dir(folder) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("asi")) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !seen.insert(name) {
+                continue;
+            }
+            match unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) } {
+                Ok(_) => {
+                    loaded += 1;
+                    log!("mods: loaded {}", path.display());
+                }
+                Err(e) => log!("mods: could not load {}: {e}", path.display()),
+            }
         }
     }
+    loaded
 }
 
-/// Sets up the overlay and loads the plugins. Call once, as early as possible.
+/// Sets up the file overlay (when there is a `mods\` folder) and loads the plugins. Call once,
+/// as early as possible.
 pub fn install(dll_dir: &Path) {
-    let mods = dll_dir.join("mods");
-    if !mods.is_dir() {
-        return;
-    }
     let mut exe = [0u16; 1024];
     let len = unsafe { windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut exe) } as usize;
     let exe = PathBuf::from(std::ffi::OsString::from_wide(&exe[..len]));
-    let Some(game) = exe.parent() else { return };
-    let mut game = game.to_string_lossy().to_lowercase().replace('/', "\\");
-    if !game.ends_with('\\') {
-        game.push('\\');
-    }
-    log!("mods: overlaying {} on {game}", mods.display());
-    let _ = ROOTS.set(Roots { game, mods: mods.clone() });
-    hook_files();
-    let asi_loader = mods.join("dinput8.dll");
-    if asi_loader.exists() {
-        match unsafe { LoadLibraryW(&HSTRING::from(asi_loader.as_os_str())) } {
-            Ok(_) => log!("mods: loaded the ASI loader {}, it loads the plugins", asi_loader.display()),
-            Err(e) => {
-                log!("mods: could not load {}: {e}; loading the plugins directly", asi_loader.display());
-                load_plugins(&mods);
-            }
+    let Some(game_dir) = exe.parent().map(Path::to_path_buf) else { return };
+
+    let mods = dll_dir.join("mods");
+    let have_mods = mods.is_dir();
+    if have_mods {
+        let mut game = game_dir.to_string_lossy().to_lowercase().replace('/', "\\");
+        if !game.ends_with('\\') {
+            game.push('\\');
         }
-    } else {
-        load_plugins(&mods);
+        log!("mods: overlaying {} on {game}", mods.display());
+        let _ = ROOTS.set(Roots { game, mods: mods.clone() });
+        hook_files();
     }
-    for proxy in ["d3d9.dll", "dsound.dll", "winmm.dll", "vulkan.dll"] {
-        if mods.join(proxy).exists() {
-            log!("mods: {proxy} can't be loaded from mods (Windows loads it before us); put it in the game folder");
+
+    // Plugins come from `mods\plugins`, then the game folder's own plugins (`plugins`, `scripts`
+    // and the folder itself), so an existing FusionFix install works without copying it.
+    let mut folders = vec![mods.join("plugins"), game_dir.join("plugins"), game_dir.join("scripts"), game_dir.clone()];
+    if !have_mods {
+        folders.remove(0);
+    }
+
+    // The ASI loader (Ultimate ASI Loader as dinput8.dll) loads the plugins itself, which is what
+    // FusionFix expects: it refuses to run when something else loaded it.
+    let asi_loader = mods.join("dinput8.dll");
+    if have_mods && asi_loader.exists() {
+        match unsafe { LoadLibraryW(&HSTRING::from(asi_loader.as_os_str())) } {
+            Ok(_) => {
+                log!("mods: loaded the ASI loader {}, it loads the plugins", asi_loader.display());
+                return;
+            }
+            Err(e) => log!("mods: could not load {}: {e}; loading the plugins directly", asi_loader.display()),
+        }
+    }
+    let loaded = load_plugins(&folders);
+    if loaded > 0 {
+        log!(
+            "mods: loaded {loaded} plugin(s) directly; FusionFix needs the latest Ultimate ASI Loader \
+             (https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/latest) as mods\\dinput8.dll \
+             and says \"incompatible version of ASI Loader\" without it"
+        );
+    }
+    if have_mods {
+        for proxy in ["d3d9.dll", "dsound.dll", "winmm.dll", "vulkan.dll"] {
+            if mods.join(proxy).exists() {
+                log!("mods: {proxy} can't be loaded from mods (Windows loads it before us); put it in the game folder");
+            }
         }
     }
 }

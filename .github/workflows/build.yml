@@ -1,10 +1,21 @@
 # Builds the client (IVMP_Client.dll + ivmp_launcher.exe) and the server (Server.exe, and a
 # Linux `Server` for hosting panels like Pelican), zips each and publishes a release.
-# Manual only: run it from the Actions tab. The release notes list every commit since the
-# previous release, and a build log with the time each part took.
+# Runs when code changes (Client, Server or this file; not for README, docs, images or icons),
+# or by hand from the Actions tab. The release is a normal "latest" release; its notes list
+# every commit since the previous release, and a build log with the time each part took.
 name: Build
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "Client/**"
+      - "Server/**"
+      - ".github/workflows/build.yml"
+      - "!**/*.md"
+      - "!**/*.png"
+      - "!**/*.ico"
+      - "!**/*.svg"
   workflow_dispatch:
 
 permissions:
