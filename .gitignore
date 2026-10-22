@@ -1,1 +1,5 @@
 .claude/
+Client/web/cef/
+Client/web/spike/out/
+Client/web/spike/obj/
+Client/web/spike/build.log

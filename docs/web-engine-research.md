@@ -95,9 +95,28 @@ game's loop; the paint callback only copies into a staging buffer and the render
 `CefInitialize` happens after the game has unpacked, from the same post-unpack thread as the other
 installs, and never on a loading screen (same `hang::game_running()` gate as the UI).
 
+## Spike result (Client/web/spike)
+
+Built and run (32-bit, MSVC Build Tools, `build.bat`; CEF 156.0.7 windows32 minimal, SHA1 checked):
+
+- Windowless rendering works: `OnPaint` delivers 1280x720 BGRA frames with dirty rectangles; one
+  frame is dumped to `spike_frame.png`.
+- The page loads from `ivmp://ui/index.html` through our scheme handler.
+- **Every outside request fails**: `fetch` (https, http, a bare IP), `XMLHttpRequest`, `WebSocket`,
+  `<img>` and `<script>` from the internet. With the request-handler wall on, the log shows each one
+  `cancelled`. With `--engine-wall-only` (handler wall off) they still fail, from the engine
+  switches alone (no DNS, no proxy). So there are two independent walls.
+- The bridge works: `ivmpSend('spike.hello', {...})` reached the browser process and was answered.
+- Real size of the runtime as unpacked: `Release` 256 MB plus `Resources` 86 MB (about 340 MB
+  before trimming locales and unused files). It stays a separate optional download.
+- Build notes: `libcef_dll_wrapper` compiles with plain `cl` (/MT), no CMake needed; the exe is also
+  the helper process (`browser_subprocess_path` can point to a separate small exe later).
+- Not covered yet: drawing into the game's D3D9 device, input routing, running inside the game
+  process (`CefInitialize` from the injected DLL).
+
 ## Plan
 
-1. **Spike** (a standalone 32-bit exe, not the game): download the pinned windows32 CEF, build
+1. **Spike (done, see above)** (a standalone 32-bit exe, not the game): download the pinned windows32 CEF, build
    `libcef_dll_wrapper` (CMake) or evaluate a Rust binding (`cef-rs`), open a windowless browser on
    an `ivmp://` page, dump one `OnPaint` frame to a PNG. Proves: 32-bit runtime, OSR, our scheme
    handler, and that every outside request is refused (test page that tries `fetch('https://...')`,

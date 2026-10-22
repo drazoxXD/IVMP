@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>IVMP web spike</title>
+<style>
+  html, body { margin: 0; background: transparent; font: 18px Segoe UI, sans-serif; color: #e8eef5; }
+  .panel { margin: 24px; padding: 20px 28px; width: 760px; background: rgba(22, 24, 28, .82);
+           border-left: 4px solid #51b3ec; }
+  h1 { margin: 0 0 12px; font-size: 26px; font-weight: 600; }
+  .row { margin: 6px 0; }
+  .ok { color: #7bdc8c; } .blocked { color: #f0a15a; } .bad { color: #ff6b6b; }
+  code { color: #9fd3f5; }
+</style>
+<div class="panel">
+  <h1>IVMP web layer spike</h1>
+  <div class="row">Served from <code id="origin"></code></div>
+  <div class="row">Frame counter: <code id="tick">0</code></div>
+  <div id="results"></div>
+</div>
+<script src="app.js"></script>
