@@ -182,19 +182,27 @@ static GAME_MODE_PENDING: AtomicUsize = AtomicUsize::new(0);
 /// Changing the game type in the lobby stores the new match settings (0x47B990) and requests the
 /// network game again (native 0x1BC5050E -> 0xBDC960 -> GameMode_Request(1)) so the session
 /// reloads with them; ignoring every request left the host on the loading screen for good.
-/// Leaving the session (after a race, or "Leave" in the lobby) asks for single player (0):
-/// ignoring that left the host on a loading screen that never ended too. In a lobby game
-/// (`gamemode = -1`) it becomes a network reload: a fresh lobby, which the others follow.
-/// Otherwise it is ignored (nothing to go back to).
+/// Leaving the session (after a race, "Leave" in the lobby, or the game bailing out of a session
+/// that failed or lost its connection) asks for single player (0): ignoring that left the host on
+/// a loading screen that never ended. There is no single player to go back to, so it becomes a
+/// network reload, a fresh session (a fresh lobby in a lobby game, which the others follow). Not
+/// more often than every 10 s, so a session that keeps failing doesn't reload in a loop.
 extern "C" fn game_mode_request(mode: i32) {
-    let mode = if mode == 0 && ivmp_networking::net::lobby_mode() {
-        log!("boot: the game left its session (asked for single player): loading the network game again for a fresh lobby");
-        1
+    static LAST_RELOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mode = if mode == 0 {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        if now.saturating_sub(LAST_RELOAD.load(Ordering::Relaxed)) >= 10_000 {
+            LAST_RELOAD.store(now, Ordering::Relaxed);
+            log!("boot: the game left its session (asked for single player): loading the network game again");
+            1
+        } else {
+            0
+        }
     } else {
         mode
     };
     if mode == 0 {
-        log!("boot: ignored a request for single player, staying in network mode");
+        log!("boot: ignored a second request for single player within 10 s, staying in network mode");
         return;
     }
     log!("boot: game mode {mode} requested (network game reload)");
