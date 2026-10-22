@@ -1,7 +1,6 @@
 //! Direct3D 9 backend for dear imgui: uploads the font atlas and draws imgui's draw lists with the
 //! game's device. Everything the game had set is restored afterwards with a state block.
 
-use std::ffi::c_void;
 
 use imgui::{DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use windows::Win32::Foundation::{HANDLE, RECT};

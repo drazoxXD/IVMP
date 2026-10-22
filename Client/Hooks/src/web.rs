@@ -165,7 +165,6 @@ fn start(show: bool) {
     put_in_job(&child);
 
     // The process creates the pipe and the mapping; wait for them.
-    let started = Instant::now();
     // Two pipes, one per direction (a synchronous handle with a pending read blocks writes).
     let mut open = |suffix: &str, write: bool| -> Result<File, String> {
         let name = format!(r"\\.\pipe\{pipe_name}{suffix}");

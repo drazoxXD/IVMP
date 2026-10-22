@@ -127,7 +127,7 @@ fn device_methods() -> Option<[usize; 4]> {
             }
             // The swap chain's Present (vtable slot 3).
             if let Ok(chain) = unsafe { d.GetSwapChain(0) } {
-                let chain_vtable = unsafe { *(chain.as_raw() as *const usize) };
+                let chain_vtable = *(chain.as_raw() as *const usize);
                 let mut entry = [0u8; 4];
                 if memory::read(chain_vtable + 3 * 4, &mut entry) {
                     targets[3] = u32::from_le_bytes(entry) as usize;

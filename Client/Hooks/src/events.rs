@@ -14,6 +14,7 @@ pub type Handler = fn(GameEvent);
 
 static HANDLERS: RwLock<Vec<Handler>> = RwLock::new(Vec::new());
 
+#[allow(dead_code)] // for the script engine, once there is one
 pub fn subscribe(handler: Handler) {
     HANDLERS.write().unwrap().push(handler);
 }
