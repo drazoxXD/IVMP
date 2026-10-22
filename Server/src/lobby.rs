@@ -2,6 +2,7 @@
 //! (10.0.0.<id>). The first client to join hosts the engine session; when the host leaves, the
 //! oldest remaining client takes over.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -19,6 +20,9 @@ pub struct Client {
     pub out: ReliableOut,
     /// Control messages from this client (delivered once, in order).
     pub inn: ReliableIn,
+    /// Game packets relayed: received from this client / sent to it (reported in the pong).
+    pub up: Cell<u32>,
+    pub down: Cell<u32>,
 }
 
 #[derive(Default)]
@@ -60,6 +64,8 @@ impl Lobby {
             last_seen: Instant::now(),
             out: ReliableOut::default(),
             inn: ReliableIn::default(),
+            up: Cell::new(0),
+            down: Cell::new(0),
         });
         self.host.get_or_insert(id);
         Ok(id)

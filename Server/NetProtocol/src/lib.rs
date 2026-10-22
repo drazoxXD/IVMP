@@ -100,7 +100,10 @@ pub enum ServerMessage {
     /// The session host's new session is in its lobby: join it now.
     SessionReady { host: ClientId },
     /// Answer to [`ClientMessage::Ping`].
-    Pong { stamp: u32 },
+    /// Answer to [`ClientMessage::Ping`] with the same stamp, plus what the server has relayed for
+    /// this client so far: game packets it received from it (`up`) and sent to it (`down`), so the
+    /// client can tell where packets are lost.
+    Pong { stamp: u32, up: u32, down: u32 },
     /// A control message that is resent until acknowledged: the encoded inner [`ServerMessage`].
     Reliable { seq: u16, body: Vec<u8> },
     /// Everything the client sent as reliable messages up to `seq` has arrived.
@@ -317,7 +320,7 @@ impl ServerMessage {
             }
             ServerMessage::SessionRestart { host } => Writer::new(S_SESSION_RESTART).u8(*host).done(),
             ServerMessage::SessionReady { host } => Writer::new(S_SESSION_READY).u8(*host).done(),
-            ServerMessage::Pong { stamp } => Writer::new(S_PONG).u32(*stamp).done(),
+            ServerMessage::Pong { stamp, up, down } => Writer::new(S_PONG).u32(*stamp).u32(*up).u32(*down).done(),
             ServerMessage::Reliable { seq, body } => Writer::new(S_RELIABLE).u16(*seq).rest(body),
             ServerMessage::Ack { seq } => Writer::new(S_ACK).u16(*seq).done(),
         }
@@ -348,7 +351,7 @@ impl ServerMessage {
             S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
             S_SESSION_RESTART => ServerMessage::SessionRestart { host: r.u8()? },
             S_SESSION_READY => ServerMessage::SessionReady { host: r.u8()? },
-            S_PONG => ServerMessage::Pong { stamp: r.u32()? },
+            S_PONG => ServerMessage::Pong { stamp: r.u32()?, up: r.u32()?, down: r.u32()? },
             S_RELIABLE => ServerMessage::Reliable { seq: r.u16()?, body: r.rest() },
             S_ACK => ServerMessage::Ack { seq: r.u16()? },
             other => return Err(DecodeError::UnknownTag(other)),
@@ -399,7 +402,7 @@ mod tests {
             ServerMessage::GameSettings { mode: -2, slots: 32 },
             ServerMessage::SessionRestart { host: 1 },
             ServerMessage::SessionReady { host: 1 },
-            ServerMessage::Pong { stamp: 99 },
+            ServerMessage::Pong { stamp: 99, up: 1234, down: 5678 },
             ServerMessage::Reliable { seq: 7, body: vec![4, 5] },
             ServerMessage::Ack { seq: 3 },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },

@@ -308,7 +308,12 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 SESSION_READY.store(false, Ordering::SeqCst);
                 SESSION_RESTART.store(true, Ordering::SeqCst);
             }
-            ServerMessage::Pong { stamp } => PING_MS.store(clock_ms().wrapping_sub(stamp).max(1), Ordering::Relaxed),
+            ServerMessage::Pong { stamp, up, down } => {
+                PING_MS.store(clock_ms().wrapping_sub(stamp).max(1), Ordering::Relaxed);
+                SERVER_UP.store(up, Ordering::Relaxed);
+                SERVER_DOWN.store(down, Ordering::Relaxed);
+                relay_check(up, down);
+            }
             ServerMessage::SessionReady { host } => {
                 log!("net: the host {}'s new session is ready", virtual_ip(host));
                 SESSION_READY.store(true, Ordering::SeqCst);
@@ -337,6 +342,31 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
 fn clock_ms() -> u32 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u32
+}
+
+/// Game packets the server says it received from us / sent to us (from the latest pong).
+static SERVER_UP: AtomicU32 = AtomicU32::new(0);
+static SERVER_DOWN: AtomicU32 = AtomicU32::new(0);
+
+/// (sent by us, received by the server, sent by the server, received by us): where game packets are
+/// lost shows in the differences (uplink: first minus second, downlink: third minus fourth).
+pub fn relay_stats() -> (u32, u32, u32, u32) {
+    let (sent, received) = packet_counts();
+    (sent, SERVER_UP.load(Ordering::Relaxed), SERVER_DOWN.load(Ordering::Relaxed), received)
+}
+
+/// Warns once when game packets are clearly not getting through (nothing arrives at the server, or
+/// nothing arrives here although the server sends): "other players stay invisible".
+fn relay_check(up: u32, down: u32) {
+    static UP_WARNED: AtomicBool = AtomicBool::new(false);
+    static DOWN_WARNED: AtomicBool = AtomicBool::new(false);
+    let (sent, received) = packet_counts();
+    if sent >= 100 && up == 0 && !UP_WARNED.swap(true, Ordering::Relaxed) {
+        log!("net: the server received none of our {sent} game packets (control messages get through, so the game port is the problem?)");
+    }
+    if down >= 100 && received == 0 && !DOWN_WARNED.swap(true, Ordering::Relaxed) {
+        log!("net: the server sent us {down} game packets but none arrived: other players will stay invisible");
+    }
 }
 
 /// Round trip to the server in milliseconds, 0 until the first answer.

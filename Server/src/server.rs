@@ -160,6 +160,9 @@ impl Server {
         for (id, client) in &self.lobby.clients {
             if Some(*id) != except {
                 let _ = self.socket.send_to(&bytes, client.addr);
+                if matches!(message, ServerMessage::Tunnel { .. }) {
+                    client.down.set(client.down.get().wrapping_add(1));
+                }
             }
         }
     }
@@ -172,6 +175,9 @@ impl Server {
         match (message, sender) {
             (ClientMessage::Hello { version, nickname }, existing) => self.hello(from, version, &nickname, existing),
             (ClientMessage::Tunnel { from_port, to, to_port, payload }, Some(id)) => {
+                if let Some(client) = self.lobby.clients.get(&id) {
+                    client.up.set(client.up.get().wrapping_add(1));
+                }
                 let target = relay::target(to);
                 if let Some(capture) = self.capture.as_mut() {
                     capture.record(id, if let Target::Client(to) = target { to } else { 0 }, &payload);
@@ -188,6 +194,7 @@ impl Server {
                     Target::Client(to) => {
                         if let Some(client) = self.lobby.clients.get(&to) {
                             self.send(client.addr, &packet);
+                            client.down.set(client.down.get().wrapping_add(1));
                         }
                     }
                     Target::Nobody => {}
@@ -217,7 +224,10 @@ impl Server {
                 }
             }
             (ClientMessage::KeepAlive, Some(_)) => {}
-            (ClientMessage::Ping { stamp }, Some(_)) => self.send(from, &ServerMessage::Pong { stamp }),
+            (ClientMessage::Ping { stamp }, Some(id)) => {
+                let (up, down) = self.lobby.clients.get(&id).map(|c| (c.up.get(), c.down.get())).unwrap_or((0, 0));
+                self.send(from, &ServerMessage::Pong { stamp, up, down });
+            }
             // A control message from the client: acknowledge it, and process it once.
             (ClientMessage::Reliable { seq, body }, Some(id)) => {
                 let accepted = self.lobby.clients.get_mut(&id).map(|c| c.inn.accept(seq));
@@ -263,6 +273,9 @@ impl Server {
             capture.record(HOST_ID, client, &payload);
         }
         self.send(addr, &ServerMessage::Tunnel { from: virtual_ip(HOST_ID), from_port: GAME_PORT, to_port: client_port, payload });
+        if let Some(client) = self.lobby.clients.get(&client) {
+            client.down.set(client.down.get().wrapping_add(1));
+        }
     }
 
     fn host_tick(&mut self) {

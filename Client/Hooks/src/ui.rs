@@ -915,6 +915,13 @@ fn draw_overlay(ui: &imgui::Ui, stats: &Stats, top: f32) {
                 ));
                 ui.text(format!("Mode {mode}  Slots {slots}"));
                 ui.text(format!("Packets sent {sent}  received {received}"));
+                let (_, server_got, server_sent, _) = ivmp_networking::net::relay_stats();
+                let lost = |sent: u32, got: u32| if sent == 0 { 0.0 } else { sent.saturating_sub(got) as f32 * 100.0 / sent as f32 };
+                ui.text(format!(
+                    "Lost  up {:.0}%  down {:.0}%",
+                    lost(sent, server_got),
+                    lost(server_sent, received)
+                ));
             }
             if perf {
                 ui.text(format!("Frame {:.1} ms (min {:.1}, max {:.1})", stats.avg_ms, stats.min_ms, stats.max_ms));
