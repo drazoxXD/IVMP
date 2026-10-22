@@ -212,6 +212,39 @@ fn hook_files() {
     }
 }
 
+/// Logs the loaded modules that export `IsUltimateASILoader` (what FusionFix looks for), and the
+/// ones named like a loader, so a "incompatible version of ASI Loader" popup can be explained.
+fn log_asi_loaders(when: &str) {
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetProcAddress};
+    use windows::Win32::System::ProcessStatus::EnumProcessModules;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::core::s;
+
+    let mut modules = [HMODULE::default(); 1024];
+    let mut needed = 0u32;
+    let size = std::mem::size_of_val(&modules) as u32;
+    if unsafe { EnumProcessModules(GetCurrentProcess(), modules.as_mut_ptr(), size, &mut needed) }.is_err() {
+        log!("mods: {when}: could not list the modules");
+        return;
+    }
+    let count = (needed as usize / std::mem::size_of::<HMODULE>()).min(modules.len());
+    let mut found = 0;
+    for &module in &modules[..count] {
+        let mut name = [0u16; 512];
+        let len = unsafe { GetModuleFileNameW(Some(module), &mut name) } as usize;
+        let name = String::from_utf16_lossy(&name[..len]);
+        let exports = unsafe { GetProcAddress(module, s!("IsUltimateASILoader")) }.is_some();
+        let lower = name.to_lowercase();
+        let loader_name = ["dinput8.dll", "dsound.dll", "xlive.dll", ".asi"].iter().any(|n| lower.ends_with(n));
+        if exports || loader_name {
+            log!("mods: {when}: {name} exports IsUltimateASILoader: {exports}");
+        }
+        found += exports as u32;
+    }
+    log!("mods: {when}: {count} modules loaded, {found} export IsUltimateASILoader");
+}
+
 /// Loads every `.asi` in `folders` (the first folder holding a file name wins, so the same plugin
 /// isn't loaded twice). Returns how many were loaded.
 fn load_plugins(folders: &[PathBuf]) -> usize {
@@ -274,6 +307,7 @@ pub fn install(dll_dir: &Path) {
         match unsafe { LoadLibraryW(&HSTRING::from(asi_loader.as_os_str())) } {
             Ok(_) => {
                 log!("mods: loaded the ASI loader {}, it loads the plugins", asi_loader.display());
+                log_asi_loaders("after loading the ASI loader");
                 return;
             }
             Err(e) => log!("mods: could not load {}: {e}; loading the plugins directly", asi_loader.display()),
