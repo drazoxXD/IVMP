@@ -151,7 +151,7 @@ pub fn window_message(message: u32, wparam: usize, lparam: isize) -> bool {
             }
             return true;
         }
-        WM_KEYDOWN | WM_SYSKEYDOWN if wparam as u16 == VK_F2.0 => {
+        WM_KEYDOWN | WM_SYSKEYDOWN if wparam as u16 == VK_F3.0 => {
             if lparam & (1 << 30) == 0 && crate::hang::game_running() {
                 crate::web::toggle();
             }
