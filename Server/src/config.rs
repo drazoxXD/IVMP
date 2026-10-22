@@ -49,7 +49,7 @@ bind = 0.0.0.0:9999
 # The server tends to be the best, but for game modes you need peer to peer.
 # 1 = server: scripting like in FiveM, the server is the host and clients are just clients
 # 0 = peer to peer: the server is only a relay, game modes, no scripts, a client is the host
-#     (like in HappinessMP)
+#     (the game's own peer to peer sessions)
 host = 0
 
 # Game mode:
