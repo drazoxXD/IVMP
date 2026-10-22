@@ -24,6 +24,8 @@ static ORIGINAL_END_SCENE: AtomicUsize = AtomicUsize::new(0);
 static VTABLE_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static VTABLE_RESET: AtomicUsize = AtomicUsize::new(0);
 /// A Present of some kind has run (so EndScene stops drawing).
+/// The game is inside Reset.
+static IN_RESET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRESENT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SWAP_CHAIN_PRESENT: AtomicUsize = AtomicUsize::new(0);
 /// d3d9's real Present / Reset / swap chain Present code (from the throwaway device).
@@ -269,6 +271,21 @@ pub fn install() {
 /// GTA IV doesn't go through Present (the log never shows it), so EndScene on the back buffer is
 /// the usual place.
 fn draw(device: *mut c_void, only_back_buffer: bool) {
+    // Not while the device is being reset, and never from inside our own drawing: the overlay's
+    // hooks of the device methods we call while drawing can call back into EndScene / Present.
+    std::thread_local! {
+        static DRAWING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    struct Drawing;
+    impl Drop for Drawing {
+        fn drop(&mut self) {
+            DRAWING.with(|d| d.set(false));
+        }
+    }
+    if IN_RESET.load(Ordering::SeqCst) || DRAWING.with(|d| d.replace(true)) {
+        return;
+    }
+    let _drawing = Drawing;
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     // Never on a loading screen (another thread draws it while the game thread loads: touching
     // the device then froze the game), and only ever from the one thread that draws the frames.
@@ -388,8 +405,10 @@ unsafe extern "system" fn vtable_reset(device: *mut c_void, parameters: *mut D3D
     if let Some(p) = unsafe { parameters.as_ref() } {
         log!("render: Reset to {}x{}, windowed {}", p.BackBufferWidth, p.BackBufferHeight, p.Windowed.as_bool());
     }
+    IN_RESET.store(true, Ordering::SeqCst);
     let original: Reset = unsafe { std::mem::transmute(VTABLE_RESET.load(Ordering::SeqCst)) };
     let result = unsafe { original(device, parameters) };
+    IN_RESET.store(false, Ordering::SeqCst);
     log!("render: Reset returned {result:#x}");
     result
 }
