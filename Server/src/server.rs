@@ -1,6 +1,7 @@
 //! The server loop: receives client messages, keeps the lobby, relays game packets and feeds
 //! them to the entity registry (docs/onesync-plan.md).
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -9,7 +10,7 @@ use ivmp_host::session::HostSession;
 use ivmp_scripting::Scripting;
 use ivmp_sync::{events::EventLog, ids, nodes, registry::Registry};
 use NetProtocol::reliable::Accept;
-use NetProtocol::{ClientId, ClientMessage, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
+use NetProtocol::{ClientId, ClientMessage, MAX_SCRIPT_PAYLOAD, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
 
 use crate::capture::Capture;
 use crate::config::Config;
@@ -46,10 +47,15 @@ pub struct Server {
     host: Option<HostSession>,
     /// The resources (Lua scripts), docs/scripting-plan.md.
     scripting: Scripting,
+    /// Script events each client triggered in the current second (a flood is dropped).
+    script_rate: HashMap<ClientId, (Instant, u32)>,
     /// What clients host and join (server.cfg `gamemode`, `slots`).
     gamemode: i32,
     slots: u8,
 }
+
+/// Script events one player may trigger per second.
+const SCRIPT_EVENTS_PER_SECOND: u32 = 100;
 
 impl Server {
     pub fn start(config: &Config) -> std::io::Result<Self> {
@@ -91,6 +97,7 @@ impl Server {
         }
         Ok(Server {
             scripting,
+            script_rate: HashMap::new(),
             socket,
             lobby: Lobby { preset_ids: config.ids.clone(), ..Lobby::default() },
             capture,
@@ -178,7 +185,43 @@ impl Server {
             }
         }
         for event in self.scripting.take_client_events() {
-            debug!("script event '{}' for {} is not delivered yet (client scripts come in a later stage)", event.name, event.target);
+            let payload = ivmp_scripting::args_to_json(&event.args).into_bytes();
+            if payload.len() > MAX_SCRIPT_PAYLOAD || event.name.len() > 255 {
+                say!("TriggerClientEvent '{}': the event is too big ({} bytes, at most {MAX_SCRIPT_PAYLOAD})", event.name, payload.len());
+                continue;
+            }
+            let message = ServerMessage::ScriptEvent { name: event.name.clone(), payload };
+            if event.target < 0 {
+                self.reliable_broadcast(None, &message);
+            } else {
+                match ClientId::try_from(event.target) {
+                    Ok(id) if self.lobby.clients.contains_key(&id) => self.reliable(id, &message),
+                    _ => say!("TriggerClientEvent '{}': there is no player {}", event.name, event.target),
+                }
+            }
+        }
+    }
+
+    /// `TriggerServerEvent` from a client: the handlers a resource registered with RegisterNetEvent.
+    fn script_event(&mut self, id: ClientId, name: &str, payload: &[u8]) {
+        let now = Instant::now();
+        let (since, count) = self.script_rate.entry(id).or_insert((now, 0));
+        if now.duration_since(*since) >= Duration::from_secs(1) {
+            (*since, *count) = (now, 0);
+        }
+        *count += 1;
+        if *count > SCRIPT_EVENTS_PER_SECOND {
+            if *count == SCRIPT_EVENTS_PER_SECOND + 1 {
+                say!("player {id} sends too many script events, dropping them");
+            }
+            return;
+        }
+        if payload.len() > MAX_SCRIPT_PAYLOAD {
+            say!("player {id}: script event '{name}' is too big ({} bytes)", payload.len());
+            return;
+        }
+        if let Err(e) = self.scripting.net_event_json(id as u32, name, payload) {
+            say!("player {id}: bad script event '{name}': {e}");
         }
     }
 
@@ -215,6 +258,7 @@ impl Server {
         }
         match (message, sender) {
             (ClientMessage::Hello { version, nickname }, existing) => self.hello(from, version, &nickname, existing),
+            (ClientMessage::ScriptEvent { name, payload }, Some(id)) => self.script_event(id, &name, &payload),
             (ClientMessage::Tunnel { from_port, to, to_port, payload }, Some(id)) => {
                 if let Some(client) = self.lobby.clients.get(&id) {
                     client.up.set(client.up.get().wrapping_add(1));
@@ -339,6 +383,13 @@ impl Server {
         // A repeated hello (lost welcome) just gets the welcome again.
         let id = match existing {
             Some(id) => id,
+            None if self.scripting.player_connecting(nickname).is_some_and(|reason| {
+                say!("{nickname} ({from}) was refused by a script: {reason}");
+                true
+            }) =>
+            {
+                return self.send(from, &ServerMessage::Reject(RejectReason::Refused));
+            }
             None => match self.lobby.join(from, nickname) {
                 Ok(id) => {
                     say!("{nickname} joined from {from} as {} (id {id}), object ids {:?}", virtual_ip(id), ids::block(id));
@@ -482,6 +533,7 @@ impl Server {
     }
 
     fn remove(&mut self, id: ClientId, why: &str) {
+        self.script_rate.remove(&id);
         if let Some(host) = self.host.as_mut() {
             host.remove(id);
         }

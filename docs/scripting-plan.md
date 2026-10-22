@@ -58,6 +58,10 @@ Client: `TriggerServerEvent(name, ...)`, natives (`Citizen.InvokeNative`-style p
    console. Sample resource. (Server only, no client scripts yet.)
 2. **Network events.** `TriggerServerEvent` / `TriggerClientEvent` as reliable messages
    (protocol 10), `RegisterNetEvent` gate, `source`.
+   Done: arguments travel as a JSON array (at most 900 bytes, 100 events per second per player),
+   `TriggerClientEvent(name, player|-1, ...)` reaches the client queue (`net::take_script_events`),
+   `playerConnecting` with `SetKickReason` + `CancelEvent` refuses a join. The client console has
+   `triggerserver <event> [json]` for testing until the client runtime (stage 3) exists.
 3. **Resource distribution and the client runtime.** The server sends client scripts and files
    (hash, chunks over the reliable channel, local cache); the client DLL runs them in Lua on the
    game thread (`game_process`), with the same event API.

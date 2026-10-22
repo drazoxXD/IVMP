@@ -66,6 +66,8 @@ pub struct World {
     drops: RefCell<Vec<(u32, String)>>,
     client_events: RefCell<Vec<ClientEvent>>,
     canceled: Cell<bool>,
+    /// Why `playerConnecting` was canceled (SetKickReason).
+    kick_reason: RefCell<String>,
     /// Resources being started right now (dependency cycles).
     starting: RefCell<Vec<String>>,
 }
@@ -95,6 +97,7 @@ impl World {
             drops: RefCell::new(Vec::new()),
             client_events: RefCell::new(Vec::new()),
             canceled: Cell::new(false),
+            kick_reason: RefCell::new(String::new()),
             starting: RefCell::new(Vec::new()),
         })
     }
@@ -260,6 +263,17 @@ impl World {
         self.players.borrow_mut().retain(|p| p.id != id);
         self.players.borrow_mut().push(Player { id, name: name.to_string() });
         self.dispatch("playerJoining", &[Variant::Str(id.to_string())], Some(id as i64), None);
+    }
+
+    /// `playerConnecting(name)` before the player is let in: `Some(reason)` if a handler canceled it
+    /// (CancelEvent, with the text from SetKickReason).
+    pub fn player_connecting(&self, name: &str) -> Option<String> {
+        self.kick_reason.borrow_mut().clear();
+        let canceled = self.dispatch("playerConnecting", &[Variant::Str(name.to_string())], Some(0), None);
+        canceled.then(|| {
+            let reason = self.kick_reason.borrow().clone();
+            if reason.is_empty() { "no reason given".to_string() } else { reason }
+        })
     }
 
     pub fn player_dropped(&self, id: u32, reason: &str) {
@@ -440,6 +454,13 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
         globals.set("CancelEvent", lua.create_function(move |_, ()| {
             if let Some(world) = cancel_weak.upgrade() {
                 world.canceled.set(true);
+            }
+            Ok(())
+        })?)?;
+        let kick_weak = weak.clone();
+        globals.set("SetKickReason", lua.create_function(move |_, reason: String| {
+            if let Some(world) = kick_weak.upgrade() {
+                *world.kick_reason.borrow_mut() = reason;
             }
             Ok(())
         })?)?;

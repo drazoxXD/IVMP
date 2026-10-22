@@ -212,6 +212,7 @@ fn reject_text(reason: &RejectReason) -> String {
         }
         RejectReason::ServerFull => "The server refused us: it is full".to_string(),
         RejectReason::BadNickname => "The server refused us: the nickname is not allowed".to_string(),
+        RejectReason::Refused => "The server refused us: a script rejected the connection".to_string(),
     }
 }
 
@@ -409,6 +410,15 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 crate::spawner::request(crate::spawner::Request { id: request, kind, model, position, heading });
             }
             ServerMessage::Despawn { kind, object_id } => crate::spawner::despawn(kind, object_id),
+            ServerMessage::ScriptEvent { name, payload } => {
+                let json = String::from_utf8_lossy(&payload).to_string();
+                log!("net: script event '{name}' {json}");
+                let mut events = SCRIPT_EVENTS.lock().unwrap();
+                if events.len() >= MAX_QUEUED_SCRIPT_EVENTS {
+                    events.pop_front();
+                }
+                events.push_back((name, json));
+            }
             // Handled above; a reliable message inside a reliable one is ignored.
             ServerMessage::Reliable { .. } | ServerMessage::Ack { .. } => {}
         }
@@ -451,6 +461,32 @@ static PING_MS: AtomicU32 = AtomicU32::new(0);
 
 pub fn ping_ms() -> u32 {
     PING_MS.load(Ordering::Relaxed)
+}
+
+/// Script events the server sent (`TriggerClientEvent`), as (name, JSON arguments), until the client
+/// script runtime takes them.
+static SCRIPT_EVENTS: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::new());
+const MAX_QUEUED_SCRIPT_EVENTS: usize = 256;
+
+/// The script events received since the last call.
+pub fn take_script_events() -> Vec<(String, String)> {
+    SCRIPT_EVENTS.lock().unwrap().drain(..).collect()
+}
+
+/// `TriggerServerEvent(name, ...)`: `json` is the JSON array of the arguments. Returns an error
+/// text if the event can't be sent.
+pub fn trigger_server_event(name: &str, json: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 255 {
+        return Err("the event name must be 1 to 255 characters".into());
+    }
+    if json.len() > NetProtocol::MAX_SCRIPT_PAYLOAD {
+        return Err(format!("the arguments are too big ({} bytes, at most {})", json.len(), NetProtocol::MAX_SCRIPT_PAYLOAD));
+    }
+    if connected().is_none() {
+        return Err("not connected".into());
+    }
+    send_reliable(&ClientMessage::ScriptEvent { name: name.to_string(), payload: json.as_bytes().to_vec() });
+    Ok(())
 }
 
 /// Sends a control message that is resent until the server acknowledges it (any thread).

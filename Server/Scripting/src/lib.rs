@@ -72,6 +72,11 @@ impl Scripting {
         self.world.tick();
     }
 
+    /// Asks the resources whether `name` may join: `Some(reason)` if one canceled `playerConnecting`.
+    pub fn player_connecting(&self, name: &str) -> Option<String> {
+        self.world.player_connecting(name)
+    }
+
     pub fn player_joined(&self, id: u32, name: &str) {
         self.world.player_joined(id, name);
     }
@@ -99,7 +104,27 @@ impl Scripting {
     pub fn net_event(&self, source: u32, name: &str, args: &[Variant]) {
         self.world.net_event(source, name, args);
     }
+
+    /// An event a client triggered: its arguments are a JSON array.
+    pub fn net_event_json(&self, source: u32, name: &str, json: &[u8]) -> Result<(), String> {
+        let args = args_from_json(json)?;
+        self.world.net_event(source, name, &args);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// The arguments of an event as the JSON array that goes over the network.
+pub fn args_to_json(args: &[Variant]) -> String {
+    serde_json::Value::Array(args.iter().map(Variant::to_json).collect()).to_string()
+}
+
+/// The inverse of [`args_to_json`]; a client could send anything, so it must be an array.
+pub fn args_from_json(json: &[u8]) -> Result<Vec<Variant>, String> {
+    match serde_json::from_slice::<serde_json::Value>(json).map_err(|e| e.to_string())? {
+        serde_json::Value::Array(items) => Ok(items.iter().map(Variant::from_json).collect()),
+        _ => Err("the arguments must be a JSON array".into()),
+    }
+}

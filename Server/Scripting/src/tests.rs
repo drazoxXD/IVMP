@@ -242,3 +242,41 @@ fn restart_runs_the_start_and_stop_events() {
     assert_eq!(out.iter().filter(|l| *l == "[r] start\tr").count(), 2, "{out:?}");
     assert_eq!(out.iter().filter(|l| *l == "[r] stop\tr").count(), 1, "{out:?}");
 }
+
+#[test]
+fn net_events_come_from_json_and_go_out_as_json() {
+    let folder = Folder::new("json_events");
+    folder.resource(
+        "e",
+        "server_script 'main.lua'",
+        &[(
+            "main.lua",
+            "RegisterNetEvent('ping', function(a, t) print('ping', source, a, t.x) TriggerClientEvent('pong', source, a + 1, { x = t.x }) end)",
+        )],
+    );
+    let (scripting, log) = scripting(&folder);
+    scripting.start("e").unwrap();
+    scripting.net_event_json(4, "ping", br#"[41, {"x": "y"}]"#).unwrap();
+    assert!(lines(&log).contains(&"[e] ping\t4\t41\ty".to_string()), "{:?}", lines(&log));
+    let events = scripting.take_client_events();
+    assert_eq!((events[0].target, events[0].name.as_str()), (4, "pong"));
+    assert_eq!(args_to_json(&events[0].args), r#"[42,{"x":"y"}]"#);
+    assert!(scripting.net_event_json(4, "ping", b"{}").is_err(), "arguments must be an array");
+    assert!(scripting.net_event_json(4, "ping", b"not json").is_err());
+}
+
+#[test]
+fn player_connecting_can_be_refused() {
+    let folder = Folder::new("connecting");
+    folder.resource(
+        "gate",
+        "server_script 'main.lua'",
+        &[("main.lua", "AddEventHandler('playerConnecting', function(name) if name == 'Bad' then SetKickReason('no bad names') CancelEvent() end end)")],
+    );
+    let (scripting, _) = scripting(&folder);
+    assert_eq!(scripting.player_connecting("Niko"), None);
+    scripting.start("gate").unwrap();
+    assert_eq!(scripting.player_connecting("Niko"), None);
+    assert_eq!(scripting.player_connecting("Bad").as_deref(), Some("no bad names"));
+    assert_eq!(scripting.player_connecting("Niko"), None, "the reason does not stick");
+}

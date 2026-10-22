@@ -416,7 +416,7 @@ static COMPLETION_OUTPUT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Every command the console knows, for Tab completion and suggestions.
 fn command_names() -> Vec<&'static str> {
-    let mut names = vec!["help", "clear", "echo", "overlay", "status", "devtools", "quit"];
+    let mut names = vec!["help", "clear", "echo", "overlay", "status", "devtools", "quit", "triggerserver"];
     names.extend(WIP_TOOLS.iter().map(|(_, name, _)| *name));
     names.sort_unstable();
     names
@@ -574,6 +574,16 @@ impl Ui {
         match name.as_str() {
             "devtools" => crate::web::open_devtools(),
             "quit" => crate::render::quit_game(),
+            "triggerserver" => match args.split_first() {
+                None => self.print(ERROR_COLOR, "usage: triggerserver <event> [json array of arguments]"),
+                Some((event, rest)) => {
+                    let json = if rest.is_empty() { "[]".to_string() } else { rest.join(" ") };
+                    match ivmp_networking::net::trigger_server_event(event, &json) {
+                        Ok(()) => self.print(OUTPUT_COLOR, format!("sent {event} {json}")),
+                        Err(e) => self.print(ERROR_COLOR, format!("{event}: {e}")),
+                    }
+                }
+            },
             "help" => self.print(
                 OUTPUT_COLOR,
                 "help                          this list\n\

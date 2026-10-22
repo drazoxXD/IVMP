@@ -45,3 +45,15 @@ end)
 exports('playerCount', function()
     return GetNumPlayerIndices()
 end)
+
+-- A client can send this with the console command `triggerserver ping 5`; the server answers with
+-- a client event (the client console shows it as "script event 'pong' ...").
+RegisterNetEvent('ping', function(n)
+    print(GetPlayerName(source) .. ' pinged with ' .. tostring(n))
+    TriggerClientEvent('pong', source, (n or 0) + 1)
+end)
+
+-- Refuse a join:
+-- AddEventHandler('playerConnecting', function(name)
+--     if name == 'Banned' then SetKickReason('you are banned') CancelEvent() end
+-- end)

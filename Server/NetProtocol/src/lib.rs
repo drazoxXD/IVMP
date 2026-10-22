@@ -12,7 +12,9 @@ pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
 pub mod reliable;
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
+/// The most a script event's JSON arguments may take: it travels in one reliable packet.
+pub const MAX_SCRIPT_PAYLOAD: usize = 900;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -58,6 +60,9 @@ pub enum ClientMessage {
     /// The session host's new session (after [`ClientMessage::SessionRestart`]) is up and in its
     /// lobby: the others can join it now.
     SessionReady,
+    /// `TriggerServerEvent(name, ...)`: the arguments as JSON (see [`MAX_SCRIPT_PAYLOAD`]). Sent
+    /// as a reliable message.
+    ScriptEvent { name: String, payload: Vec<u8> },
 }
 
 /// What a [`ServerMessage::Spawn`] creates.
@@ -72,6 +77,8 @@ pub enum RejectReason {
     VersionMismatch,
     ServerFull,
     BadNickname,
+    /// A resource refused the player (`playerConnecting` canceled).
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +115,8 @@ pub enum ServerMessage {
     Reliable { seq: u16, body: Vec<u8> },
     /// Everything the client sent as reliable messages up to `seq` has arrived.
     Ack { seq: u16 },
+    /// `TriggerClientEvent(name, ...)`: the arguments as JSON. Sent as a reliable message.
+    ScriptEvent { name: String, payload: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +138,7 @@ const C_BYE: u8 = 0x04;
 const C_SPAWNED: u8 = 0x05;
 const C_SESSION_RESTART: u8 = 0x06;
 const C_SESSION_READY: u8 = 0x07;
+const C_SCRIPT_EVENT: u8 = 0x08;
 const S_WELCOME: u8 = 0x81;
 const S_REJECT: u8 = 0x82;
 const S_PEER_JOINED: u8 = 0x83;
@@ -144,6 +154,7 @@ const S_SESSION_READY: u8 = 0x8C;
 const S_PONG: u8 = 0x8D;
 const S_RELIABLE: u8 = 0x8E;
 const S_ACK: u8 = 0x8F;
+const S_SCRIPT_EVENT: u8 = 0x90;
 
 fn kind_byte(kind: SpawnKind) -> u8 {
     match kind {
@@ -264,6 +275,7 @@ impl ClientMessage {
             }
             ClientMessage::SessionRestart => Writer::new(C_SESSION_RESTART).done(),
             ClientMessage::SessionReady => Writer::new(C_SESSION_READY).done(),
+            ClientMessage::ScriptEvent { name, payload } => Writer::new(C_SCRIPT_EVENT).str(name).rest(payload),
         }
     }
 
@@ -280,6 +292,7 @@ impl ClientMessage {
             C_SPAWNED => ClientMessage::Spawned { request: r.u32()?, object_id: r.u16()? },
             C_SESSION_RESTART => ClientMessage::SessionRestart,
             C_SESSION_READY => ClientMessage::SessionReady,
+            C_SCRIPT_EVENT => ClientMessage::ScriptEvent { name: r.str()?, payload: r.rest() },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -294,6 +307,7 @@ impl ServerMessage {
                     RejectReason::VersionMismatch => 0,
                     RejectReason::ServerFull => 1,
                     RejectReason::BadNickname => 2,
+                    RejectReason::Refused => 3,
                 })
                 .done(),
             ServerMessage::PeerJoined { id, nickname } => Writer::new(S_PEER_JOINED).u8(*id).str(nickname).done(),
@@ -323,6 +337,7 @@ impl ServerMessage {
             ServerMessage::Pong { stamp, up, down } => Writer::new(S_PONG).u32(*stamp).u32(*up).u32(*down).done(),
             ServerMessage::Reliable { seq, body } => Writer::new(S_RELIABLE).u16(*seq).rest(body),
             ServerMessage::Ack { seq } => Writer::new(S_ACK).u16(*seq).done(),
+            ServerMessage::ScriptEvent { name, payload } => Writer::new(S_SCRIPT_EVENT).str(name).rest(payload),
         }
     }
 
@@ -333,6 +348,7 @@ impl ServerMessage {
             S_REJECT => ServerMessage::Reject(match r.u8()? {
                 0 => RejectReason::VersionMismatch,
                 1 => RejectReason::ServerFull,
+                3 => RejectReason::Refused,
                 _ => RejectReason::BadNickname,
             }),
             S_PEER_JOINED => ServerMessage::PeerJoined { id: r.u8()?, nickname: r.str()? },
@@ -354,6 +370,7 @@ impl ServerMessage {
             S_PONG => ServerMessage::Pong { stamp: r.u32()?, up: r.u32()?, down: r.u32()? },
             S_RELIABLE => ServerMessage::Reliable { seq: r.u16()?, body: r.rest() },
             S_ACK => ServerMessage::Ack { seq: r.u16()? },
+            S_SCRIPT_EVENT => ServerMessage::ScriptEvent { name: r.str()?, payload: r.rest() },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -377,6 +394,7 @@ mod tests {
             ClientMessage::Spawned { request: 7, object_id: 500 },
             ClientMessage::SessionRestart,
             ClientMessage::SessionReady,
+            ClientMessage::ScriptEvent { name: "chat:message".into(), payload: b"[\"hi\",1]".to_vec() },
         ] {
             assert_eq!(ClientMessage::decode(&m.encode()), Ok(m));
         }
@@ -405,6 +423,7 @@ mod tests {
             ServerMessage::Pong { stamp: 99, up: 1234, down: 5678 },
             ServerMessage::Reliable { seq: 7, body: vec![4, 5] },
             ServerMessage::Ack { seq: 3 },
+            ServerMessage::ScriptEvent { name: "news".into(), payload: b"{}".to_vec() },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));
