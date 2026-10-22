@@ -23,7 +23,9 @@ static ORIGINAL_END_SCENE: AtomicUsize = AtomicUsize::new(0);
 /// trampolines skip the start of d3d9's functions, so only this sees every Present).
 static VTABLE_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static VTABLE_RESET: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A Present of some kind has run (so EndScene stops drawing).
+static PRESENT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SWAP_CHAIN_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 
@@ -243,13 +245,41 @@ fn hook_device_vtable(device: *mut c_void) {
             return;
         }
     }
-    PRESENT_HOOKED.store(true, Ordering::SeqCst);
     log!("render: hooked the game device's own vtable {vtable:#x} (Present, Reset)");
+    // The game may present through its swap chain instead of the device.
+    if let Some(d3d) = unsafe { IDirect3DDevice9::from_raw_borrowed(&device) } {
+        if let Ok(chain) = unsafe { d3d.GetSwapChain(0) } {
+            let chain_vtable = unsafe { *(chain.as_raw() as *const usize) };
+            let address = chain_vtable + 3 * 4;
+            SWAP_CHAIN_PRESENT.store(unsafe { *(address as *const usize) }, Ordering::SeqCst);
+            match unsafe { memory::patch(address, &(swap_chain_present as u32).to_le_bytes()) } {
+                Ok(()) => log!("render: hooked the swap chain's Present too (vtable {chain_vtable:#x})"),
+                Err(e) => log!("render: could not hook the swap chain's Present: {e}"),
+            }
+        }
+    }
+}
+
+type SwapChainPresent = unsafe extern "system" fn(*mut c_void, *const RECT, *const RECT, HWND, *const c_void, u32) -> i32;
+
+unsafe extern "system" fn swap_chain_present(chain: *mut c_void, source: *const RECT, dest: *const RECT, window: HWND, dirty: *const c_void, flags: u32) -> i32 {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| log!("render: first Present through the swap chain"));
+    // The swap chain knows its device.
+    if let Some(chain_ref) = unsafe { IDirect3DSwapChain9::from_raw_borrowed(&chain) } {
+        if let Ok(device) = unsafe { chain_ref.GetDevice() } {
+            PRESENT_SEEN.store(true, Ordering::SeqCst);
+            draw(device.as_raw(), false);
+        }
+    }
+    let original: SwapChainPresent = unsafe { std::mem::transmute(SWAP_CHAIN_PRESENT.load(Ordering::SeqCst)) };
+    unsafe { original(chain, source, dest, window, dirty, flags) }
 }
 
 unsafe extern "system" fn vtable_present(device: *mut c_void, source: *const RECT, dest: *const RECT, window: HWND, dirty: *const c_void) -> i32 {
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| log!("render: first Present through the device vtable"));
+    PRESENT_SEEN.store(true, Ordering::SeqCst);
     draw(device, false);
     let original: Present = unsafe { std::mem::transmute(VTABLE_PRESENT.load(Ordering::SeqCst)) };
     unsafe { original(device, source, dest, window, dirty) }
@@ -269,7 +299,7 @@ unsafe extern "system" fn end_scene(device: *mut c_void) -> i32 {
         hook_device_vtable(device);
     });
     // The frame is drawn once, at Present, as the last thing; EndScene only until that hook is in.
-    if !PRESENT_HOOKED.load(Ordering::SeqCst) {
+    if !PRESENT_SEEN.load(Ordering::SeqCst) {
         draw(device, true);
     }
     let original: EndScene = unsafe { std::mem::transmute(ORIGINAL_END_SCENE.load(Ordering::SeqCst)) };
