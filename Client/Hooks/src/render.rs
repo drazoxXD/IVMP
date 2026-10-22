@@ -208,6 +208,27 @@ fn inline_hook(target: usize, hook: usize) -> Option<usize> {
 
 /// Hooks Present and Reset. Call once, after the game has unpacked.
 pub fn install() {
+    // Where the game itself calls the device's Present (slot 17, +0x44) and Reset (slot 16, +0x40):
+    // call sites in the game's own code sit above d3d9 and the Steam overlay's hooks.
+    {
+        let code = memory::code_section();
+        let start = code.as_ptr() as usize;
+        let mut found = [Vec::new(), Vec::new()];
+        for at in 0..code.len().saturating_sub(3) {
+            // call dword ptr [reg + disp8]: FF /2 with mod 01, reg field 010 -> 0x50..=0x57
+            if code[at] == 0xFF && (0x50..=0x57).contains(&code[at + 1]) && code[at + 1] != 0x54 {
+                match code[at + 2] {
+                    0x44 => found[0].push(start + at),
+                    0x40 => found[1].push(start + at),
+                    _ => {}
+                }
+            }
+        }
+        for (name, sites) in ["Present +0x44", "Reset +0x40"].iter().zip(&found) {
+            let list: Vec<String> = sites.iter().take(40).map(|a| format!("{:#x}", *a - memory::game_image().as_ptr() as usize + memory::GHIDRA_BASE)).collect();
+            log!("render: game call sites of device->{name}: {} found: {}", sites.len(), list.join(" "));
+        }
+    }
     // The game's own call site of the device's Reset (GTAIV RVA 0x42c46a, Ghidra 0x82c46a)
     // sits above d3d9 and the Steam overlay's hooks. Dump the bytes there so the call site
     // can be studied.
