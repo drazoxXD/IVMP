@@ -166,21 +166,19 @@ fn inline_hook(target: usize, hook: usize) -> Option<usize> {
 
 /// Hooks Present and Reset. Call once, after the game has unpacked.
 pub fn install() {
-    let Some([reset_target, present_target, end_scene_target]) = device_methods() else { return };
-    for (target, hook, original, name) in [
-        (present_target, present as usize, &ORIGINAL_PRESENT, "Present"),
-        (reset_target, reset as usize, &ORIGINAL_RESET, "Reset"),
-        (end_scene_target, end_scene as usize, &ORIGINAL_END_SCENE, "EndScene"),
-    ] {
-        match inline_hook(target, hook) {
-            Some(stub) => original.store(stub, Ordering::SeqCst),
-            None => {
-                log!("render: could not hook {name} at {target:#x}");
-                return;
-            }
+    // Only EndScene is hooked in d3d9's code (to learn the game's device); Present and Reset are
+    // hooked on the device's own vtable from there. Patching d3d9's Present / Reset code as well
+    // chained into the compatibility shim (apphelp.dll) on some runs and crashed on a resolution
+    // change.
+    let Some([_reset_target, _present_target, end_scene_target]) = device_methods() else { return };
+    match inline_hook(end_scene_target, end_scene as usize) {
+        Some(stub) => ORIGINAL_END_SCENE.store(stub, Ordering::SeqCst),
+        None => {
+            log!("render: could not hook EndScene at {end_scene_target:#x}");
+            return;
         }
     }
-    log!("render: hooked the D3D9 device's Present ({present_target:#x}) and Reset ({reset_target:#x})");
+    log!("render: hooked the D3D9 device's EndScene ({end_scene_target:#x})");
 }
 
 /// Draws the UI on `device` (once per frame, whichever of EndScene / Present gets here first).
