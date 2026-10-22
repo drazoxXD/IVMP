@@ -210,44 +210,6 @@ fn inline_hook(target: usize, hook: usize) -> Option<usize> {
 
 /// Hooks Present and Reset. Call once, after the game has unpacked.
 pub fn install() {
-    // Where the game itself calls the device's Present (slot 17, +0x44) and Reset (slot 16, +0x40):
-    // call sites in the game's own code sit above d3d9 and the Steam overlay's hooks.
-    {
-        let code = memory::code_section();
-        let start = code.as_ptr() as usize;
-        let mut found = [Vec::new(), Vec::new()];
-        for at in 0..code.len().saturating_sub(3) {
-            // call dword ptr [reg + disp8]: FF /2 with mod 01, reg field 010 -> 0x50..=0x57
-            if code[at] == 0xFF && (0x50..=0x57).contains(&code[at + 1]) && code[at + 1] != 0x54 {
-                match code[at + 2] {
-                    0x44 => found[0].push(start + at),
-                    0x40 => found[1].push(start + at),
-                    _ => {}
-                }
-            }
-        }
-        for (name, sites) in ["Present +0x44", "Reset +0x40"].iter().zip(&found) {
-            let list: Vec<String> = sites.iter().take(40).map(|a| format!("{:#x}", *a - memory::game_image().as_ptr() as usize + memory::GHIDRA_BASE)).collect();
-            log!("render: game call sites of device->{name}: {} found: {}", sites.len(), list.join(" "));
-        }
-    }
-    // The game's own call site of the device's Reset (GTAIV RVA 0x42c46a, Ghidra 0x82c46a)
-    // sits above d3d9 and the Steam overlay's hooks. Dump the bytes there so the call site
-    // can be studied.
-    {
-        let start = memory::from_ghidra(0x0082_c440);
-        let mut bytes = [0u8; 96];
-        if memory::read(start, &mut bytes) {
-            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            log!("render: game bytes at ghidra 0x82c440: {}", hex.join(" "));
-        }
-    }
-    // Debug switch: an empty file named `no_render` next to the DLL turns every D3D hook off, to
-    // tell whether a crash is ours or the game's / the Steam overlay's.
-    if crate::dll_dir().join("no_render").exists() {
-        log!("render: no_render file found, the D3D hooks and the UI are off");
-        return;
-    }
     // Only EndScene is hooked in d3d9's code (to learn the game's device); Present and Reset are
     // hooked on the device's own vtable from there. Patching d3d9's Present / Reset code as well
     // chained into the compatibility shim (apphelp.dll) on some runs and crashed on a resolution
@@ -452,3 +414,11 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
 
 #[allow(dead_code)]
 fn unused(_: HANDLE) {}
+
+/// Asks the game window to close (like its close button).
+pub fn quit_game() {
+    let window = WINDOW.load(Ordering::Relaxed);
+    if window != 0 {
+        let _ = unsafe { PostMessageW(Some(HWND(window as *mut c_void)), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+}

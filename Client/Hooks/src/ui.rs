@@ -221,7 +221,6 @@ const WIP_TOOLS: &[(&str, &str, &str)] = &[
     ("Console", "con_miniconChannels", "Show chosen log channels on screen without opening the console"),
     ("Console", "cmdlist", "List every command and variable"),
     ("Console", "developer", "Extra developer logging"),
-    ("Console", "nui_devtools", "Dev tools for the web UI (needs the web engine, stage 2)"),
     ("Scripting", "script_debug", "Script engine debugger: native calls, running scripts (needs the native hook)"),
 ];
 
@@ -280,7 +279,9 @@ fn menu_bar(ui: &imgui::Ui) -> f32 {
                 wip_menu(ui, "Connect to host", "Connect to a typed address");
                 wip_menu(ui, "Disconnect", "Leave the server");
             });
-            wip_menu(ui, "Quit", "Close the game");
+            if ui.menu_item("Quit") {
+                crate::render::quit_game();
+            }
         });
         ui.menu("Tools", || {
             ui.menu("Performance", || {
@@ -302,7 +303,13 @@ fn menu_bar(ui: &imgui::Ui) -> f32 {
                 });
             }
             ui.menu("NUI", || {
-                wip_menu(ui, "Open DevTools", "Dev tools for the web UI (needs the web engine, stage 2)");
+                if crate::web::devtools_allowed() {
+                    if ui.menu_item("Open DevTools") {
+                        crate::web::open_devtools();
+                    }
+                } else {
+                    wip_menu(ui, "Open DevTools", "Developer builds only (or a `developer` file next to the client)");
+                }
             });
             ui.menu("Scripting", || {
                 wip_menu(ui, "Script debugger", "Native calls and running scripts (needs the native hook)");
@@ -405,7 +412,7 @@ static COMPLETION_OUTPUT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Every command the console knows, for Tab completion and suggestions.
 fn command_names() -> Vec<&'static str> {
-    let mut names = vec!["help", "clear", "echo", "overlay", "status"];
+    let mut names = vec!["help", "clear", "echo", "overlay", "status", "devtools", "quit"];
     names.extend(WIP_TOOLS.iter().map(|(_, name, _)| *name));
     names.sort_unstable();
     names
@@ -561,12 +568,16 @@ impl Ui {
         let name = words.next().unwrap_or("").to_lowercase();
         let args: Vec<&str> = words.collect();
         match name.as_str() {
+            "devtools" => crate::web::open_devtools(),
+            "quit" => crate::render::quit_game(),
             "help" => self.print(
                 OUTPUT_COLOR,
                 "help                          this list\n\
                  clear                         clear the console\n\
                  overlay <fps|ping|net|perf|all> [on|off]   show or hide a stats panel\n\
                  status                        network and game state\n\
+                 devtools                      open the web page's DevTools (developer builds)\n\
+                 quit                          close the game\n\
                  echo <text>                   print text",
             ),
             "clear" => self.lines.clear(),

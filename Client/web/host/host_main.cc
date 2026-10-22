@@ -27,14 +27,22 @@ using ivmp::Log;
 
 // ---- protocol ---------------------------------------------------------------------------------
 // Every message: u32 length (of type + payload), u8 type, payload. Little endian.
-enum ToHost : uint8_t { kVisible = 1, kFocus = 2, kResize = 3, kMouseMove = 4, kMouseButton = 5, kMouseWheel = 6, kKey = 7, kEmit = 8 };
+enum ToHost : uint8_t { kVisible = 1, kFocus = 2, kResize = 3, kMouseMove = 4, kMouseButton = 5, kMouseWheel = 6, kKey = 7, kEmit = 8, kDevTools = 9 };
 enum ToGame : uint8_t { kLog = 0x81, kBridge = 0x82, kReady = 0x83 };
 
+// Version of this protocol; the game refuses a process that reports another one.
+const uint32_t kProtocol = 1;
+
 // ---- shared frame -----------------------------------------------------------------------------
-// Header: u32 sequence (odd while being written), u32 width, u32 height, u32 reserved; then BGRA.
+// Header: u32 sequence (odd while being written), u32 width, u32 height, u32 reserved; then a ring
+// of the dirty rectangle (x, y, w, h as u32) of the last kRing paints, indexed by paint number
+// (sequence / 2) % kRing; then the BGRA frame. The sequence grows by 2 per paint, so a reader that
+// last saw sequence S and now sees T knows (T - S) / 2 paints happened and which rectangles to copy.
 const size_t kMaxWidth = 4096, kMaxHeight = 2304;
-const size_t kHeader = 16;
+const size_t kRing = 16;
+const size_t kHeader = 16 + kRing * 16;
 volatile uint32_t* g_frame_header = nullptr;
+volatile uint32_t* g_frame_ring = nullptr;
 uint8_t* g_frame_data = nullptr;
 
 // Two pipes, one per direction: a synchronous pipe handle with a pending read blocks writes on the
@@ -116,13 +124,37 @@ class Client : public CefClient, public CefRenderHandler, public CefRequestHandl
 
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override { rect = CefRect(0, 0, g_width, g_height); }
 
-  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&, const void* buffer, int width, int height) override {
+  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList& dirty, const void* buffer, int width, int height) override {
     if (type != PET_VIEW || !g_frame_header || width <= 0 || height <= 0 || (size_t)width > kMaxWidth || (size_t)height > kMaxHeight) return;
+    // The union of this paint's dirty rectangles (the whole frame when the size changed).
+    bool full = g_frame_header[1] != (uint32_t)width || g_frame_header[2] != (uint32_t)height || dirty.empty();
+    int x0 = 0, y0 = 0, x1 = width, y1 = height;
+    if (!full) {
+      x0 = width;
+      y0 = height;
+      x1 = 0;
+      y1 = 0;
+      for (const CefRect& r : dirty) {
+        x0 = std::min(x0, std::max(r.x, 0));
+        y0 = std::min(y0, std::max(r.y, 0));
+        x1 = std::max(x1, std::min(r.x + r.width, width));
+        y1 = std::max(y1, std::min(r.y + r.height, height));
+      }
+      if (x1 <= x0 || y1 <= y0) return;
+    }
     // Seqlock: odd while writing, so the game never uses a half-written frame.
     uint32_t sequence = g_frame_header[0];
     g_frame_header[0] = sequence + 1;
     MemoryBarrier();
-    memcpy(g_frame_data, buffer, (size_t)width * height * 4);
+    const uint8_t* source = (const uint8_t*)buffer;
+    for (int row = y0; row < y1; row++) {
+      memcpy(g_frame_data + ((size_t)row * width + x0) * 4, source + ((size_t)row * width + x0) * 4, (size_t)(x1 - x0) * 4);
+    }
+    volatile uint32_t* slot = g_frame_ring + (((sequence / 2) + 1) % kRing) * 4;
+    slot[0] = x0;
+    slot[1] = y0;
+    slot[2] = x1 - x0;
+    slot[3] = y1 - y0;
     g_frame_header[1] = width;
     g_frame_header[2] = height;
     MemoryBarrier();
@@ -246,6 +278,15 @@ void Handle(uint8_t type, const std::string& p) {
       });
       break;
     }
+    case kDevTools: {
+      OnUi([]() {
+        if (!g_browser) return;
+        CefWindowInfo window;
+        window.SetAsPopup(nullptr, "IVMP DevTools");
+        g_browser->GetHost()->ShowDevTools(window, nullptr, CefBrowserSettings(), CefPoint());
+      });
+      break;
+    }
     case kEmit: {
       // name\0json
       size_t zero = p.find('\0');
@@ -316,6 +357,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   if (!view) return 5;
   memset(view, 0, kHeader);
   g_frame_header = (volatile uint32_t*)view;
+  g_frame_ring = (volatile uint32_t*)(view + 16);
   g_frame_data = view + kHeader;
 
   g_pipe = CreateNamedPipeW(Widen("\\\\.\\pipe\\" + pipe_name + "_out").c_str(), PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 1 << 16, 1 << 16, 0, nullptr);
@@ -353,7 +395,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     return 8;
   }
   Log("web: CEF %s started (own process)", CEF_VERSION);
-  SendToGame(kReady, "");
+  SendToGame(kReady, std::string((const char*)&kProtocol, 4));
 
   // Exit when the game goes away (pipe closes or the process ends).
   HANDLE game = game_pid ? OpenProcess(SYNCHRONIZE, FALSE, game_pid) : nullptr;
