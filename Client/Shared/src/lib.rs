@@ -34,6 +34,13 @@ pub struct LaunchConfig {
     /// GTAIV.exe to start for the second client (FiveM's `PathCL2`), e.g. a second copy of the
     /// game folder. Empty: use the exe of the copy that is already running.
     pub game_path: String,
+    /// `windowed`, `borderless` (windowed, no frame, over the whole screen) or `fullscreen`.
+    pub window_mode: String,
+    /// The game's resolution (`-width`, `-height`).
+    pub width: u32,
+    pub height: u32,
+    /// The game folder, learned from the running game; the launcher writes its `commandline.txt`.
+    pub game_dir: String,
 }
 
 impl Default for LaunchConfig {
@@ -44,6 +51,10 @@ impl Default for LaunchConfig {
             direct_online: true,
             network_test: false,
             game_path: String::new(),
+            window_mode: "windowed".into(),
+            width: 1280,
+            height: 720,
+            game_dir: String::new(),
         }
     }
 }
@@ -69,6 +80,26 @@ impl LaunchConfig {
             config.nickname.push('2');
         }
         config
+    }
+
+    /// Writes the window options into the game's `commandline.txt` (the game reads it at start),
+    /// keeping its other lines.
+    pub fn write_commandline(&self, game_dir: &Path) -> std::io::Result<()> {
+        let path = game_dir.join("commandline.txt");
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let ours = ["-windowed", "-fullscreen", "-width", "-height", "-borderless"];
+        let mut lines: Vec<String> = old
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !ours.iter().any(|o| l.starts_with(o)))
+            .map(String::from)
+            .collect();
+        if self.window_mode != "fullscreen" {
+            lines.push("-windowed".into());
+        }
+        lines.push(format!("-width {}", self.width));
+        lines.push(format!("-height {}", self.height));
+        std::fs::write(path, lines.join("\r\n") + "\r\n")
     }
 
     pub fn save(&self, dir: &Path, second_client: bool) -> std::io::Result<()> {

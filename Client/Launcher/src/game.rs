@@ -178,6 +178,29 @@ fn wait_for_window(pid: u32, timeout: Duration) -> inject::Result<bool> {
     }
 }
 
+/// The folder of the running game, to write its `commandline.txt` into.
+pub fn game_dir() -> Option<PathBuf> {
+    find_game().and_then(crate::process::image_path).and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+}
+
+/// The resolutions the main display offers, biggest first, as `(width, height)`.
+pub fn resolutions() -> Vec<(u32, u32)> {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, EnumDisplaySettingsW, ENUM_CURRENT_SETTINGS};
+    let mut found = Vec::new();
+    let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+    let mut index = 0;
+    while unsafe { EnumDisplaySettingsW(None, windows::Win32::Graphics::Gdi::ENUM_DISPLAY_SETTINGS_MODE(index), &mut mode) }.as_bool() {
+        let size = (mode.dmPelsWidth, mode.dmPelsHeight);
+        if size.0 >= 800 && size.1 >= 600 && !found.contains(&size) {
+            found.push(size);
+        }
+        index += 1;
+    }
+    let _ = ENUM_CURRENT_SETTINGS;
+    found.sort_by(|a, b| b.cmp(a));
+    found
+}
+
 fn find_game() -> Option<u32> {
     crate::process::find_process(GAME_EXE)
 }

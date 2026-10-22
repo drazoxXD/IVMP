@@ -330,6 +330,7 @@ pub fn install() {
         ivmp_networking::net::on_game_settings(use_game_lobby);
     }
     install_spawn_hook();
+    install_menu_guard();
 }
 
 // Without the startup script nothing creates the player ped, and the first world update
@@ -517,6 +518,13 @@ fn catch_up_missed_network_load() {
     SESSION_LOADING.store(true, Ordering::SeqCst);
     log!("boot: the network session loaded before our hook was in (intros skipped?), finishing the load now");
     after_network_load();
+    // The load ran its startup scripts before `gamemode -1` could bring `network_startup` back
+    // ([`use_game_lobby`] was too late), so the host starts the lobby script by hand.
+    use ivmp_networking::net;
+    if net::lobby_mode() && net::our_id().is_some() && net::our_id() == net::host_id() {
+        log!("boot: gamemode -1: the session loaded without the lobby script, starting it now");
+        ivmp_networking::lobby::start_network_startup();
+    }
 }
 
 fn after_network_load() {
@@ -631,7 +639,69 @@ fn network_test_tick() {
     log!("net test: requested network game mode");
 }
 
+
+// The M menu of the lobby (the MP frontend, `CViewportFrontend3DScene`): its close routine
+// (0x5BD8B0) runs on a null UI object when the setup (0x5B9AA0) never finished, which crashes the
+// game thread. Guard it, and log the setup's state once a second while the menu is up.
+static MENU_CLOSE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+const MENU_CLOSE: usize = 0x005B_D8B0;
+const MENU_UI_OBJECT: usize = 0x018B_6EAC;
+
+extern "C" fn menu_close() {
+    unsafe {
+        if *(memory::from_ghidra(MENU_UI_OBJECT) as *const usize) == 0 {
+            log!("menu: close skipped, its UI object was never created");
+            return;
+        }
+        let original: extern "C" fn() = std::mem::transmute(MENU_CLOSE_ORIGINAL.load(Ordering::SeqCst));
+        original();
+    }
+}
+
+fn install_menu_guard() {
+    match unsafe { ivmp_core::hook::install(memory::from_ghidra(MENU_CLOSE), menu_close as usize) } {
+        Ok(hook) => {
+            MENU_CLOSE_ORIGINAL.store(hook.trampoline, Ordering::SeqCst);
+            log!("menu: close guard installed");
+        }
+        Err(e) => log!("menu: close guard failed: {e}"),
+    }
+}
+
+fn menu_diag() {
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    unsafe {
+        let byte = |a: usize| *(memory::from_ghidra(a) as *const u8);
+        let (active, open) = (byte(0x0116_0C39), byte(0x0116_09F6));
+        if active == 0 && open == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as usize);
+        if LAST.swap(now, Ordering::Relaxed) == now {
+            return;
+        }
+        let flags = *(memory::from_ghidra(0x018B_6EA4) as *const u32);
+        let object = *(memory::from_ghidra(MENU_UI_OBJECT) as *const usize);
+        log!(
+            "menu: active {active} open {open} resources {} {} flags {flags:#x} ui object {object:#x}",
+            byte(0x019D_3022) & 1,
+            byte(0x019D_302E) & 1
+        );
+        // The two assets it waits for are model infos 30 and 31 (descriptor +0x18/+0x1c): their
+        // stream slot and status (is_loaded = FUN_008D8400(slot, pool), status & 3 == 1).
+        let table = *(memory::from_ghidra(0x016D_D640) as *const usize);
+        let pool = *(memory::from_ghidra(0x0104_96E8) as *const i32);
+        let is_loaded: extern "C" fn(i32, i32) -> u8 = std::mem::transmute(memory::from_ghidra(0x008D_8400));
+        for model in [30usize, 31] {
+            let slot = *((table + model * 0x58 + 0x48) as *const i32);
+            let loaded = if slot == -1 { 0 } else { is_loaded(slot, pool) };
+            log!("menu: model info {model}: stream slot {slot:#x}, loaded {loaded}");
+        }
+    }
+}
+
 extern "C" fn game_process() {
+    menu_diag();
     crate::hang::heartbeat();
     crate::focus::hook_input();
     ensure_player();

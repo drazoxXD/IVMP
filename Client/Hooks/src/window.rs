@@ -83,6 +83,39 @@ fn set_window_title(window: HWND, title: &str) {
 }
 
 /// Starts the thread that brands the game window.
+/// Borderless windowed: no frame, covering the monitor the window is on. The game keeps its own
+/// resolution, which the window then scales. Cheap enough to check every couple of seconds.
+fn make_borderless(window: HWND) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongPtrW, GetWindowRect, SWP_FRAMECHANGED, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_POPUP, WS_VISIBLE,
+    };
+    unsafe {
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return;
+        }
+        let screen = info.rcMonitor;
+        let mut rect = Default::default();
+        let _ = GetWindowRect(window, &mut rect);
+        let style = (WS_POPUP | WS_VISIBLE).0 as _;
+        if GetWindowLongPtrW(window, GWL_STYLE) == style && rect == screen {
+            return;
+        }
+        SetWindowLongPtrW(window, GWL_STYLE, style);
+        let _ = SetWindowPos(
+            window,
+            None,
+            screen.left,
+            screen.top,
+            screen.right - screen.left,
+            screen.bottom - screen.top,
+            SWP_FRAMECHANGED | SWP_NOZORDER,
+        );
+        log!("window: borderless, {}x{} at {},{}", screen.right - screen.left, screen.bottom - screen.top, screen.left, screen.top);
+    }
+}
+
 pub fn install() {
     std::thread::spawn(|| {
         let title = title();
@@ -105,6 +138,9 @@ pub fn install() {
                                 SendMessageW(w, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(icon.0 as isize)));
                             }
                         }
+                    }
+                    if crate::config().window_mode == "borderless" {
+                        make_borderless(w);
                     }
                     if window_title(w) != title {
                         set_window_title(w, &title);
