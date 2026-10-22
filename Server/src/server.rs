@@ -185,6 +185,7 @@ impl Server {
                 }
             }
             (ClientMessage::KeepAlive, Some(_)) => {}
+            (ClientMessage::Ping { stamp }, Some(_)) => self.send(from, &ServerMessage::Pong { stamp }),
             (ClientMessage::Bye, Some(id)) => self.remove(id, "left"),
             // Anything but hello from an unknown address is ignored.
             (_, None) => {}

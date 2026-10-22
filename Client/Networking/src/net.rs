@@ -201,9 +201,10 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
     let mut last_sent = Instant::now() - Duration::from_secs(60);
     let mut buf = [0u8; 2048];
     loop {
-        let interval = if our_id().is_some() { Duration::from_secs(KEEPALIVE_SECS) } else { Duration::from_secs(1) };
+        let interval = if our_id().is_some() { Duration::from_secs(KEEPALIVE_SECS.min(2)) } else { Duration::from_secs(1) };
         if last_sent.elapsed() >= interval {
-            let message = if our_id().is_some() { ClientMessage::KeepAlive.encode() } else { hello.clone() };
+            // While connected the ping doubles as the keep-alive.
+            let message = if our_id().is_some() { ClientMessage::Ping { stamp: clock_ms() }.encode() } else { hello.clone() };
             let _ = connection.socket.send(&message);
             last_sent = Instant::now();
         }
@@ -255,6 +256,7 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 SESSION_READY.store(false, Ordering::SeqCst);
                 SESSION_RESTART.store(true, Ordering::SeqCst);
             }
+            Ok(ServerMessage::Pong { stamp }) => PING_MS.store(clock_ms().wrapping_sub(stamp).max(1), Ordering::Relaxed),
             Ok(ServerMessage::SessionReady { host }) => {
                 log!("net: the host {}'s new session is ready", virtual_ip(host));
                 SESSION_READY.store(true, Ordering::SeqCst);
@@ -276,6 +278,19 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             Err(e) => log!("net: bad packet from server: {e:?}"),
         }
     }
+}
+
+/// Milliseconds since the first call (wraps after 49 days), the stamp of a ping.
+fn clock_ms() -> u32 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u32
+}
+
+/// Round trip to the server in milliseconds, 0 until the first answer.
+static PING_MS: AtomicU32 = AtomicU32::new(0);
+
+pub fn ping_ms() -> u32 {
+    PING_MS.load(Ordering::Relaxed)
 }
 
 /// Sends a message to the server (any thread). Dropped when not connected yet.

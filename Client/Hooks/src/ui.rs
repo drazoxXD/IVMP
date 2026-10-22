@@ -37,8 +37,6 @@ static SHOW_PERF: AtomicBool = AtomicBool::new(false);
 
 /// Microseconds the game's own update took last frame (set by `game_process` in boot.rs).
 pub static GAME_TICK_US: AtomicU32 = AtomicU32::new(0);
-/// Round trip to the server in milliseconds (0 = unknown); set by the networking.
-pub static PING_MS: AtomicU32 = AtomicU32::new(0);
 
 enum Event {
     Char(char),
@@ -500,7 +498,7 @@ fn draw_overlay(ui: &imgui::Ui, stats: &Stats) {
                 ui.text(format!("FPS: {:.0}", stats.fps));
             }
             if ping {
-                match PING_MS.load(Ordering::Relaxed) {
+                match ivmp_networking::net::ping_ms() {
                     0 => ui.text("Ping: -"),
                     ms => ui.text(format!("Ping: {ms} ms")),
                 }

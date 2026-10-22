@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -39,6 +39,8 @@ pub enum ClientMessage {
     /// A game packet from the local engine (`from_port` = its socket port) to a virtual address.
     Tunnel { from_port: u16, to: Ipv4Addr, to_port: u16, payload: Vec<u8> },
     KeepAlive,
+    /// Round trip measurement; the server answers with [`ServerMessage::Pong`] and the same stamp.
+    Ping { stamp: u32 },
     Bye,
     /// Answer to [`ServerMessage::Spawn`]: the network object id of the created entity, or 0 if
     /// it couldn't be created.
@@ -90,6 +92,8 @@ pub enum ServerMessage {
     SessionRestart { host: ClientId },
     /// The session host's new session is in its lobby: join it now.
     SessionReady { host: ClientId },
+    /// Answer to [`ClientMessage::Ping`].
+    Pong { stamp: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +108,7 @@ pub enum DecodeError {
 const C_HELLO: u8 = 0x01;
 const C_TUNNEL: u8 = 0x02;
 const C_KEEPALIVE: u8 = 0x03;
+const C_PING: u8 = 0x0A;
 const C_BYE: u8 = 0x04;
 const C_SPAWNED: u8 = 0x05;
 const C_SESSION_RESTART: u8 = 0x06;
@@ -120,6 +125,7 @@ const S_DESPAWN: u8 = 0x89;
 const S_GAME_SETTINGS: u8 = 0x8A;
 const S_SESSION_RESTART: u8 = 0x8B;
 const S_SESSION_READY: u8 = 0x8C;
+const S_PONG: u8 = 0x8D;
 
 fn kind_byte(kind: SpawnKind) -> u8 {
     match kind {
@@ -231,6 +237,7 @@ impl ClientMessage {
                 Writer::new(C_TUNNEL).u16(*from_port).ip(*to).u16(*to_port).rest(payload)
             }
             ClientMessage::KeepAlive => Writer::new(C_KEEPALIVE).done(),
+            ClientMessage::Ping { stamp } => Writer::new(C_PING).u32(*stamp).done(),
             ClientMessage::Bye => Writer::new(C_BYE).done(),
             ClientMessage::Spawned { request, object_id } => {
                 Writer::new(C_SPAWNED).u32(*request).u16(*object_id).done()
@@ -246,6 +253,7 @@ impl ClientMessage {
             C_HELLO => ClientMessage::Hello { version: r.u16()?, nickname: r.str()? },
             C_TUNNEL => ClientMessage::Tunnel { from_port: r.u16()?, to: r.ip()?, to_port: r.u16()?, payload: r.rest() },
             C_KEEPALIVE => ClientMessage::KeepAlive,
+            C_PING => ClientMessage::Ping { stamp: r.u32()? },
             C_BYE => ClientMessage::Bye,
             C_SPAWNED => ClientMessage::Spawned { request: r.u32()?, object_id: r.u16()? },
             C_SESSION_RESTART => ClientMessage::SessionRestart,
@@ -290,6 +298,7 @@ impl ServerMessage {
             }
             ServerMessage::SessionRestart { host } => Writer::new(S_SESSION_RESTART).u8(*host).done(),
             ServerMessage::SessionReady { host } => Writer::new(S_SESSION_READY).u8(*host).done(),
+            ServerMessage::Pong { stamp } => Writer::new(S_PONG).u32(*stamp).done(),
         }
     }
 
@@ -318,6 +327,7 @@ impl ServerMessage {
             S_TUNNEL => ServerMessage::Tunnel { from: r.ip()?, from_port: r.u16()?, to_port: r.u16()?, payload: r.rest() },
             S_SESSION_RESTART => ServerMessage::SessionRestart { host: r.u8()? },
             S_SESSION_READY => ServerMessage::SessionReady { host: r.u8()? },
+            S_PONG => ServerMessage::Pong { stamp: r.u32()? },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -334,6 +344,7 @@ mod tests {
             ClientMessage::Tunnel { from_port: 6672, to: virtual_ip(2), to_port: 6672, payload: vec![1, 2, 3] },
             ClientMessage::Tunnel { from_port: 1, to: BROADCAST, to_port: 2, payload: vec![] },
             ClientMessage::KeepAlive,
+            ClientMessage::Ping { stamp: 123456 },
             ClientMessage::Bye,
             ClientMessage::Spawned { request: 7, object_id: 500 },
             ClientMessage::SessionRestart,
@@ -363,6 +374,7 @@ mod tests {
             ServerMessage::GameSettings { mode: -2, slots: 32 },
             ServerMessage::SessionRestart { host: 1 },
             ServerMessage::SessionReady { host: 1 },
+            ServerMessage::Pong { stamp: 99 },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));
