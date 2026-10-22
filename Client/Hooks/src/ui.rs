@@ -481,6 +481,8 @@ struct Ui {
     history_position: Option<usize>,
     filter: String,
     auto_scroll: bool,
+    /// The log view is pinned to the bottom (it was there, and no new line moved it).
+    stick_to_bottom: bool,
     channels: BTreeSet<String>,
     focus_input: bool,
     scroll_to_end: bool,
@@ -519,6 +521,7 @@ impl Ui {
             history_position: None,
             filter: String::new(),
             auto_scroll: true,
+            stick_to_bottom: true,
             channels: BTreeSet::new(),
             focus_input: true,
             scroll_to_end: true,
@@ -691,6 +694,7 @@ impl Ui {
         let position = &mut self.history_position;
         let mut filter = std::mem::take(&mut self.filter);
         let mut auto_scroll = self.auto_scroll;
+        let mut stick = self.stick_to_bottom;
         let mut clear_log = false;
         let mut open_log = false;
 
@@ -751,7 +755,14 @@ impl Ui {
                             let _style = ui.push_style_color(StyleColor::Text, line.color);
                             ui.text_wrapped(message);
                         }
-                        if scroll && auto_scroll {
+                        // Stick to the bottom: wrapped lines change the content height after the
+                        // frame they are added in, so keep pinning while the view was at the
+                        // bottom; scrolling up lets go, scrolling back down sticks again.
+                        let at_bottom = ui.scroll_y() >= ui.scroll_max_y() - 4.0;
+                        if !scroll {
+                            stick = at_bottom;
+                        }
+                        if auto_scroll && (scroll || stick) {
                             ui.set_scroll_here_y_with_ratio(1.0);
                         }
                         if let Some(_popup) = ui.begin_popup_context_window() {
@@ -803,6 +814,7 @@ impl Ui {
         self.input = input;
         self.filter = filter;
         self.auto_scroll = auto_scroll;
+        self.stick_to_bottom = stick;
         if open_log {
             let name = if crate::instance::second_client() { "IVMP_Client_cl2.log" } else { "IVMP_Client.log" };
             let _ = std::process::Command::new("notepad").arg(crate::dll_dir().join(name)).spawn();
