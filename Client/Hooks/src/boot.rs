@@ -331,9 +331,6 @@ pub fn install() {
     }
     install_spawn_hook();
     install_menu_guard();
-    if crate::config().dlc >= 2 {
-        crate::dlc::install();
-    }
 }
 
 // Without the startup script nothing creates the player ped, and the first world update
@@ -665,9 +662,6 @@ fn raised(capacity: u32) -> u32 {
 }
 
 pub fn raise_model_pools() {
-    if crate::config().dlc < 2 {
-        return;
-    }
     let mut raised_count = 0;
     for (index, original) in MODEL_POOL_CAPACITIES.iter().enumerate() {
         let address = MODEL_POOL_TABLE + 12 * (index + 1);

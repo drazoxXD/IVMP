@@ -57,6 +57,8 @@ pub struct Server {
     /// What clients host and join (server.cfg `gamemode`, `slots`).
     gamemode: i32,
     slots: u8,
+    /// Which content the clients load (server.cfg `dlc`).
+    dlc: u8,
 }
 
 /// How many unacknowledged messages a client may have outstanding while files are sent to it.
@@ -125,6 +127,7 @@ impl Server {
             console: console::start(),
             host: config.host.then(HostSession::default),
             gamemode: config.gamemode,
+            dlc: config.dlc,
             slots: config.slots,
         })
     }
@@ -540,7 +543,7 @@ impl Server {
         if existing.is_none() {
             let (first, count) = ids::block(id);
             self.reliable(id, &ServerMessage::ObjectIds { first, count });
-            self.reliable(id, &ServerMessage::GameSettings { mode: self.gamemode, slots: self.slots });
+            self.reliable(id, &ServerMessage::GameSettings { mode: self.gamemode, slots: self.slots, dlc: self.dlc });
         }
     }
 

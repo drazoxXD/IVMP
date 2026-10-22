@@ -7,7 +7,12 @@
 //! streaming tables and would overwrite its map. So the lines the game reads from them are filtered:
 //! what stays is what the base world can use, the vehicles, peds and weapons and their data.
 //!
-//! Two hooks do it: the game's `fopen` (which file a handle is) and its line reader (called again
+//! Which episodes are read is up to the server (`dlc` in server.cfg, sent with the game settings):
+//! the game keeps one record per `<content>` block of an episode's `setup2.xml`, with an `enabled`
+//! byte, and the record is hooked as it is added: the client sets that byte from the server's `dlc`
+//! (1 = GTA IV only, 2 and 3 = with the episodes). No game file is edited.
+//!
+//! Two hooks filter: the game's `fopen` (which file a handle is) and its line reader (called again
 //! for the next line while the current one is dropped).
 
 use std::collections::HashMap;
@@ -153,11 +158,8 @@ static HANDLING_FIND_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 /// Moves the handling table into a buffer twice as big, before the game uses it: the game's
 /// entries are copied, and every instruction that holds an address inside the old table is pointed
 /// into the new one (found by decoding the code). Call early (with the model pools), from the first thread after the unpack.
-pub fn relocate_handling() {
+fn relocate_handling() {
     use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-    if crate::config().dlc < 2 {
-        return;
-    }
     let (old_start, old_end) = (memory::from_ghidra(HANDLING_TABLE), memory::from_ghidra(HANDLING_TABLE_END));
     let size = old_end - old_start;
     let new_start = unsafe { VirtualAlloc(None, size * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
@@ -205,6 +207,88 @@ extern "C" fn handling_find_or_add(name: *const c_char) -> i32 {
     index
 }
 
+// ---- Which episodes ---------------------------------------------------------------------------
+
+/// `int add_content(record*)`, thiscall: adds a `<content>` block of a `setup2.xml` to the game's list.
+const CONTENT_ADD: usize = 0x0093_3CD0;
+/// The record is 0x22C bytes; at the end: +0x225 enabled, +0x228 the content's id, +0x229 its
+/// episode (0 for the radio blocks, 1 TLAD, 2 TBoGT).
+const RECORD_SIZE: usize = 0x22C;
+const RECORD_ENABLED: usize = 0x225;
+const RECORD_EPISODE: usize = 0x229;
+
+static CONTENT_ADD_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets an episode's record to enabled or not for `dlc`; the episode (1 or 2), or None for a record
+/// that is not an episode (the radio blocks stay as the game has them).
+fn set_episode_enabled(record: &mut [u8], dlc: u8) -> Option<u8> {
+    if record.len() < RECORD_SIZE || record[RECORD_EPISODE] == 0 {
+        return None;
+    }
+    record[RECORD_ENABLED] = (dlc >= 2) as u8;
+    Some(record[RECORD_EPISODE])
+}
+
+/// The `dlc` to load: the server's, waited for a moment if its settings are not here yet, else the
+/// one in ivmp.json. Decided once.
+fn wanted_dlc() -> u8 {
+    static WANTED: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| {
+        let ours = crate::config().dlc;
+        if !crate::config().network_test {
+            return ours;
+        }
+        let known = ivmp_networking::net::wait_for_settings(std::time::Duration::from_secs(15));
+        match ivmp_networking::net::server_dlc() {
+            Some(theirs) if known => {
+                log!("dlc: the server says {theirs} ({})", describe(theirs));
+                theirs
+            }
+            _ => {
+                log!("dlc: no answer from the server, using ours: {ours} ({})", describe(ours));
+                ours
+            }
+        }
+    })
+}
+
+fn describe(dlc: u8) -> &'static str {
+    match dlc {
+        1 => "GTA IV",
+        2 => "EFLC",
+        _ => "GTA IV + EFLC",
+    }
+}
+
+extern "thiscall" fn content_add(this: *mut std::ffi::c_void, record: *mut u8) -> i32 {
+    let original: extern "thiscall" fn(*mut std::ffi::c_void, *mut u8) -> i32 =
+        unsafe { std::mem::transmute(CONTENT_ADD_ORIGINAL.load(Ordering::SeqCst)) };
+    if !record.is_null() {
+        let bytes = unsafe { std::slice::from_raw_parts_mut(record, RECORD_SIZE) };
+        // Only a record of an episode needs the answer; the radio blocks are not asked about.
+        if bytes[RECORD_EPISODE] != 0 {
+            let dlc = wanted_dlc();
+            if let Some(episode) = set_episode_enabled(bytes, dlc) {
+                log!("dlc: episode {episode} {}", if dlc >= 2 { "enabled" } else { "left out" });
+            }
+        }
+    }
+    original(this, record)
+}
+
+/// Everything that has to be in before the game starts reading its data: the model pools, the
+/// handling table and the hooks. Call right after the game code is unpacked. With `dlc` 1 in
+/// ivmp.json this PC does without the episodes altogether.
+pub fn early() {
+    if crate::config().dlc < 2 {
+        log!("dlc: off on this PC (dlc 1 in ivmp.json)");
+        return;
+    }
+    crate::boot::raise_model_pools();
+    relocate_handling();
+    install();
+}
+
 /// Installs the hooks. With `dlctrace.txt` next to the DLL every opened file and every dropped line is logged.
 pub fn install() {
     TRACE.store(crate::dll_dir().join("dlctrace.txt").exists(), Ordering::Relaxed);
@@ -220,16 +304,35 @@ pub fn install() {
             }
         }
     }
+    match unsafe { ivmp_core::hook::install(memory::from_ghidra(CONTENT_ADD), content_add as usize) } {
+        Ok(installed) => CONTENT_ADD_ORIGINAL.store(installed.trampoline, Ordering::SeqCst),
+        Err(e) => log!("dlc: the content hook failed: {e}: the episodes follow their setup2.xml"),
+    }
     match unsafe { ivmp_core::hook::install(memory::from_ghidra(HANDLING_FIND_OR_ADD), handling_find_or_add as usize) } {
         Ok(installed) => HANDLING_FIND_ORIGINAL.store(installed.trampoline, Ordering::SeqCst),
         Err(e) => log!("dlc: the handling hook failed: {e}"),
     }
-    log!("dlc: episode content is filtered to vehicles, peds and weapons");
+    log!("dlc: episode content is filtered to vehicles, peds and weapons, the server decides which episodes");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_decides_which_episodes_are_enabled() {
+        let mut episode = vec![0u8; RECORD_SIZE];
+        episode[RECORD_EPISODE] = 1;
+        assert_eq!(set_episode_enabled(&mut episode, 3), Some(1));
+        assert_eq!(episode[RECORD_ENABLED], 1);
+        assert_eq!(set_episode_enabled(&mut episode, 1), Some(1));
+        assert_eq!(episode[RECORD_ENABLED], 0, "dlc 1: only GTA IV");
+        let mut radio = vec![0u8; RECORD_SIZE];
+        radio[RECORD_ENABLED] = 1;
+        assert_eq!(set_episode_enabled(&mut radio, 1), None);
+        assert_eq!(radio[RECORD_ENABLED], 1, "the radio blocks are left as the game has them");
+        assert_eq!(set_episode_enabled(&mut [0u8; 8], 3), None);
+    }
 
     #[test]
     fn episode_files_are_told_from_the_base_games() {

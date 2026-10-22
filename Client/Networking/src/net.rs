@@ -59,6 +59,8 @@ static HOST_ID: AtomicU8 = AtomicU8::new(0);
 /// The session's game mode and slots from the server (server.cfg); Free Mode, 32 until told.
 static GAME_MODE: AtomicI32 = AtomicI32::new(FREE_MODE);
 static SLOTS: AtomicU8 = AtomicU8::new(32);
+/// The server's `dlc` (1 GTA IV, 2 EFLC, 3 both); 0 until its settings arrived.
+static SERVER_DLC: AtomicU8 = AtomicU8::new(0);
 /// The game's stored network game config (30 dwords: +0 mode, +8 slots), found by the boot code.
 static NETWORK_CONFIG: AtomicUsize = AtomicUsize::new(0);
 const FREE_MODE: i32 = 16;
@@ -120,6 +122,23 @@ pub fn tell_session_ready() {
 /// The server wants the game's own lobby (`gamemode = -1`).
 pub fn lobby_mode() -> bool {
     GAME_MODE.load(Ordering::SeqCst) == LOBBY_MODE
+}
+
+/// The server's `dlc` once its settings arrived: which content to load (1 = GTA IV, 2 = EFLC, 3 = both).
+pub fn server_dlc() -> Option<u8> {
+    Some(SERVER_DLC.load(Ordering::SeqCst)).filter(|dlc| *dlc != 0)
+}
+
+/// Waits until the server's settings arrived, at most `timeout`; whether they did.
+pub fn wait_for_settings(timeout: Duration) -> bool {
+    let started = Instant::now();
+    while server_dlc().is_none() {
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 /// The network game mode and slots to host and join with. IVMP's own modes (negative, e.g. -2
@@ -369,7 +388,10 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 OBJECT_IDS.store((first as u32) << 16 | count as u32, Ordering::SeqCst);
             }
-            ServerMessage::GameSettings { mode, slots } => {
+            ServerMessage::GameSettings { mode, slots, dlc } => {
+                if SERVER_DLC.swap(dlc, Ordering::SeqCst) != dlc {
+                    log!("net: server dlc {dlc}");
+                }
                 let mode_changed = GAME_MODE.swap(mode, Ordering::SeqCst) != mode;
                 if mode_changed || SLOTS.swap(slots, Ordering::SeqCst) != slots {
                     log!("net: server game mode {mode}, {slots} slots (playing mode {})", game_settings().0);
