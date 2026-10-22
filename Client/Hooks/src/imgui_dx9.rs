@@ -196,6 +196,8 @@ impl Renderer {
         }
     }
 
+    /// Everything imgui needs on the device: shaders off, alpha blending, scissor, the pixel
+    /// projection, and the vertex / index streams.
     unsafe fn set_state(
         &self,
         device: &IDirect3DDevice9,
@@ -205,13 +207,21 @@ impl Renderer {
         height: f32,
     ) {
         unsafe {
+            set_common_state(device, width, height);
+            let _ = device.SetStreamSource(0, vertices, 0, size_of::<Vertex>() as u32);
+            let _ = device.SetIndices(indices);
+        }
+    }
+}
+
+/// Render state for drawing 2D UI in pixel coordinates.
+unsafe fn set_common_state(device: &IDirect3DDevice9, width: f32, height: f32) {
+    unsafe {
             let viewport = D3DVIEWPORT9 { X: 0, Y: 0, Width: width as u32, Height: height as u32, MinZ: 0.0, MaxZ: 1.0 };
             let _ = device.SetViewport(&viewport);
             let _ = device.SetPixelShader(None::<&IDirect3DPixelShader9>);
             let _ = device.SetVertexShader(None::<&IDirect3DVertexShader9>);
             let _ = device.SetFVF(FVF);
-            let _ = device.SetStreamSource(0, vertices, 0, size_of::<Vertex>() as u32);
-            let _ = device.SetIndices(indices);
             for (state, value) in [
                 (D3DRS_FILLMODE, D3DFILL_SOLID.0 as u32),
                 (D3DRS_SHADEMODE, D3DSHADE_GOURAUD.0 as u32),
@@ -274,7 +284,31 @@ impl Renderer {
             let _ = device.SetTransform(D3DTRANSFORMSTATETYPE(256), identity.as_ptr().cast());
             let _ = device.SetTransform(D3DTS_VIEW, identity.as_ptr().cast());
             let _ = device.SetTransform(D3DTS_PROJECTION, projection.as_ptr().cast());
-        }
+    }
+}
+
+/// Draws `texture` (BGRA, premultiplied alpha, `width` x `height`) over the whole screen.
+pub fn draw_texture(device: &IDirect3DDevice9, texture: &IDirect3DTexture9, width: f32, height: f32) {
+    let block = unsafe { device.CreateStateBlock(D3DSBT_ALL) }.ok();
+    unsafe {
+        set_common_state(device, width, height);
+        // Premultiplied alpha: the page's colors are already multiplied by its alpha.
+        let _ = device.SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE.0 as u32);
+        let _ = device.SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, 0);
+        let _ = device.SetRenderState(D3DRS_SCISSORTESTENABLE, 0);
+        let white = 0xFFFF_FFFFu32;
+        let corners = [
+            Vertex { pos: [0.0, 0.0, 0.0], color: white, uv: [0.0, 0.0] },
+            Vertex { pos: [width, 0.0, 0.0], color: white, uv: [1.0, 0.0] },
+            Vertex { pos: [0.0, height, 0.0], color: white, uv: [0.0, 1.0] },
+            Vertex { pos: [width, height, 0.0], color: white, uv: [1.0, 1.0] },
+        ];
+        let base: Option<IDirect3DBaseTexture9> = texture.cast().ok();
+        let _ = device.SetTexture(0, base.as_ref());
+        let _ = device.DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, corners.as_ptr().cast(), size_of::<Vertex>() as u32);
+    }
+    if let Some(block) = block {
+        let _ = unsafe { block.Apply() };
     }
 }
 

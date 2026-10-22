@@ -22,21 +22,31 @@ static CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
 /// Last display size, for centring the raw cursor.
 static DISPLAY_SIZE: (AtomicU32, AtomicU32) = (AtomicU32::new(0), AtomicU32::new(0));
 
+/// The game gets no keyboard or mouse input: the console or the web page is up.
 pub fn capturing() -> bool {
+    CONSOLE_OPEN.load(Ordering::Relaxed) || crate::web::visible()
+}
+
+fn console_open() -> bool {
     CONSOLE_OPEN.load(Ordering::Relaxed)
+}
+
+/// The raw cursor starts at the middle of the screen.
+pub fn reset_raw_cursor() {
+    RAW_SEEN.store(false, Ordering::Relaxed);
+    *RAW_POSITION.lock().unwrap() = [DISPLAY_SIZE.0.load(Ordering::Relaxed) as f32 / 2.0, DISPLAY_SIZE.1.load(Ordering::Relaxed) as f32 / 2.0];
 }
 
 /// The console shuts when the game can't show it (loading screens).
 pub fn close_console() {
     CONSOLE_OPEN.store(false, Ordering::Relaxed);
+    crate::web::close();
 }
 
 pub fn toggle_console() {
     let open = !CONSOLE_OPEN.load(Ordering::Relaxed);
     if open {
-        // The raw cursor starts at the middle of the screen.
-        RAW_SEEN.store(false, Ordering::Relaxed);
-        *RAW_POSITION.lock().unwrap() = [DISPLAY_SIZE.0.load(Ordering::Relaxed) as f32 / 2.0, DISPLAY_SIZE.1.load(Ordering::Relaxed) as f32 / 2.0];
+        reset_raw_cursor();
     }
     CONSOLE_OPEN.store(open, Ordering::Relaxed);
 }
@@ -58,9 +68,19 @@ static RAW_POSITION: Mutex<[f32; 2]> = Mutex::new([0.0, 0.0]);
 pub fn raw_mouse(dx: i32, dy: i32, wheel: i32) {
     RAW_SEEN.store(true, Ordering::Relaxed);
     let mut position = RAW_POSITION.lock().unwrap();
-    position[0] += dx as f32;
-    position[1] += dy as f32;
-    if wheel != 0 {
+    let (width, height) = (DISPLAY_SIZE.0.load(Ordering::Relaxed) as f32, DISPLAY_SIZE.1.load(Ordering::Relaxed) as f32);
+    position[0] = (position[0] + dx as f32).clamp(0.0, (width - 1.0).max(0.0));
+    position[1] = (position[1] + dy as f32).clamp(0.0, (height - 1.0).max(0.0));
+    let at = *position;
+    drop(position);
+    if !console_open() && crate::web::visible() {
+        if dx != 0 || dy != 0 {
+            crate::web::mouse_move(at[0], at[1]);
+        }
+        if wheel != 0 {
+            crate::web::mouse_wheel(wheel);
+        }
+    } else if wheel != 0 {
         push(Event::Wheel(wheel as f32 / 120.0));
     }
 }
@@ -68,6 +88,10 @@ pub fn raw_mouse(dx: i32, dy: i32, wheel: i32) {
 pub fn raw_button(index: usize, down: bool) {
     static STATE: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
     if index < 3 && STATE[index].swap(down, Ordering::Relaxed) != down {
+        if !console_open() && crate::web::visible() {
+            crate::web::mouse_button(index, down);
+            return;
+        }
         let button = [MouseButton::Left, MouseButton::Right, MouseButton::Middle][index];
         push(Event::Button(button, down));
     }
@@ -127,10 +151,20 @@ pub fn window_message(message: u32, wparam: usize, lparam: isize) -> bool {
             }
             return true;
         }
+        WM_KEYDOWN | WM_SYSKEYDOWN if wparam as u16 == VK_F2.0 => {
+            if lparam & (1 << 30) == 0 && crate::hang::game_running() {
+                crate::web::toggle();
+            }
+            return true;
+        }
         _ => {}
     }
     if !capturing() {
         return false;
+    }
+    if !console_open() {
+        // The web page has the keyboard and mouse.
+        return web_message(message, wparam, lparam);
     }
     match message {
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
@@ -296,6 +330,36 @@ fn wip_menu(ui: &imgui::Ui, label: &str, about: &str) {
     ui.menu_item_config(label).enabled(false).build();
     if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
         ui.tooltip_text(format!("WIP: not implemented yet.\n{about}"));
+    }
+}
+
+/// Keyboard and mouse messages while the web page is up: forwarded to it, hidden from the game.
+fn web_message(message: u32, wparam: usize, lparam: isize) -> bool {
+    let modifiers = unsafe {
+        (if GetKeyState(VK_SHIFT.0 as i32) < 0 { 2 } else { 0 })
+            | (if GetKeyState(VK_CONTROL.0 as i32) < 0 { 4 } else { 0 })
+            | (if GetKeyState(VK_MENU.0 as i32) < 0 { 8 } else { 0 })
+    };
+    match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if wparam as u16 == VK_ESCAPE.0 {
+                crate::web::close();
+            } else {
+                crate::web::key(0, wparam as i32, lparam, modifiers);
+            }
+            true
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            crate::web::key(1, wparam as i32, lparam, modifiers);
+            true
+        }
+        WM_CHAR => {
+            crate::web::key(2, wparam as i32, lparam, modifiers);
+            true
+        }
+        // Mouse comes from the raw DirectInput state; the window messages are not used.
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL => true,
+        _ => false,
     }
 }
 
@@ -577,7 +641,8 @@ impl Ui {
             return;
         }
         let size = [viewport.Width as f32, viewport.Height as f32];
-        let open = capturing();
+        let open = console_open();
+        let cursor_wanted = capturing();
         DISPLAY_SIZE.0.store(size[0] as u32, Ordering::Relaxed);
         DISPLAY_SIZE.1.store(size[1] as u32, Ordering::Relaxed);
 
@@ -585,7 +650,7 @@ impl Ui {
         let io = self.context.io_mut();
         io.display_size = size;
         io.delta_time = delta;
-        if open {
+        if cursor_wanted {
             let mut cursor = POINT::default();
             let mut client = RECT::default();
             if RAW_SEEN.load(Ordering::Relaxed) {
@@ -612,7 +677,7 @@ impl Ui {
                 Event::Wheel(wheel) => io.add_mouse_wheel_event([0.0, wheel]),
             }
         }
-        self.context.io_mut().mouse_draw_cursor = open;
+        self.context.io_mut().mouse_draw_cursor = cursor_wanted;
 
         // The panels are built into locals first: `context.frame()` borrows the context.
         let stats = Stats::collect(&self.frame_ms);

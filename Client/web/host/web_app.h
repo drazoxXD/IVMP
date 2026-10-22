@@ -1,0 +1,150 @@
+// Shared by IVMP_Web.dll (the browser process side, inside the game) and IVMP_Web.exe (the helper
+// processes CEF starts: renderer, GPU, ...). Both must register the same scheme and run the
+// renderer side of the bridge, so they use this one App.
+//
+// Lockdown (docs/web-engine-research.md): the page can only load ivmp:// and can only talk to the
+// client through ivmp.send / ivmp.on.
+#pragma once
+
+#include <windows.h>
+
+#include <cstdarg>
+#include <cstdio>
+#include <fstream>
+#include <functional>
+#include <sstream>
+#include <string>
+
+#include "include/cef_app.h"
+#include "include/cef_browser.h"
+#include "include/cef_command_line.h"
+#include "include/cef_parser.h"
+#include "include/cef_request_handler.h"
+#include "include/cef_resource_request_handler.h"
+#include "include/cef_scheme.h"
+#include "include/wrapper/cef_message_router.h"
+#include "include/wrapper/cef_stream_resource_handler.h"
+
+namespace ivmp {
+
+inline const char* kScheme = "ivmp";
+inline const char* kHost = "ui";
+
+// Where the page files are (set by the DLL; the helper never serves pages).
+inline std::string g_ui_dir;
+// The log sink (a callback into the game's log); null in helpers.
+inline void (*g_log)(const char*) = nullptr;
+
+inline void Log(const char* format, ...) {
+  if (!g_log) return;
+  va_list args;
+  va_start(args, format);
+  char line[2048];
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  g_log(line);
+}
+
+inline std::string MimeOf(const std::string& path) {
+  auto ends = [&](const char* e) { return path.size() >= strlen(e) && path.compare(path.size() - strlen(e), strlen(e), e) == 0; };
+  if (ends(".html")) return "text/html";
+  if (ends(".js")) return "text/javascript";
+  if (ends(".css")) return "text/css";
+  if (ends(".png")) return "image/png";
+  if (ends(".svg")) return "image/svg+xml";
+  if (ends(".json")) return "application/json";
+  if (ends(".woff2")) return "font/woff2";
+  return "application/octet-stream";
+}
+
+// ivmp://ui/<path>: files from the ui folder, nothing else.
+class SchemeFactory : public CefSchemeHandlerFactory {
+ public:
+  CefRefPtr<CefResourceHandler> Create(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, const CefString&, CefRefPtr<CefRequest> request) override {
+    CefURLParts parts;
+    CefParseURL(request->GetURL(), parts);
+    std::string host = CefString(&parts.host).ToString();
+    std::string path = CefString(&parts.path).ToString();
+    if (host != kHost || path.find("..") != std::string::npos || path.find('\\') != std::string::npos) {
+      Log("web: scheme refused %s", request->GetURL().ToString().c_str());
+      return nullptr;
+    }
+    if (path.empty() || path == "/") path = "/index.html";
+    std::ifstream file(g_ui_dir + path, std::ios::binary);
+    if (!file) {
+      Log("web: scheme: not found %s", path.c_str());
+      return nullptr;
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string data = buffer.str();
+    return new CefStreamResourceHandler(MimeOf(path), CefStreamReader::CreateForData((void*)data.data(), data.size()));
+  }
+  IMPLEMENT_REFCOUNTING(SchemeFactory);
+};
+
+class WebApp : public CefApp, public CefRenderProcessHandler {
+ public:
+  // Set by the DLL: runs once the browser context exists (UI thread).
+  std::function<void()> on_context_initialized;
+
+  class BrowserSide : public CefBrowserProcessHandler {
+   public:
+    explicit BrowserSide(WebApp* app) : app_(app) {}
+    void OnContextInitialized() override {
+      CefRegisterSchemeHandlerFactory(kScheme, kHost, new SchemeFactory());
+      if (app_->on_context_initialized) app_->on_context_initialized();
+    }
+    IMPLEMENT_REFCOUNTING(BrowserSide);
+
+   private:
+    WebApp* app_;
+  };
+
+  WebApp() : browser_side_(new BrowserSide(this)) {}
+  CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return browser_side_; }
+  CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return this; }
+
+  void OnRegisterCustomSchemes(CefRawPtr<CefSchemeRegistrar> registrar) override {
+    registrar->AddCustomScheme(kScheme, CEF_SCHEME_OPTION_STANDARD | CEF_SCHEME_OPTION_SECURE | CEF_SCHEME_OPTION_CORS_ENABLED | CEF_SCHEME_OPTION_FETCH_ENABLED);
+  }
+
+  // The engine-level wall: no DNS, no proxy, nothing that phones home.
+  void OnBeforeCommandLineProcessing(const CefString&, CefRefPtr<CefCommandLine> line) override {
+    line->AppendSwitchWithValue("host-resolver-rules", "MAP * ~NOTFOUND");
+    line->AppendSwitchWithValue("proxy-server", "direct://");
+    line->AppendSwitch("no-proxy-server");
+    line->AppendSwitch("disable-background-networking");
+    line->AppendSwitch("disable-component-update");
+    line->AppendSwitch("disable-sync");
+    line->AppendSwitch("disable-extensions");
+    line->AppendSwitch("disable-domain-reliability");
+    line->AppendSwitch("disable-client-side-phishing-detection");
+    line->AppendSwitch("disable-default-apps");
+    line->AppendSwitch("no-pings");
+    line->AppendSwitchWithValue("disable-features", "MediaRouter,Translate,WebRtcHideLocalIpsWithMdns");
+  }
+
+  // Renderer side of the bridge: window.cefQuery, wrapped by ui/ivmp.js as ivmp.send.
+  void OnWebKitInitialized() override {
+    CefMessageRouterConfig config;
+    renderer_router_ = CefMessageRouterRendererSide::Create(config);
+  }
+  void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
+    renderer_router_->OnContextCreated(browser, frame, context);
+  }
+  void OnContextReleased(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
+    renderer_router_->OnContextReleased(browser, frame, context);
+  }
+  bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source, CefRefPtr<CefProcessMessage> message) override {
+    return renderer_router_->OnProcessMessageReceived(browser, frame, source, message);
+  }
+
+  IMPLEMENT_REFCOUNTING(WebApp);
+
+ private:
+  CefRefPtr<BrowserSide> browser_side_;
+  CefRefPtr<CefMessageRouterRendererSide> renderer_router_;
+};
+
+}  // namespace ivmp

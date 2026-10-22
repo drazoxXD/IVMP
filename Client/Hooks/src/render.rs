@@ -219,6 +219,7 @@ fn draw(device: *mut c_void, only_back_buffer: bool) {
     if unsafe { d3d.GetCreationParameters(&mut parameters) }.is_ok() {
         subclass(parameters.hFocusWindow);
         events::emit(events::GameEvent::Frame);
+        crate::web::draw(d3d);
         ui::frame(d3d, parameters.hFocusWindow);
     }
 }
