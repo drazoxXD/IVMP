@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use imgui::{Condition, Context, Key, MouseButton, StyleColor, WindowFlags};
+use imgui::{Condition, Context, ItemHoveredFlags, Key, MouseButton, StyleColor, TreeNodeFlags, WindowFlags};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct3D9::*;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -133,6 +133,79 @@ pub fn window_message(message: u32, wparam: usize, lparam: isize) -> bool {
     }
 }
 
+/// FiveM's debug tools that IVMP doesn't have yet: (group, console name, what it does). They show
+/// in the console's tool list as disabled entries with a "WIP" tooltip.
+const WIP_TOOLS: &[(&str, &str, &str)] = &[
+    ("Network", "netgraph", "Real-time graph of ping, packets, bytes and routing"),
+    ("Network", "netEventLog", "Network traffic with direction, name and size"),
+    ("Network", "net_statsFile", "Write network metrics to a CSV file"),
+    ("Network", "netobjviewer", "List the network objects and sync nodes being synchronised"),
+    ("Network", "net_printOwner", "Print the owner of a network object id"),
+    ("Streaming", "strdbg", "What the streamer is loading right now"),
+    ("Streaming", "strlist", "Streamer entries and their status"),
+    ("Streaming", "strmem", "Streaming memory use per asset"),
+    ("Game", "resmon", "CPU and memory use per script/resource"),
+    ("Game", "modelviewer", "Load and view models and textures"),
+    ("Game", "poolInspector", "Inspect the game's entity pools"),
+    ("Game", "inputViewer", "Show the keys and axes the game receives"),
+    ("Game", "handlingEditor", "Edit vehicle handling live"),
+    ("Game", "timecycleEditor", "Edit the time cycle live"),
+    ("Console", "con_miniconChannels", "Show chosen log channels on screen without opening the console"),
+    ("Console", "cmdlist", "List every command and variable"),
+    ("Console", "developer", "Extra developer logging"),
+    ("Console", "nui_devtools", "Dev tools for the web UI (needs the web engine, stage 2)"),
+    ("Scripting", "script_debug", "Script engine debugger: native calls, running scripts (needs the native hook)"),
+];
+
+/// A disabled checkbox whose tooltip says it's not implemented.
+fn wip_item(ui: &imgui::Ui, name: &str, about: &str) {
+    ui.disabled(true, || {
+        let mut off = false;
+        ui.checkbox(name, &mut off);
+    });
+    if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
+        ui.tooltip_text(format!("WIP: not implemented yet.
+{about}"));
+    }
+}
+
+/// A checkbox for a panel flag.
+fn flag_item(ui: &imgui::Ui, label: &str, flag: &AtomicBool, about: &str) {
+    let mut value = flag.load(Ordering::Relaxed);
+    if ui.checkbox(label, &mut value) {
+        flag.store(value, Ordering::Relaxed);
+    }
+    if ui.is_item_hovered() {
+        ui.tooltip_text(about);
+    }
+}
+
+fn tools_panel(ui: &imgui::Ui) {
+    if !ui.collapsing_header("Overlays and debug tools", TreeNodeFlags::empty()) {
+        return;
+    }
+    ui.text_disabled("Working");
+    flag_item(ui, "FPS", &SHOW_FPS, "overlay fps: frames per second");
+    ui.same_line();
+    flag_item(ui, "Ping", &SHOW_PING, "overlay ping: round trip to the server");
+    ui.same_line();
+    flag_item(ui, "Network info", &SHOW_NET, "overlay net: ids, mode, packets");
+    ui.same_line();
+    flag_item(ui, "Client performance", &SHOW_PERF, "overlay perf: frame and game update times");
+    let mut group = "";
+    for (g, name, about) in WIP_TOOLS {
+        if *g != group {
+            group = g;
+            ui.separator();
+            ui.text_disabled(format!("{g} (WIP)"));
+        } else {
+            ui.same_line();
+        }
+        wip_item(ui, name, about);
+    }
+    ui.separator();
+}
+
 struct Line {
     text: String,
     color: [f32; 4],
@@ -237,6 +310,9 @@ impl Ui {
                     ),
                 );
             }
+            _ if WIP_TOOLS.iter().any(|(_, n, _)| n.eq_ignore_ascii_case(&name)) => {
+                self.print(ERROR_COLOR, format!("{name} is WIP: not implemented yet"));
+            }
             _ => self.print(ERROR_COLOR, format!("unknown command '{name}', try help")),
         }
     }
@@ -336,6 +412,7 @@ impl Ui {
                 .flags(WindowFlags::NO_MOVE | WindowFlags::NO_RESIZE | WindowFlags::NO_COLLAPSE)
                 .bg_alpha(0.85)
                 .build(|| {
+                    tools_panel(ui);
                     let footer = ui.frame_height_with_spacing() + 4.0;
                     ui.child_window("log").size([0.0, -footer]).build(|| {
                         for line in lines {

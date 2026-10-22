@@ -114,6 +114,7 @@ fn on_attach() {
             ivmp_networking::crypt::install();
             net::start(&config.server, &config.nickname);
         }
+        boot::hooks_installed();
     });
 }
 

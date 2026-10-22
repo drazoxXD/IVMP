@@ -480,6 +480,39 @@ extern "fastcall" fn start_network_session(loading_screen_up: u32) {
     unsafe {
         let original: extern "fastcall" fn(u32) = std::mem::transmute(ORIGINAL_START_NETWORK.load(Ordering::SeqCst));
         original(loading_screen_up);
+    }
+    after_network_load();
+}
+
+/// Every hook and the server connection are in (end of the DLL's init thread).
+static HOOKS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+pub fn hooks_installed() {
+    HOOKS_INSTALLED.store(true, Ordering::SeqCst);
+}
+
+/// g_GameModeCurrent (0x011D6FC4): 1 once a network session is loaded.
+const GAME_MODE_CURRENT: usize = 0x011D_6FC4;
+
+/// The first network load can start before [`start_network_session`] is hooked: with FusionFix
+/// the intros are skipped and the game boots while we are still scanning, so its load ran
+/// unhooked, the screen stayed on "LOADING..." and the host never hosted (its joiner found no
+/// session). CGame_Process only runs once the boot load has returned (GameThread_Main), so on
+/// the first frames, once our hooks are in, finish what the hook would have done.
+fn catch_up_missed_network_load() {
+    if SESSION_LOADING.load(Ordering::SeqCst) || !HOOKS_INSTALLED.load(Ordering::SeqCst) || !network_boot() {
+        return;
+    }
+    if unsafe { *(memory::from_ghidra(GAME_MODE_CURRENT) as *const i32) } != 1 {
+        return;
+    }
+    SESSION_LOADING.store(true, Ordering::SeqCst);
+    log!("boot: the network session loaded before our hook was in (intros skipped?), finishing the load now");
+    after_network_load();
+}
+
+fn after_network_load() {
+    unsafe {
         set_spawn_point();
         let spawn: extern "C" fn(u32) = std::mem::transmute(memory::from_ghidra(SPAWN_PLAYER_AFTER_LOAD));
         spawn(0);
@@ -594,6 +627,7 @@ extern "C" fn game_process() {
     crate::hang::heartbeat();
     crate::focus::hook_input();
     ensure_player();
+    catch_up_missed_network_load();
     network_test_tick();
     ivmp_networking::session::watch();
     if crate::config().network_test && ivmp_networking::session::network_ready() {
