@@ -23,6 +23,14 @@
     delete frames[resource];
   });
 
+  // SetNuiFocus: the keyboard goes into the resource's frame (a frame can't take it by itself).
+  ivmp.on('ui.focus', ({ resource, focus }) => {
+    const frame = frames[resource];
+    if (!frame) return;
+    if (focus) frame.focus();
+    else if (document.activeElement === frame) frame.blur();
+  });
+
   // SendNUIMessage: the page gets the table as a plain message event.
   ivmp.on('ui.message', ({ resource, data }) => {
     const frame = frames[resource];

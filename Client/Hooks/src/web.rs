@@ -166,8 +166,17 @@ fn resend_uis() {
     }
 }
 
+/// The focus came from a script (SetNuiFocus): Escape then goes to the page, which closes itself
+/// (the chat does); F2 still takes the focus back.
+static SCRIPT_FOCUS: AtomicBool = AtomicBool::new(false);
+
+pub fn script_focus() -> bool {
+    SCRIPT_FOCUS.load(Ordering::Relaxed) && focused()
+}
+
 /// Gives the page the keyboard and mouse, or takes them back (SetNuiFocus, like F2).
 pub fn set_focus(focus: bool) {
+    SCRIPT_FOCUS.store(focus, Ordering::Relaxed);
     if host().is_none() || FOCUSED.swap(focus, Ordering::Relaxed) == focus {
         return;
     }
@@ -430,6 +439,7 @@ pub fn toggle() {
     }
     let focus = !FOCUSED.load(Ordering::Relaxed);
     FOCUSED.store(focus, Ordering::Relaxed);
+    SCRIPT_FOCUS.store(false, Ordering::Relaxed);
     send(TO_FOCUS, &ints(&[focus as i32]));
     if focus {
         crate::ui::reset_raw_cursor();
@@ -446,6 +456,7 @@ fn send_client_info() {
 
 /// Takes the keyboard and mouse back from the page (Escape, loading screens); it stays drawn.
 pub fn close() {
+    SCRIPT_FOCUS.store(false, Ordering::Relaxed);
     if FOCUSED.swap(false, Ordering::Relaxed) {
         send(TO_FOCUS, &ints(&[0]));
     }

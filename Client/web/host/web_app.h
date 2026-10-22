@@ -8,6 +8,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <fstream>
@@ -76,6 +77,18 @@ inline bool ValidResourceName(const std::string& name) {
   return name.find("..") == std::string::npos;
 }
 
+// A resource page gets ivmp://ui/nui.js first thing (callbacks, FiveM's http://<resource>/ posts and
+// GetParentResourceName), right after <head>, or after the doctype when there is no head.
+inline void InjectNui(std::string& html) {
+  const std::string tag = "<script src=\"ivmp://ui/nui.js\"></script>";
+  std::string lower(html.size(), '\0');
+  std::transform(html.begin(), html.end(), lower.begin(), [](unsigned char c) { return (char)tolower(c); });
+  size_t at = lower.find("<head");
+  if (at != std::string::npos) at = lower.find('>', at);
+  if (at == std::string::npos && lower.rfind("<!doctype", 0) == 0) at = lower.find('>');
+  html.insert(at == std::string::npos ? 0 : at + 1, tag);
+}
+
 // ivmp://ui/<path>: files from the ui folder. ivmp://<resource>/<path>: files of that resource from
 // the folder the server's files were downloaded to. Nothing else.
 class SchemeFactory : public CefSchemeHandlerFactory {
@@ -104,6 +117,7 @@ class SchemeFactory : public CefSchemeHandlerFactory {
     std::stringstream buffer;
     buffer << file.rdbuf();
     std::string data = buffer.str();
+    if (host != kHost && MimeOf(path) == "text/html") InjectNui(data);
     return new CefStreamResourceHandler(MimeOf(path), CefStreamReader::CreateForData((void*)data.data(), data.size()));
   }
   IMPLEMENT_REFCOUNTING(SchemeFactory);

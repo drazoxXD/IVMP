@@ -16,8 +16,10 @@ pub struct FileEntry {
 }
 
 /// The files of a resource clients need, or `None` if it has nothing for clients (only server
-/// scripts). `ivmp.lua` is always one of them, so the client can start the resource like the
-/// server does.
+/// scripts). The manifest (`ivmp.lua`, or a FiveM `fxmanifest.lua` / `__resource.lua`) is always
+/// one of them, so the client can start the resource like the server does. An entry of `files`
+/// that doesn't exist is left out (FiveM resources list optional ones, e.g. the chat's config.js);
+/// a missing script or ui_page is an error.
 pub fn offer(dir: &Path, manifest: &Manifest) -> Result<Option<Vec<FileEntry>>, String> {
     let mut wanted: Vec<&str> = Vec::new();
     wanted.extend(manifest.client_scripts.iter().map(String::as_str));
@@ -26,7 +28,7 @@ pub fn offer(dir: &Path, manifest: &Manifest) -> Result<Option<Vec<FileEntry>>, 
     if wanted.is_empty() {
         return Ok(None);
     }
-    let mut paths = vec![manifest::FILE];
+    let mut paths = vec![manifest::find(dir).unwrap_or(manifest::FILE)];
     paths.extend(wanted);
     let mut seen = HashSet::new();
     let mut files = Vec::new();
@@ -37,6 +39,12 @@ pub fn offer(dir: &Path, manifest: &Manifest) -> Result<Option<Vec<FileEntry>>, 
         }
         if !safe_path(path) {
             return Err(format!("'{path}' is not a plain relative path"));
+        }
+        let optional = manifest.files.iter().any(|f| f == path)
+            && !manifest.client_scripts.iter().any(|f| f == path)
+            && manifest.ui_page.as_deref() != Some(path);
+        if optional && !dir.join(path).is_file() {
+            continue;
         }
         let data = std::fs::read(dir.join(path)).map_err(|e| format!("cannot read {path}: {e}"))?;
         if data.len() as u64 > MAX_FILE_BYTES as u64 {
@@ -127,6 +135,18 @@ mod tests {
         assert!(offer(&dir, &escape).is_err());
         let missing = Manifest { client_scripts: vec!["nope.lua".into()], ..Manifest::default() };
         assert!(offer(&dir, &missing).unwrap_err().contains("nope.lua"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_fivem_resource_sends_its_manifest_and_skips_missing_extra_files() {
+        let dir = temp("fivem");
+        std::fs::write(dir.join("__resource.lua"), "client_script 'c.lua'").unwrap();
+        std::fs::write(dir.join("c.lua"), "").unwrap();
+        let manifest = Manifest { client_scripts: vec!["c.lua".into()], files: vec!["config.js".into()], ..Manifest::default() };
+        let files = offer(&dir, &manifest).unwrap().unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["__resource.lua", "c.lua"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

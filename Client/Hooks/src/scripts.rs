@@ -39,7 +39,8 @@ fn with_runtime<R>(f: impl FnOnce(&Scripting) -> R) -> R {
             let runtime = Scripting::client(crate::dll_dir().join("cache"), |line| log!("script: {line}"));
             runtime.set_extra_api(|lua| {
                 crate::luanatives::install(lua)?;
-                crate::luaui::install(lua)
+                crate::luaui::install(lua)?;
+                crate::luacompat::install(lua)
             });
             runtime
         });
@@ -61,8 +62,9 @@ pub fn tick() {
         return;
     }
     with_runtime(|runtime| {
-        // Stops can be refused while a resource that depends on the one stopping still runs;
-        // go through them again until nothing more is stopped.
+        // In order: a restart is a stop and then a start, often in the same frame. A stop can be
+        // refused while a resource that depends on the one stopping still runs; those are tried
+        // again below until nothing more is stopped.
         let mut stops: Vec<String> = Vec::new();
         for change in changes {
             match change {
@@ -76,7 +78,9 @@ pub fn tick() {
                 },
                 Change::Stop(name) => {
                     crate::web::close_ui(&name);
-                    stops.push(name);
+                    if runtime.stop(&name).is_err() && runtime.running().contains(&name) {
+                        stops.push(name);
+                    }
                 }
             }
         }

@@ -362,3 +362,135 @@ fn an_event_can_go_to_one_resource() {
     assert!(out.contains(&"[b] got\tb\t3\t7".to_string()), "{out:?}");
     assert!(!out.iter().any(|l| l.starts_with("[a] got")), "only the named resource gets it");
 }
+
+/// The server half of FiveM's chat resource (its sv_chat.lua, shortened to what IVMP runs), from a
+/// `__resource.lua` manifest.
+const SV_CHAT: &str = r#"
+RegisterServerEvent('chat:init')
+RegisterServerEvent('_chat:messageEntered')
+RegisterServerEvent('__cfx_internal:commandFallback')
+
+AddEventHandler('_chat:messageEntered', function(author, color, message)
+    if not message or not author then return end
+    TriggerEvent('chatMessage', source, author, message)
+    if not WasEventCanceled() then
+        TriggerClientEvent('chatMessage', -1, author, { 255, 255, 255 }, message)
+    end
+    print(author .. '^7: ' .. message .. '^7')
+end)
+
+AddEventHandler('__cfx_internal:commandFallback', function(command)
+    local name = GetPlayerName(source)
+    TriggerEvent('chatMessage', source, name, '/' .. command)
+    if not WasEventCanceled() then
+        TriggerClientEvent('chatMessage', -1, name, { 255, 255, 255 }, '/' .. command)
+    end
+    CancelEvent()
+end)
+
+AddEventHandler('chat:init', function()
+    TriggerClientEvent('chatMessage', -1, '', { 255, 255, 255 }, '^2* ' .. GetPlayerName(source) .. ' joined.')
+end)
+
+RegisterCommand('say', function(source, args, rawCommand)
+    TriggerClientEvent('chatMessage', -1, (source == 0) and 'console' or GetPlayerName(source), { 255, 255, 255 }, rawCommand:sub(5))
+end)
+RegisterCommand('kick_all', function() end, true)
+
+local function refreshCommands(player)
+    if GetRegisteredCommands then
+        local suggestions = {}
+        for _, command in ipairs(GetRegisteredCommands()) do
+            if IsPlayerAceAllowed(player, ('command.%s'):format(command.name)) then
+                table.insert(suggestions, { name = '/' .. command.name, help = '' })
+            end
+        end
+        TriggerClientEvent('chat:addSuggestions', player, suggestions)
+    end
+end
+
+AddEventHandler('chat:init', function() refreshCommands(source) end)
+
+AddEventHandler('onServerResourceStart', function(resName)
+    Wait(500)
+    for _, player in ipairs(GetPlayers()) do refreshCommands(player) end
+end)
+"#;
+
+#[test]
+fn fivem_chat_runs_on_the_server() {
+    let folder = Folder::new("chat");
+    let dir = folder.0.join("chat");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("__resource.lua"), "description 'chat'\nserver_script 'sv_chat.lua'\nclient_script 'cl_chat.lua'").unwrap();
+    std::fs::write(dir.join("sv_chat.lua"), SV_CHAT).unwrap();
+    let (scripting, log) = scripting(&folder);
+    assert_eq!(scripting.available(), vec!["chat"]);
+    scripting.start("chat").unwrap();
+    scripting.player_joined(2, "Niko");
+    let _ = scripting.take_client_events();
+
+    // A chat line goes to everybody, and the server log has it without colour codes.
+    scripting.net_event_json(2, "_chat:messageEntered", br#"["Niko", [0, 153, 255], "hello"]"#).unwrap();
+    let events = scripting.take_client_events();
+    assert_eq!((events.len(), events[0].target, events[0].name.as_str()), (1, -1, "chatMessage"));
+    assert_eq!(args_to_json(&events[0].args), r#"["Niko",[255,255,255],"hello"]"#);
+    assert!(lines(&log).contains(&"[chat] Niko: hello".to_string()), "{:?}", lines(&log));
+
+    // `/say hi` typed in the chat: the client's ExecuteCommand forwards it, the server runs it.
+    scripting.net_event_json(2, runtime::COMMAND_EVENT, br#"["say hi there"]"#).unwrap();
+    let events = scripting.take_client_events();
+    assert_eq!(args_to_json(&events[0].args), r#"["Niko",[255,255,255],"hi there"]"#);
+
+    // An unknown command, and a restricted one, come back as a chat line through the fallback.
+    scripting.net_event_json(2, runtime::COMMAND_EVENT, br#"["dance now"]"#).unwrap();
+    scripting.net_event_json(2, runtime::COMMAND_EVENT, br#"["kick_all"]"#).unwrap();
+    let events = scripting.take_client_events();
+    let lines_sent: Vec<String> = events.iter().map(|e| args_to_json(&e.args)).collect();
+    assert_eq!(lines_sent, [r#"["Niko",[255,255,255],"/dance now"]"#, r#"["Niko",[255,255,255],"/kick_all"]"#]);
+
+    // chat:init: the join line, and the suggestions without the restricted command.
+    scripting.net_event_json(2, "chat:init", b"[]").unwrap();
+    let events = scripting.take_client_events();
+    assert_eq!(args_to_json(&events[0].args), r#"["",[255,255,255],"^2* Niko joined."]"#);
+    assert_eq!((events[1].name.as_str(), events[1].target), ("chat:addSuggestions", 2));
+    assert_eq!(args_to_json(&events[1].args), r#"[[{"help":"","name":"/say"}]]"#);
+
+    // A handler that Waits (onServerResourceStart) goes on later instead of failing.
+    std::fs::create_dir_all(folder.0.join("other")).unwrap();
+    std::fs::write(folder.0.join("other").join("ivmp.lua"), "").unwrap();
+    scripting.start("other").unwrap();
+    assert!(!lines(&log).iter().any(|l| l.contains("error")), "{:?}", lines(&log));
+    assert!(scripting.take_client_events().is_empty(), "not before the 500 ms");
+    std::thread::sleep(std::time::Duration::from_millis(550));
+    scripting.tick();
+    // Two refreshes: the one for chat's own start and the one for `other`.
+    let events = scripting.take_client_events();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|e| e.name == "chat:addSuggestions" && e.target == 2));
+}
+
+#[test]
+fn a_client_command_runs_locally_or_goes_to_the_server() {
+    let folder = Folder::new("exec");
+    folder.resource(
+        "r",
+        "client_script 'c.lua'",
+        &[(
+            "c.lua",
+            "RegisterCommand('local', function(_, args) print('local', args[1]) end)\n\
+             AddEventHandler('go', function() ExecuteCommand('local x') ExecuteCommand('/say hi') end)\n\
+             Citizen.CreateThread(function() Citizen.Wait(0) print('citizen thread') end)",
+        )],
+    );
+    let (scripting, log) = client_scripting(&folder);
+    scripting.start("r").unwrap();
+    scripting.client_event_to("r", "go", b"[]").unwrap();
+    // The thread starts on the first tick and goes on after its Wait(0) on the second.
+    scripting.tick();
+    scripting.tick();
+    let out = lines(&log);
+    assert!(out.contains(&"[r] local\tx".to_string()), "{out:?}");
+    assert!(out.contains(&"[r] citizen thread".to_string()), "{out:?}");
+    assert_eq!(scripting.take_server_events(), vec![(runtime::COMMAND_EVENT.to_string(), r#"["say hi"]"#.to_string())]);
+}

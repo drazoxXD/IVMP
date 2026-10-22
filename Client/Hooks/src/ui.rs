@@ -351,7 +351,8 @@ fn web_message(message: u32, wparam: usize, lparam: isize) -> bool {
     };
     match message {
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if wparam as u16 == VK_ESCAPE.0 {
+            // Escape takes the focus back, unless a script gave it (the page closes itself then).
+            if wparam as u16 == VK_ESCAPE.0 && !crate::web::script_focus() {
                 crate::web::close();
             } else {
                 crate::web::key(0, wparam as i32, lparam, modifiers);

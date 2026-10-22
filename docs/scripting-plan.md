@@ -51,6 +51,27 @@ Server: `RegisterCommand(name, handler, restricted)`, `GetPlayers`, `GetPlayerNa
 Client: `TriggerServerEvent(name, ...)`, natives (`Citizen.InvokeNative`-style plus named wrappers),
 `SendNUIMessage`, `RegisterNUICallback`.
 
+## FiveM resources
+
+FiveM resources run as they are where IVMP has what they use (FiveM's `chat` does):
+
+* Manifest: `fxmanifest.lua` or `__resource.lua` when there is no `ivmp.lua`; `shared_script(s)`
+  run on both sides; any other entry is metadata (`GetNumResourceMetadata`, `GetResourceMetadata`).
+  An entry of `files` that doesn't exist is left out of what clients download.
+* Event handlers may `Wait` (each runs as a thread); `RegisterServerEvent`, `Citizen.CreateThread` /
+  `Citizen.Wait`, `GetNumResources`, `GetResourceByFindIndex`, `GetRegisteredCommands`,
+  `IsAceAllowed` / `IsPlayerAceAllowed` (no ACLs: `command.<name>` unless it is restricted).
+  `^0`..`^9` colour codes are stripped from `print`.
+* `ExecuteCommand` on a client runs a client command, or sends it to the server, which runs it for
+  that player (not restricted ones) or triggers `__cfx_internal:commandFallback`.
+* Client: `PlayerId`, `GetPlayerName`, `IsControlPressed` and the `Just` / `Disabled` variants (GTA V
+  controls 245 / 246, text chat, are T / Y), `IsScreenFadedOut`, `IsPauseMenuActive`,
+  `SetTextChatEnabled` (does nothing). `SetNuiFocus` moves the keyboard into the resource's frame;
+  with a script's focus Escape goes to the page, F2 still takes the focus back.
+* Pages: every resource HTML page gets `ivmp://ui/nui.js`, so FiveM's callback POSTs to
+  `http://<resource>/<name>` (XMLHttpRequest or fetch) reach `RegisterNUICallback`, and
+  `GetParentResourceName()` works.
+
 ## Stages
 
 1. **Server runtime.** Resource loader and manifest, Lua states, events, threads and timers,

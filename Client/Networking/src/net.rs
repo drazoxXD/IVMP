@@ -242,6 +242,17 @@ fn with_port(server: &str) -> String {
     }
 }
 
+/// A new join starts new reliable streams (the server's side is fresh too) and drops what ran for
+/// the old connection. Done when the hello goes out, not when the welcome comes back: the server
+/// sends its first reliable messages (the resource list) right after the welcome, and they can
+/// arrive before it; resetting on the welcome then took the server's resends as new messages, and
+/// every resource was announced twice (a restart: started, stopped, started).
+fn new_session() {
+    *RELIABLE_OUT.lock().unwrap() = Some(ReliableOut::default());
+    *RELIABLE_IN.lock().unwrap() = Some(ReliableIn::default());
+    crate::resources::reset();
+}
+
 fn run(server: &str, nickname: &str) -> std::io::Result<()> {
     let address = with_port(server)
         .to_socket_addrs()
@@ -259,6 +270,7 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
     let mut connected_text = String::new();
 
     let hello = ClientMessage::Hello { version: PROTOCOL_VERSION, nickname: nickname.to_string() }.encode();
+    new_session();
     let mut last_sent = Instant::now() - Duration::from_secs(60);
     let mut buf = [0u8; 2048];
     loop {
@@ -289,6 +301,7 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             set_status(format!("Connection lost: nothing from the server for {} s, reconnecting to {address}...", last_heard.elapsed().as_secs()));
             OUR_ID.store(0, Ordering::SeqCst);
             HOST_ID.store(0, Ordering::SeqCst);
+            new_session();
             connected_text.clear();
             started = Instant::now();
             last_heard = Instant::now();
@@ -344,10 +357,6 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             ServerMessage::Welcome { id, host } => {
                 if our_id().is_none() {
                     log!("net: joined as {} (id {id}), host is id {host}", virtual_ip(id));
-                    // A new join starts new reliable streams (the server's side is fresh too).
-                    *RELIABLE_OUT.lock().unwrap() = Some(ReliableOut::default());
-                    *RELIABLE_IN.lock().unwrap() = Some(ReliableIn::default());
-                    crate::resources::reset();
                 }
                 OUR_ID.store(id, Ordering::SeqCst);
                 HOST_ID.store(host, Ordering::SeqCst);

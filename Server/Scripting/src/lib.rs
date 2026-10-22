@@ -91,7 +91,7 @@ impl Scripting {
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.path().join(manifest::FILE).is_file())
+            .filter(|e| manifest::find(&e.path()).is_some())
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         out.sort();

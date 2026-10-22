@@ -56,6 +56,8 @@ struct State {
     handlers: HashMap<String, Vec<(u64, Function)>>,
     net_events: HashSet<String>,
     commands: HashMap<String, Function>,
+    /// Commands registered with `restricted = true`: the console only, not players.
+    restricted: HashSet<String>,
     exports: HashMap<String, Function>,
     threads: Vec<Th>,
     next_id: u64,
@@ -75,6 +77,24 @@ pub type ExtraApi = Rc<dyn Fn(&Lua) -> mlua::Result<()>>;
 
 /// The resource that `eval` (the F1 console) runs its lines in.
 pub const CONSOLE: &str = "console";
+
+/// The net event a client's `ExecuteCommand` sends when no client script has the command: the
+/// server runs it for that player, or triggers `__cfx_internal:commandFallback` (like FiveM).
+pub const COMMAND_EVENT: &str = "__ivmp_internal:command";
+
+/// `^1` .. `^9` colour codes (the chat shows them as colours; the logs don't).
+fn strip_colours(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '^' && chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
 
 pub struct World {
     me: Weak<World>,
@@ -128,6 +148,15 @@ fn limited_thread(lua: &Lua, function: Function, world: Weak<World>) -> mlua::Re
     let thread = lua.create_thread(function)?;
     thread.set_hook(HookTriggers::new().every_nth_instruction(HOOK_STEP), budget_hook(world))?;
     Ok(thread)
+}
+
+/// The milliseconds a yielding thread asked to wait (`Wait(ms)` yields them).
+fn wait_ms(value: &Value) -> u64 {
+    match value {
+        Value::Integer(i) => (*i).max(0) as u64,
+        Value::Number(n) => n.max(0.0) as u64,
+        _ => 0,
+    }
 }
 
 fn lua_error(message: impl Into<String>) -> mlua::Error {
@@ -237,11 +266,26 @@ impl World {
             for handler in handlers {
                 let converted: Result<Vec<Value>, _> = args.iter().map(|a| a.to_lua(&resource.lua)).collect();
                 let Ok(converted) = converted else { continue };
-                let _ = resource.lua.globals().set("source", source.map_or(Value::Nil, |s| Value::Integer(s as _)));
-                self.arm();
-                if let Err(e) = handler.call::<()>(Variadic::from(converted)) {
-                    self.say(format!("[{}] error in the handler of '{event}': {e}", resource.name));
+                // A nested TriggerEvent must not leave its `source` behind for the outer handler.
+                let globals = resource.lua.globals();
+                let outer_source: Value = globals.get("source").unwrap_or(Value::Nil);
+                let _ = globals.set("source", source.map_or(Value::Nil, |s| Value::Integer(s as _)));
+                // Each handler runs as a thread, so it may Wait (it then goes on later, like FiveM).
+                match limited_thread(&resource.lua, handler, self.me.clone()) {
+                    Ok(thread) => {
+                        self.arm();
+                        match thread.resume::<Value>(Variadic::from(converted)) {
+                            Ok(value) if thread.is_resumable() => {
+                                let wake = Instant::now() + Duration::from_millis(wait_ms(&value));
+                                resource.state.borrow_mut().threads.push(Th { thread, wake });
+                            }
+                            Ok(_) => {}
+                            Err(e) => self.say(format!("[{}] error in the handler of '{event}': {e}", resource.name)),
+                        }
+                    }
+                    Err(e) => self.say(format!("[{}] error in the handler of '{event}': {e}", resource.name)),
                 }
+                let _ = globals.set("source", outer_source);
             }
         }
         self.canceled.get()
@@ -267,9 +311,9 @@ impl World {
             return Err(format!("dependency cycle through '{name}'"));
         }
         let dir = safe_join(&self.dir, name).ok_or_else(|| format!("'{name}' is not a valid resource name"))?;
-        let source = std::fs::read_to_string(dir.join(manifest::FILE))
-            .map_err(|e| format!("resource '{name}': cannot read {}: {e}", manifest::FILE))?;
-        let manifest = manifest::parse(&source).map_err(|e| format!("resource '{name}': {}: {e}", manifest::FILE))?;
+        let file = manifest::find(&dir).ok_or_else(|| format!("resource '{name}': no {} (or fxmanifest.lua / __resource.lua)", manifest::FILE))?;
+        let source = std::fs::read_to_string(dir.join(file)).map_err(|e| format!("resource '{name}': cannot read {file}: {e}"))?;
+        let manifest = manifest::parse(&source).map_err(|e| format!("resource '{name}': {file}: {e}"))?;
         self.starting.borrow_mut().push(name.to_string());
         let result = self.start_loaded(name, dir, manifest);
         self.starting.borrow_mut().retain(|n| n != name);
@@ -341,6 +385,10 @@ impl World {
         let mut words = line.split_whitespace();
         let Some(name) = words.next() else { return false };
         let name = name.to_ascii_lowercase();
+        // Restricted commands are for the console; a player gets the fallback like an unknown one.
+        if source > 0 && self.command_restricted(&name) {
+            return false;
+        }
         let args: Vec<String> = words.map(str::to_string).collect();
         let resources: Vec<Rc<Resource>> = {
             let map = self.resources.borrow();
@@ -363,6 +411,29 @@ impl World {
             return true;
         }
         false
+    }
+
+    fn command_restricted(&self, name: &str) -> bool {
+        self.resources.borrow().values().any(|r| r.state.borrow().restricted.contains(name))
+    }
+
+    /// Every registered command, sorted.
+    fn command_names(&self) -> Vec<String> {
+        let mut names: Vec<String> =
+            self.resources.borrow().values().flat_map(|r| r.state.borrow().commands.keys().cloned().collect::<Vec<_>>()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// A command a player typed that no client script has (their `ExecuteCommand` sent it): run it
+    /// for them, or hand it to `__cfx_internal:commandFallback` (the chat shows it as a message).
+    fn player_command(&self, source: u32, line: &str) {
+        let line = line.trim().trim_start_matches('/');
+        if line.is_empty() || self.run_command(source as i64, line) {
+            return;
+        }
+        self.net_event(source, "__cfx_internal:commandFallback", &[Variant::Str(line.to_string())]);
     }
 
     // ---- players -------------------------------------------------------------------------------
@@ -400,6 +471,14 @@ impl World {
     /// A network event from player `source`: only handlers of resources that registered it with
     /// `RegisterNetEvent` run (a script can't be triggered by a client that way otherwise).
     pub fn net_event(&self, source: u32, name: &str, args: &[Variant]) {
+        if name == COMMAND_EVENT {
+            if self.side == Side::Server {
+                if let Some(Variant::Str(line)) = args.first() {
+                    self.player_command(source, line);
+                }
+            }
+            return;
+        }
         let resources: Vec<Rc<Resource>> = {
             let map = self.resources.borrow();
             self.order.borrow().iter().filter_map(|n| map.get(n).cloned()).collect()
@@ -428,12 +507,7 @@ impl Resource {
         match th.thread.resume::<Value>(()) {
             Ok(value) => {
                 if th.thread.is_resumable() {
-                    let wait = match value {
-                        Value::Integer(i) => i.max(0) as u64,
-                        Value::Number(n) => n.max(0.0) as u64,
-                        _ => 0,
-                    };
-                    self.state.borrow_mut().threads.push(Th { thread: th.thread, wake: now + Duration::from_millis(wait) });
+                    self.state.borrow_mut().threads.push(Th { thread: th.thread, wake: now + Duration::from_millis(wait_ms(&value)) });
                 }
             }
             Err(e) => world.say(format!("[{}] {e}", self.name)),
@@ -476,7 +550,7 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
                     parts.push(tostring.call::<String>(arg.clone())?);
                 }
                 if let Some(world) = weak.upgrade() {
-                    world.say(format!("[{name}] {}", parts.join("\t")));
+                    world.say(format!("[{name}] {}", strip_colours(&parts.join("\t"))));
                 }
                 Ok(())
             })?,
@@ -542,6 +616,8 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
             })?,
         )?;
     }
+    // FiveM's older name for it.
+    globals.set("RegisterServerEvent", globals.get::<Function>("RegisterNetEvent")?)?;
     {
         let weak = weak.clone();
         globals.set(
@@ -596,8 +672,52 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
         let state = state.clone();
         globals.set(
             "RegisterCommand",
-            lua.create_function(move |_, (command, handler, _restricted): (String, Function, Option<bool>)| {
-                state.borrow_mut().commands.insert(command.to_ascii_lowercase(), handler);
+            lua.create_function(move |_, (command, handler, restricted): (String, Function, Option<bool>)| {
+                let command = command.to_ascii_lowercase();
+                let mut state = state.borrow_mut();
+                if restricted == Some(true) {
+                    state.restricted.insert(command.clone());
+                } else {
+                    state.restricted.remove(&command);
+                }
+                state.commands.insert(command, handler);
+                Ok(())
+            })?,
+        )?;
+        let weak2 = weak.clone();
+        globals.set(
+            "GetRegisteredCommands",
+            lua.create_function(move |lua, ()| {
+                let list = lua.create_table()?;
+                for name in weak2.upgrade().map(|w| w.command_names()).unwrap_or_default() {
+                    let entry = lua.create_table()?;
+                    entry.set("name", name)?;
+                    list.push(entry)?;
+                }
+                Ok(list)
+            })?,
+        )?;
+        // There are no ACLs in IVMP: `command.<name>` is allowed unless the command is restricted
+        // (console only); any other ace is not granted.
+        let weak2 = weak.clone();
+        let allowed = move |ace: &str| -> bool {
+            let Some(command) = ace.strip_prefix("command.") else { return false };
+            !weak2.upgrade().is_some_and(|w| w.command_restricted(&command.to_ascii_lowercase()))
+        };
+        let player_allowed = allowed.clone();
+        globals.set("IsPlayerAceAllowed", lua.create_function(move |_, (_player, ace): (Value, String)| Ok(player_allowed(&ace)))?)?;
+        globals.set("IsAceAllowed", lua.create_function(move |_, ace: String| Ok(allowed(&ace)))?)?;
+        // ExecuteCommand: a command of this side's scripts; on a client anything else goes to the
+        // server, which runs it for the player or falls back to `__cfx_internal:commandFallback`.
+        let weak2 = weak.clone();
+        globals.set(
+            "ExecuteCommand",
+            lua.create_function(move |_, line: String| {
+                let Some(world) = weak2.upgrade() else { return Ok(()) };
+                let line = line.trim().trim_start_matches('/').to_string();
+                if !line.is_empty() && !world.run_command(0, &line) && world.side == Side::Client {
+                    world.server_events.borrow_mut().push((COMMAND_EVENT.to_string(), vec![Variant::Str(line)]));
+                }
                 Ok(())
             })?,
         )?;
@@ -688,6 +808,43 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
             "GetResourceState",
             lua.create_function(move |_, resource: String| {
                 Ok(if weak2.upgrade().is_some_and(|w| w.is_running(&resource)) { "started" } else { "stopped" })
+            })?,
+        )?;
+    }
+
+    // the resource list and manifest metadata
+    {
+        let weak2 = weak.clone();
+        globals.set(
+            "GetNumResources",
+            lua.create_function(move |_, ()| Ok(weak2.upgrade().map_or(0, |w| w.order.borrow().iter().filter(|n| *n != CONSOLE).count() as i64)))?,
+        )?;
+        let weak2 = weak.clone();
+        globals.set(
+            "GetResourceByFindIndex",
+            lua.create_function(move |_, index: i64| {
+                Ok(weak2.upgrade().and_then(|w| w.order.borrow().iter().filter(|n| *n != CONSOLE).nth(index.max(0) as usize).cloned()))
+            })?,
+        )?;
+        let weak2 = weak.clone();
+        globals.set(
+            "GetNumResourceMetadata",
+            lua.create_function(move |_, (resource, key): (String, String)| {
+                Ok(weak2.upgrade().and_then(|w| w.manifest_of(&resource)).map_or(0, |m| m.metadata_values(&key).len() as i64))
+            })?,
+        )?;
+        let weak2 = weak.clone();
+        globals.set(
+            "GetResourceMetadata",
+            lua.create_function(move |_, (resource, key, index): (String, String, Option<i64>)| {
+                let Some(manifest) = weak2.upgrade().and_then(|w| w.manifest_of(&resource)) else { return Ok(None) };
+                let index = index.unwrap_or(0).max(0) as usize;
+                Ok(match key.as_str() {
+                    "author" if index == 0 => Some(manifest.author.clone()),
+                    "description" if index == 0 => Some(manifest.description.clone()),
+                    "version" if index == 0 => Some(manifest.version.clone()),
+                    _ => manifest.metadata_values(&key).get(index).map(|v| v.to_string()),
+                })
             })?,
         )?;
     }
@@ -810,6 +967,9 @@ function Wait(ms) coroutine.yield(ms or 0) end
 function SetTimeout(ms, fn)
     CreateThread(function() Wait(ms) fn() end)
 end
+
+-- FiveM scripts call these through `Citizen`.
+Citizen = { CreateThread = CreateThread, Wait = Wait, SetTimeout = SetTimeout, Trace = print }
 
 local proxies = {}
 exports = setmetatable({}, {

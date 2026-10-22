@@ -51,8 +51,11 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     globals.set(
         "SetNuiFocus",
-        lua.create_function(|_, (focus, _cursor): (bool, Option<bool>)| {
+        lua.create_function(|lua, (focus, _cursor): (bool, Option<bool>)| {
             crate::web::set_focus(focus);
+            // The page moves the keyboard focus into this resource's frame (or out of it).
+            let resource = resource_name(lua)?;
+            crate::web::emit("ui.focus", &serde_json::json!({ "resource": resource, "focus": focus }).to_string());
             Ok(())
         })?,
     )?;

@@ -21,6 +21,7 @@ mod hang;
 mod memstats;
 mod luanatives;
 mod luaui;
+mod luacompat;
 mod mods;
 mod scripts;
 mod window;
