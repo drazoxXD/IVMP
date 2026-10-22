@@ -1,11 +1,10 @@
 # Builds the client (IVMP_Client.dll + ivmp_launcher.exe) and the server (Server.exe, and a
-# Linux `Server` for hosting panels like Pelican), zips each and publishes them as a pre-release.
-# Never a full release: every build is marked pre-release and not latest.
+# Linux `Server` for hosting panels like Pelican), zips each and publishes a release.
+# Manual only: run it from the Actions tab. The release notes list every commit since the
+# previous release, and a build log with the time each part took.
 name: Build
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -28,17 +27,27 @@ jobs:
             Client
             Server
 
-      - name: Build client DLL (32-bit, injected into GTAIV.exe)
-        working-directory: Client
-        run: cargo build --release --locked --target i686-pc-windows-msvc -p Hooks
-
-      - name: Build launcher (64-bit)
-        working-directory: Client
-        run: cargo build --release --locked -p Launcher
-
-      - name: Build server
-        working-directory: Server
-        run: cargo build --release --locked
+      - name: Build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force log | Out-Null
+          function Fmt([double]$s) {
+            if ($s -ge 60) { return "{0}min {1}sec" -f [int][math]::Floor($s / 60), [int]($s % 60) }
+            return "{0}sec" -f [int]$s
+          }
+          function Step([string]$name, [string]$dir, [string]$cargoArgs) {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            Push-Location $dir
+            Invoke-Expression "cargo build --release --locked $cargoArgs"
+            $code = $LASTEXITCODE
+            Pop-Location
+            if ($code -ne 0) { throw "$name failed" }
+            Add-Content log/win.txt "${name}: built in $(Fmt $sw.Elapsed.TotalSeconds)"
+          }
+          # Server first, then the launcher, then the 32-bit DLL injected into GTAIV.exe.
+          Step "Server(win64)" "Server" ""
+          Step "Client-launcher(win64)" "Client" "-p Launcher"
+          Step "Client-Dll(win32)" "Client" "--target i686-pc-windows-msvc -p Hooks"
 
       - name: Zip
         shell: pwsh
@@ -52,27 +61,14 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: IVMP-${{ github.run_number }}
+          name: win
           path: |
             IVMP_Client.zip
             IVMP_Server.zip
+            log/win.txt
 
-      - name: Pre-release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = "build-${{ github.run_number }}"
-          $sha = "${{ github.sha }}".Substring(0, 7)
-          gh release create $tag IVMP_Client.zip IVMP_Server.zip `
-            --target ${{ github.sha }} `
-            --title "Build ${{ github.run_number }} ($sha)" `
-            --notes "Automatic build of $sha. Pre-release only." `
-            --prerelease --latest=false
-
-  # The Linux server, added to the same pre-release (the Pelican egg downloads it).
+  # The Linux server (the Pelican egg downloads it).
   server-linux:
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,7 +82,13 @@ jobs:
 
       - name: Build server
         working-directory: Server
-        run: cargo build --release --locked
+        run: |
+          mkdir -p ../log
+          start=$SECONDS
+          cargo build --release --locked
+          t=$((SECONDS - start))
+          if [ "$t" -ge 60 ]; then time="$((t / 60))min $((t % 60))sec"; else time="${t}sec"; fi
+          echo "Server(linux): built in $time" >> ../log/linux.txt
 
       - name: Zip
         run: |
@@ -95,7 +97,57 @@ jobs:
           chmod +x dist/Server
           (cd dist && zip -9 ../IVMP_Server_Linux.zip Server)
 
-      - name: Add to the pre-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            IVMP_Server_Linux.zip
+            log/linux.txt
+
+  release:
+    needs: [build, server-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "build-${{ github.run_number }}" IVMP_Server_Linux.zip --repo "${{ github.repository }}"
+          REPO: ${{ github.repository }}
+        run: |
+          tag="build-${{ github.run_number }}"
+          sha="${{ github.sha }}"
+          prev=$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName')
+
+          {
+            echo "## Changes"
+            echo
+            if [ -n "$prev" ] && git rev-parse -q --verify "refs/tags/$prev" >/dev/null; then
+              range="$prev..$sha"
+            else
+              range="$sha"
+            fi
+            git log --no-merges --format="%s|%H" "$range" | while IFS='|' read -r subject hash; do
+              echo "$subject [commit](https://github.com/$REPO/commit/$hash)"
+              echo
+            done
+            echo
+            echo "Build log:"
+            echo '```'
+            cat out/log/win.txt out/log/linux.txt
+            echo '```'
+          } > notes.md
+
+          gh release create "$tag" out/IVMP_Client.zip out/IVMP_Server.zip out/IVMP_Server_Linux.zip \
+            --repo "$REPO" \
+            --target "$sha" \
+            --title "Build ${{ github.run_number }} (${sha:0:7})" \
+            --notes-file notes.md \
+            --latest
