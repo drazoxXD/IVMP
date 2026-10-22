@@ -32,6 +32,20 @@ static TRACE_UNTIL: AtomicU64 = AtomicU64::new(0);
 static TRACE_LINES: AtomicUsize = AtomicUsize::new(0);
 const TRACE_MAX_LINES: usize = 3000;
 
+/// Turns a native's hash into its name for the log (the client's Lua runtime knows the names).
+static NAMER: OnceLock<fn(u32) -> Option<String>> = OnceLock::new();
+
+pub fn set_namer(namer: fn(u32) -> Option<String>) {
+    let _ = NAMER.set(namer);
+}
+
+fn label(hash: u32) -> String {
+    match NAMER.get().and_then(|namer| namer(hash)) {
+        Some(name) => format!("{name} ({hash:#010x})"),
+        None => format!("{hash:#010x}"),
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
@@ -136,7 +150,7 @@ extern "C" fn record(handler: usize, context: *const CallContext) -> usize {
                 })
                 .collect();
             match HASHES.get().and_then(|h| h.get(&handler)) {
-                Some(hash) => log!("native {hash:#010x}({})", args.join(", ")),
+                Some(hash) => log!("native {}({})", label(*hash), args.join(", ")),
                 None => log!("native ?({})", args.join(", ")),
             }
         }
@@ -149,7 +163,7 @@ extern "C" fn record(handler: usize, context: *const CallContext) -> usize {
     if seen.insert(handler) {
         let ghidra = handler - memory::game_image().as_ptr() as usize + memory::GHIDRA_BASE;
         match HASHES.get().and_then(|h| h.get(&handler)) {
-            Some(hash) => log!("natives: first call {hash:#010x} (handler {ghidra:#x})"),
+            Some(hash) => log!("natives: first call {} (handler {ghidra:#x})", label(*hash)),
             None => log!("natives: first call ? (handler {ghidra:#x})"),
         }
     }

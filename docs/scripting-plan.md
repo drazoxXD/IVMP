@@ -68,16 +68,17 @@ Client: `TriggerServerEvent(name, ...)`, natives (`Citizen.InvokeNative`-style p
    resource; start/stop/restart reach clients live. Client Lua has a 30M instruction budget per call.) The server sends client scripts and files
    (hash, chunks over the reliable channel, local cache); the client DLL runs them in Lua on the
    game thread (`game_process`), with the same event API.
-4. **Natives.** (Started: the bridge and the tools are in, the name table is not. This game build's
-   native hashes are scrambled relative to the public lists (the exe holds no old hashes and the
-   new ones are not a function of them), so there is no generated name table. Client Lua has
+4. **Natives.** (Done: about 3000 natives with names and typed signatures. The table comes from the
+   GTA IV script tooling's native lists (`natives.cfg` / `natives.h`, found in the ScriptHookDotNet
+   sources, MIT; originally Alexander Blade's scocl): every name of it is registered in this game
+   build with the same hash, and `Client/tools/gen_natives.py` turns it into
+   `Client/Hooks/natives.json`, which is built into the DLL. Client Lua has
    `InvokeNative(name|hash, ...)`, `Natives.NAME(...)`, `DeclareNative(name, hash, args, ret)` and
-   `NativeExists(...)`; the 14 natives the project has identified are built in, more come from
-   `natives.json` next to the DLL (`{"NAME": {"hash": "0x...", "args": "iif", "ret": "b"}}`, see
-   Hooks/src/luanatives.rs for the signature letters). F1 console: `lua <code>` runs Lua on the game
-   thread, `nativetrace [seconds]` logs every native the scripts call with its arguments, to find
-   the hash of what an action does. The registration order in the exe follows a native header,
-   not the alphabet: a public list in that order would give every name by position.)
+   `NativeExists(...)`, e.g. `local x, y, z = Natives.GET_CHAR_COORDINATES(Natives.GET_PLAYER_CHAR(0))`:
+   out parameters come back as return values. A `natives.json` next to the DLL adds or overrides
+   entries (`{"NAME": {"hash": "0x...", "args": "iif", "ret": "b"}}`, signature letters in
+   Hooks/src/luanatives.rs). F1 console: `lua <code>` runs Lua on the game thread, `nativetrace
+   [seconds]` logs every native the scripts call, with name and arguments.)
    Original plan: Name to hash table for GTA IV's natives (generated), typed wrappers, a safe
    `InvokeNative` on the game thread, a script debug panel in the F1 console (the WIP entry).
 5. **UI.** A resource's `ui_page` is served to the web layer as `ivmp://<resource>/...`;

@@ -1,16 +1,18 @@
 //! Natives for client scripts (docs/scripting-plan.md, stage 4): `InvokeNative(name or hash, ...)`,
 //! `Natives.NAME(...)`, `DeclareNative(name, hash, args, ret)` and `NativeExists(name or hash)`.
 //!
-//! This game build's native hashes are scrambled relative to the public lists, so there is no
-//! generated name table: the names this project knows are built in below, and more come from
-//! `natives.json` next to the DLL and from `DeclareNative` in scripts. `nativetrace` in the F1
-//! console shows which natives (and arguments) an action in the game calls, to find new ones.
+//! The name table (about 3000 natives with typed signatures, `Client/Hooks/natives.json`, built into
+//! the DLL) comes from the GTA IV script tooling's native lists, whose hashes are this game
+//! build's; `Client/tools/gen_natives.py` makes it. More natives, or fixes, come from a
+//! `natives.json` next to the DLL (same format, it wins) and from `DeclareNative` in scripts.
+//! `nativetrace` in the F1 console shows which natives (and arguments) an action in the game calls.
 //!
 //! A signature has argument and return letters: `i` int, `u` unsigned, `f` float, `b` bool, `s`
-//! string (arguments only), `I` / `F` out parameter (an int / float the native writes; it comes
-//! back after the return values), `v` vector (returns only: three floats). A native without a
-//! signature takes its arguments as they are in Lua (integer, float, boolean, string) and returns
-//! its first slot as an integer. Wrong arguments can crash the game: natives don't check them.
+//! string, `a` any (typed by the Lua value), `I` / `F` / `V` out parameter (an int / a float / a
+//! vector of three floats the native writes: they come back after the return values), and for
+//! returns `s` string and `v` vector (three floats). A native without a signature takes its
+//! arguments as they are in Lua (integer, float, boolean, string) and returns its first slot as an
+//! integer. Wrong arguments can crash the game: natives don't check them.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -28,8 +30,10 @@ enum Arg {
     Float,
     Bool,
     Str,
+    Any,
     OutInt,
     OutFloat,
+    OutVec,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -38,6 +42,7 @@ enum Ret {
     Uint,
     Float,
     Bool,
+    Str,
     Vector,
 }
 
@@ -53,6 +58,7 @@ static TABLE: Mutex<Option<HashMap<String, Signature>>> = Mutex::new(None);
 
 /// The natives this project has identified in this game build (name, hash); their arguments are
 /// not typed yet.
+/// Names this project used before the full table: kept as aliases of the table's names.
 const KNOWN: &[(&str, u32)] = &[
     ("NETWORK_HOST_GAME", 0x5BEA05E2),
     ("NETWORK_IS_OPERATION_PENDING", 0x391E4575),
@@ -78,9 +84,11 @@ fn parse_args(text: &str) -> Result<Vec<Arg>, String> {
             'f' => Ok(Arg::Float),
             'b' => Ok(Arg::Bool),
             's' => Ok(Arg::Str),
+            'a' => Ok(Arg::Any),
             'I' => Ok(Arg::OutInt),
             'F' => Ok(Arg::OutFloat),
-            other => Err(format!("'{other}' is not an argument type (i u f b s I F)")),
+            'V' => Ok(Arg::OutVec),
+            other => Err(format!("'{other}' is not an argument type (i u f b s a I F V)")),
         })
         .collect()
 }
@@ -92,30 +100,41 @@ fn parse_ret(text: &str) -> Result<Vec<Ret>, String> {
             'u' => Ok(Ret::Uint),
             'f' => Ok(Ret::Float),
             'b' => Ok(Ret::Bool),
+            's' => Ok(Ret::Str),
             'v' => Ok(Ret::Vector),
-            other => Err(format!("'{other}' is not a return type (i u f b v)")),
+            other => Err(format!("'{other}' is not a return type (i u f b s v)")),
         })
         .collect()
 }
 
+/// The table of natives generated from the script tooling's lists (see the module docs).
+const BUILT_IN: &str = include_str!("../natives.json");
+
 fn with_table<R>(f: impl FnOnce(&mut HashMap<String, Signature>) -> R) -> R {
     let mut guard = TABLE.lock().unwrap();
     let table = guard.get_or_insert_with(|| {
-        KNOWN
-            .iter()
-            .map(|(name, hash)| (name.to_string(), Signature { hash: *hash, args: None, ret: vec![Ret::Int] }))
-            .collect()
+        let mut table = HashMap::new();
+        let count = load_text(&mut table, BUILT_IN, "the built-in table");
+        for (name, hash) in KNOWN {
+            table.entry(name.to_string()).or_insert(Signature { hash: *hash, args: None, ret: vec![Ret::Int] });
+        }
+        log!("natives: {count} natives known");
+        table
     });
     f(table)
 }
 
 /// Adds or replaces a native; `args` / `ret` are signature letters (None: untyped / one int).
-fn declare(name: &str, hash: u32, args: Option<&str>, ret: Option<&str>) -> Result<(), String> {
-    let signature = Signature {
+fn signature(hash: u32, args: Option<&str>, ret: Option<&str>) -> Result<Signature, String> {
+    Ok(Signature {
         hash,
         args: args.map(parse_args).transpose()?,
         ret: ret.map(parse_ret).transpose()?.unwrap_or_else(|| vec![Ret::Int]),
-    };
+    })
+}
+
+fn declare(name: &str, hash: u32, args: Option<&str>, ret: Option<&str>) -> Result<(), String> {
+    let signature = signature(hash, args, ret)?;
     with_table(|t| t.insert(name.to_ascii_uppercase(), signature));
     Ok(())
 }
@@ -131,11 +150,23 @@ fn parse_hash(value: &serde_json::Value) -> Option<u32> {
 /// Reads `natives.json`: `{ "NAME": "0xHASH" }` or `{ "NAME": { "hash": "0xHASH", "args": "iif", "ret": "b" } }`.
 pub fn load_file(path: &std::path::Path) {
     let Ok(text) = std::fs::read_to_string(path) else { return };
-    let value: serde_json::Value = match serde_json::from_str(&text) {
+    let added = with_table(|table| load_text(table, &text, &path.display().to_string()));
+    log!("natives: {added} native(s) from {}", path.display());
+}
+
+/// Adds the natives of a `natives.json` text; returns how many.
+fn load_text(table: &mut HashMap<String, Signature>, text: &str, source: &str) -> usize {
+    let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(e) => return log!("natives: {} is not valid JSON: {e}", path.display()),
+        Err(e) => {
+            log!("natives: {source} is not valid JSON: {e}");
+            return 0;
+        }
     };
-    let Some(map) = value.as_object() else { return log!("natives: {} must be a JSON object", path.display()) };
+    let Some(map) = value.as_object() else {
+        log!("natives: {source} must be a JSON object");
+        return 0;
+    };
     let mut added = 0;
     for (name, entry) in map {
         let (hash, args, ret) = match entry {
@@ -146,13 +177,30 @@ pub fn load_file(path: &std::path::Path) {
             ),
             other => (parse_hash(other), None, None),
         };
-        match hash.map(|hash| declare(name, hash, args, ret)) {
-            Some(Ok(())) => added += 1,
+        match hash.map(|hash| signature(hash, args, ret)) {
+            Some(Ok(signature)) => {
+                table.insert(name.to_ascii_uppercase(), signature);
+                added += 1;
+            }
             Some(Err(e)) => log!("natives: {name}: {e}"),
             None => log!("natives: {name}: needs a hash"),
         }
     }
-    log!("natives: {added} native(s) from {}", path.display());
+    added
+}
+
+/// The name of a native by its hash, for the trace log.
+pub fn name_of(hash: u32) -> Option<String> {
+    static BY_HASH: std::sync::OnceLock<HashMap<u32, String>> = std::sync::OnceLock::new();
+    BY_HASH
+        .get_or_init(|| {
+            let mut names: Vec<(String, u32)> = with_table(|t| t.iter().map(|(name, s)| (name.clone(), s.hash)).collect());
+            // Several names for one hash: the longest (the full name, not an alias) is listed last and wins.
+            names.sort_by_key(|(name, _)| (name.len(), name.clone()));
+            names.into_iter().map(|(name, hash)| (hash, name)).collect()
+        })
+        .get(&hash)
+        .cloned()
 }
 
 fn lua_error(message: impl Into<String>) -> mlua::Error {
@@ -170,6 +218,7 @@ fn hash_of(value: &Value) -> Option<u32> {
 
 /// A Lua value as a native argument slot, keeping strings alive in `strings`.
 fn slot_of(value: &Value, kind: Option<Arg>, strings: &mut Vec<CString>) -> mlua::Result<u32> {
+    let kind = kind.filter(|k| *k != Arg::Any);
     Ok(match (value, kind) {
         (Value::Integer(i), None | Some(Arg::Int) | Some(Arg::Uint)) => *i as i32 as u32,
         (Value::Number(n), None | Some(Arg::Float)) => (*n as f32).to_bits(),
@@ -213,7 +262,7 @@ fn invoke(lua: &Lua, args: Variadic<Value>) -> mlua::Result<Variadic<Value>> {
     let mut slots: Vec<u32> = Vec::new();
     let mut strings: Vec<CString> = Vec::new();
     // Out parameters: the native writes into these, which stay alive (and in place) for the call.
-    let mut outs: Vec<(Arg, Box<u32>)> = Vec::new();
+    let mut outs: Vec<(Arg, Box<[u32; 4]>)> = Vec::new();
     match &signature.args {
         None => {
             for value in &rest {
@@ -224,9 +273,9 @@ fn invoke(lua: &Lua, args: Variadic<Value>) -> mlua::Result<Variadic<Value>> {
             let mut values = rest.iter();
             for kind in kinds {
                 match kind {
-                    Arg::OutInt | Arg::OutFloat => {
-                        let cell = Box::new(0u32);
-                        slots.push(&*cell as *const u32 as usize as u32);
+                    Arg::OutInt | Arg::OutFloat | Arg::OutVec => {
+                        let cell = Box::new([0u32; 4]);
+                        slots.push(cell.as_ptr() as usize as u32);
                         outs.push((*kind, cell));
                     }
                     kind => {
@@ -255,6 +304,14 @@ fn invoke(lua: &Lua, args: Variadic<Value>) -> mlua::Result<Variadic<Value>> {
             Ret::Uint => results.push(Value::Integer(slot(next) as i64)),
             Ret::Float => results.push(Value::Number(f32::from_bits(slot(next)) as f64)),
             Ret::Bool => results.push(Value::Boolean(slot(next) & 0xFF != 0)),
+            Ret::Str => {
+                let pointer = slot(next) as usize as *const std::ffi::c_char;
+                results.push(if pointer.is_null() {
+                    Value::Nil
+                } else {
+                    Value::String(lua.create_string(unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes())?)
+                });
+            }
             Ret::Vector => {
                 for i in 0..3 {
                     results.push(Value::Number(f32::from_bits(slot(next + i)) as f64));
@@ -265,13 +322,13 @@ fn invoke(lua: &Lua, args: Variadic<Value>) -> mlua::Result<Variadic<Value>> {
         next += 1;
     }
     for (kind, cell) in &outs {
-        results.push(match kind {
-            Arg::OutFloat => Value::Number(f32::from_bits(**cell) as f64),
-            _ => Value::Integer(**cell as i32 as i64),
-        });
+        match kind {
+            Arg::OutFloat => results.push(Value::Number(f32::from_bits(cell[0]) as f64)),
+            Arg::OutVec => results.extend((0..3).map(|i| Value::Number(f32::from_bits(cell[i]) as f64))),
+            _ => results.push(Value::Integer(cell[0] as i32 as i64)),
+        }
     }
     drop(strings);
-    let _ = lua;
     Ok(Variadic::from(results))
 }
 
@@ -320,7 +377,7 @@ mod tests {
 
     #[test]
     fn signatures_parse() {
-        assert_eq!(parse_args("ifsbIF").unwrap(), [Arg::Int, Arg::Float, Arg::Str, Arg::Bool, Arg::OutInt, Arg::OutFloat]);
+        assert_eq!(parse_args("ifsbIFaV").unwrap(), [Arg::Int, Arg::Float, Arg::Str, Arg::Bool, Arg::OutInt, Arg::OutFloat, Arg::Any, Arg::OutVec]);
         assert!(parse_args("x").is_err());
         assert_eq!(parse_ret("bv").unwrap(), [Ret::Bool, Ret::Vector]);
     }
@@ -332,6 +389,19 @@ mod tests {
         assert_eq!(signature.hash, 0x1234);
         assert_eq!(signature.args.unwrap(), [Arg::Int, Arg::Float]);
         assert!(with_table(|t| t.contains_key("NETWORK_HOST_GAME")), "the known natives are built in");
+    }
+
+    #[test]
+    fn the_built_in_table_has_the_game_natives_with_signatures() {
+        let player = with_table(|t| t.get("GET_PLAYER_CHAR").cloned()).unwrap();
+        assert_eq!(player.hash, 0x511454A9);
+        assert_eq!(player.args.unwrap(), [Arg::Int, Arg::OutInt]);
+        let coords = with_table(|t| t.get("GET_CHAR_COORDINATES").cloned()).unwrap();
+        assert_eq!(coords.args.unwrap(), [Arg::Int, Arg::OutFloat, Arg::OutFloat, Arg::OutFloat]);
+        assert!(coords.ret.is_empty(), "a void native returns nothing but its out parameters");
+        let name = with_table(|t| t.get("GET_PLAYER_NAME").cloned()).unwrap();
+        assert_eq!(name.ret, [Ret::Str]);
+        assert!(with_table(|t| t.len()) > 2900);
     }
 
     #[test]

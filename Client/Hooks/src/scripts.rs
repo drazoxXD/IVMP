@@ -28,6 +28,7 @@ thread_local! {
 /// Where the downloaded resources are kept (`cache` next to the DLL).
 pub fn init() {
     resources::set_cache_dir(crate::dll_dir().join("cache"));
+    ivmp_natives::nativelog::set_namer(crate::luanatives::name_of);
     crate::luanatives::load_file(&crate::dll_dir().join("natives.json"));
 }
 

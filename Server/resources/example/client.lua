@@ -22,3 +22,11 @@ CreateThread(function()
         print('client script alive for ' .. seconds .. ' s')
     end
 end)
+
+-- Natives by name (about 3000 are known, with their argument types): `where` in the F1 console
+-- prints where you are. Out parameters (the ped, the coordinates) come back as return values.
+RegisterCommand('where', function()
+    local ped = Natives.GET_PLAYER_CHAR(0)
+    local x, y, z = Natives.GET_CHAR_COORDINATES(ped)
+    print(string.format('you are at %.1f, %.1f, %.1f (ped %d)', x, y, z, ped))
+end)

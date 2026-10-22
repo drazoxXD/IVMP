@@ -191,8 +191,8 @@ client (`Client/Networking/src/spawner.rs`) streams the model and creates a netw
 entity with the engine's factories (vehicle 0x5DA990, ped 0x5C3770, pop type 2), then answers
 with its object id. The server follows it in the registry and has it created again if it is
 gone for 10 s. Console: `spawn car|ped <model> [x y z [heading]]`, `entities`, `despawn <id>`.
-Native hashes in 1.2.0.59 don't match the public lists (old ones are joaat of the lowercase
-name), so the factories are called directly.
+(The factories are called directly. The game's native hashes do match the script tooling's
+native lists after all, see docs/scripting-plan.md stage 4.)
 
 Despawn: the server sends `ServerMessage::Despawn` to the entity's owner; the client looks the
 network object up (0x4913C0 on the object manager at 0x1908EF0) and destroys the entity with
