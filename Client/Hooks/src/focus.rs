@@ -138,6 +138,14 @@ fn focused() -> bool {
     }
 }
 
+/// DirectInput key codes the game never sees: F1 (console) and F2 (web layer). F2 is also the
+/// game's own clip hotkey, which would save a clip every time the page is toggled.
+const OUR_KEYS: [u8; 2] = [0x3B, 0x3C];
+
+fn is_keyboard(device: *mut c_void) -> bool {
+    device as usize == unsafe { *(memory::from_ghidra(KEYBOARD_DEVICE) as *const usize) }
+}
+
 /// Whether `device` is the game's DirectInput mouse.
 fn is_mouse(device: *mut c_void) -> bool {
     device as usize == unsafe { *(memory::from_ghidra(MOUSE_DEVICE) as *const usize) }
@@ -153,6 +161,12 @@ unsafe extern "system" fn get_device_state(device: *mut c_void, size: u32, data:
     let Some(index) = originals_of(device) else { return DI_OK };
     let original: GetDeviceState = unsafe { std::mem::transmute(STATE_ORIGINALS[index].load(Ordering::SeqCst)) };
     let result = unsafe { original(device, size, data) };
+    if result == DI_OK && is_keyboard(device) && size == 256 && !data.is_null() {
+        // Our keys are ours: the game must not see them (F2 is its own clip hotkey).
+        for dik in OUR_KEYS {
+            unsafe { *data.add(dik as usize) = 0 };
+        }
+    }
     if crate::ui::capturing() && is_mouse(device) && size >= 16 && !data.is_null() && result == DI_OK {
         // DIMOUSESTATE(2): lX, lY, lZ, then the button bytes. The console reads the mouse itself.
         let state = unsafe { std::slice::from_raw_parts(data, size as usize) };
@@ -173,6 +187,23 @@ unsafe extern "system" fn get_device_data(device: *mut c_void, size: u32, data: 
     let Some(index) = originals_of(device) else { return DI_OK };
     let original: GetDeviceData = unsafe { std::mem::transmute(DATA_ORIGINALS[index].load(Ordering::SeqCst)) };
     let result = unsafe { original(device, size, data, count, flags) };
+    if result == DI_OK && is_keyboard(device) && size >= 16 && !data.is_null() && !count.is_null() {
+        // Drop the buffered events of our keys (DIDEVICEOBJECTDATA: offset = the DIK code).
+        let total = unsafe { *count } as usize;
+        let mut kept = 0usize;
+        for entry in 0..total {
+            let at = unsafe { data.add(entry * size as usize) };
+            let offset = unsafe { *(at as *const u32) };
+            if OUR_KEYS.iter().any(|dik| *dik as u32 == offset) {
+                continue;
+            }
+            if kept != entry {
+                unsafe { std::ptr::copy(at, data.add(kept * size as usize), size as usize) };
+            }
+            kept += 1;
+        }
+        unsafe { *count = kept as u32 };
+    }
     if crate::ui::capturing() && is_mouse(device) && size >= 16 && !data.is_null() && !count.is_null() && result == DI_OK {
         // DIDEVICEOBJECTDATA entries: offset (0 = X, 4 = Y, 8 = wheel, 12.. = buttons), data.
         for entry in 0..unsafe { *count } as usize {
