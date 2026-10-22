@@ -138,6 +138,11 @@ impl HostSystem {
     }
 
     fn process(&mut self) {
+        // No Social Club, so no copy is signed in: give the local gamer an id and our nickname before
+        // any host or join (hosting fails without it).
+        if matches!(self.state, State::Loaded | State::StartHosting | State::StartFinding) {
+            ensure_gamer_id();
+        }
         match self.state {
             State::Idle | State::GaveUp => {}
             // `gamemode = -1`: the first player (the server's host) gets the game's lobby, which
@@ -410,9 +415,9 @@ fn log_join_state(when: &str) {
     );
 }
 
-/// The second copy isn't signed in to Social Club (only the Rockstar launcher signs a game in),
-/// so its local gamer has no id (+0x38, -1:-1) and JOIN_GAME refuses at once. The host's id
-/// looks random, so give ours one derived from the client id.
+/// IVMP skips Social Club (socialclub.rs), so no copy is signed in: the local gamer has no id
+/// (+0x38, -1:-1), hosting fails and JOIN_GAME refuses at once. Give it an id derived from the
+/// client id, mark it online, and put our nickname in as its name.
 fn ensure_gamer_id() {
     let Some(id) = net::our_id() else { return };
     unsafe {
