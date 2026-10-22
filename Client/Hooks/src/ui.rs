@@ -329,6 +329,7 @@ fn flag_menu(ui: &imgui::Ui, label: &str, flag: &AtomicBool) {
     let mut value = flag.load(Ordering::Relaxed);
     if ui.menu_item_config(label).build_with_ref(&mut value) {
         flag.store(value, Ordering::Relaxed);
+        log!("ui: overlay {label} {}", if value { "on" } else { "off" });
     }
 }
 
@@ -712,7 +713,6 @@ impl Ui {
         // Larger text on bigger screens (FiveM uses 18 px up to 1080p, 22 px above).
         self.context.io_mut().font_global_scale = if size[1] <= 1080.0 { 1.4 } else { 1.7 };
         let ui = self.context.frame();
-        draw_overlay(ui, &stats);
         if open {
             let menu_height = menu_bar(ui);
             let [width, height] = size;
@@ -819,6 +819,8 @@ impl Ui {
                     }
                 });
         }
+        // After the console, so it is on top of it (and below the menu bar when that is up).
+        draw_overlay(ui, &stats, if open { ui.frame_height() + 6.0 } else { 0.0 });
         let draw_data = self.context.render();
         self.renderer.render(device, draw_data);
 
@@ -868,7 +870,7 @@ impl Stats {
     }
 }
 
-fn draw_overlay(ui: &imgui::Ui, stats: &Stats) {
+fn draw_overlay(ui: &imgui::Ui, stats: &Stats, top: f32) {
     let (fps, ping, net, perf) = (
         SHOW_FPS.load(Ordering::Relaxed),
         SHOW_PING.load(Ordering::Relaxed),
@@ -879,7 +881,7 @@ fn draw_overlay(ui: &imgui::Ui, stats: &Stats) {
         return;
     }
     ui.window("##overlay")
-        .position([10.0, 10.0], Condition::Always)
+        .position([10.0, 10.0 + top], Condition::Always)
         .flags(
             WindowFlags::NO_DECORATION
                 | WindowFlags::NO_INPUTS
