@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use NetProtocol::reliable::{ReliableIn, ReliableOut};
 use NetProtocol::{ClientId, RejectReason, TIMEOUT_SECS};
 
 pub const MAX_CLIENTS: usize = 32;
@@ -14,6 +15,10 @@ pub struct Client {
     pub addr: SocketAddr,
     pub nickname: String,
     pub last_seen: Instant,
+    /// Control messages to this client that are resent until it acknowledges them.
+    pub out: ReliableOut,
+    /// Control messages from this client (delivered once, in order).
+    pub inn: ReliableIn,
 }
 
 #[derive(Default)]
@@ -49,7 +54,13 @@ impl Lobby {
             .filter(|id| !self.clients.contains_key(id))
             .or_else(|| (1..=MAX_CLIENTS as ClientId).find(|id| !self.clients.contains_key(id)))
             .ok_or(RejectReason::ServerFull)?;
-        self.clients.insert(id, Client { addr, nickname: nickname.to_string(), last_seen: Instant::now() });
+        self.clients.insert(id, Client {
+            addr,
+            nickname: nickname.to_string(),
+            last_seen: Instant::now(),
+            out: ReliableOut::default(),
+            inn: ReliableIn::default(),
+        });
         self.host.get_or_insert(id);
         Ok(id)
     }

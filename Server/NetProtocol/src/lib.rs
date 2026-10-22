@@ -10,7 +10,9 @@ use std::net::Ipv4Addr;
 
 pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub mod reliable;
+
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const DEFAULT_PORT: u16 = 9999;
 /// The engine reads at most 0x400 bytes per packet.
 pub const MAX_GAME_PAYLOAD: usize = 0x400;
@@ -41,6 +43,11 @@ pub enum ClientMessage {
     KeepAlive,
     /// Round trip measurement; the server answers with [`ServerMessage::Pong`] and the same stamp.
     Ping { stamp: u32 },
+    /// A control message that is resent until acknowledged: the encoded inner [`ClientMessage`]
+    /// (see [`reliable`]).
+    Reliable { seq: u16, body: Vec<u8> },
+    /// Everything the server sent as reliable messages up to `seq` has arrived.
+    Ack { seq: u16 },
     Bye,
     /// Answer to [`ServerMessage::Spawn`]: the network object id of the created entity, or 0 if
     /// it couldn't be created.
@@ -94,6 +101,10 @@ pub enum ServerMessage {
     SessionReady { host: ClientId },
     /// Answer to [`ClientMessage::Ping`].
     Pong { stamp: u32 },
+    /// A control message that is resent until acknowledged: the encoded inner [`ServerMessage`].
+    Reliable { seq: u16, body: Vec<u8> },
+    /// Everything the client sent as reliable messages up to `seq` has arrived.
+    Ack { seq: u16 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +120,8 @@ const C_HELLO: u8 = 0x01;
 const C_TUNNEL: u8 = 0x02;
 const C_KEEPALIVE: u8 = 0x03;
 const C_PING: u8 = 0x0A;
+const C_RELIABLE: u8 = 0x0B;
+const C_ACK: u8 = 0x0C;
 const C_BYE: u8 = 0x04;
 const C_SPAWNED: u8 = 0x05;
 const C_SESSION_RESTART: u8 = 0x06;
@@ -126,6 +139,8 @@ const S_GAME_SETTINGS: u8 = 0x8A;
 const S_SESSION_RESTART: u8 = 0x8B;
 const S_SESSION_READY: u8 = 0x8C;
 const S_PONG: u8 = 0x8D;
+const S_RELIABLE: u8 = 0x8E;
+const S_ACK: u8 = 0x8F;
 
 fn kind_byte(kind: SpawnKind) -> u8 {
     match kind {
@@ -238,6 +253,8 @@ impl ClientMessage {
             }
             ClientMessage::KeepAlive => Writer::new(C_KEEPALIVE).done(),
             ClientMessage::Ping { stamp } => Writer::new(C_PING).u32(*stamp).done(),
+            ClientMessage::Reliable { seq, body } => Writer::new(C_RELIABLE).u16(*seq).rest(body),
+            ClientMessage::Ack { seq } => Writer::new(C_ACK).u16(*seq).done(),
             ClientMessage::Bye => Writer::new(C_BYE).done(),
             ClientMessage::Spawned { request, object_id } => {
                 Writer::new(C_SPAWNED).u32(*request).u16(*object_id).done()
@@ -254,6 +271,8 @@ impl ClientMessage {
             C_TUNNEL => ClientMessage::Tunnel { from_port: r.u16()?, to: r.ip()?, to_port: r.u16()?, payload: r.rest() },
             C_KEEPALIVE => ClientMessage::KeepAlive,
             C_PING => ClientMessage::Ping { stamp: r.u32()? },
+            C_RELIABLE => ClientMessage::Reliable { seq: r.u16()?, body: r.rest() },
+            C_ACK => ClientMessage::Ack { seq: r.u16()? },
             C_BYE => ClientMessage::Bye,
             C_SPAWNED => ClientMessage::Spawned { request: r.u32()?, object_id: r.u16()? },
             C_SESSION_RESTART => ClientMessage::SessionRestart,
@@ -299,6 +318,8 @@ impl ServerMessage {
             ServerMessage::SessionRestart { host } => Writer::new(S_SESSION_RESTART).u8(*host).done(),
             ServerMessage::SessionReady { host } => Writer::new(S_SESSION_READY).u8(*host).done(),
             ServerMessage::Pong { stamp } => Writer::new(S_PONG).u32(*stamp).done(),
+            ServerMessage::Reliable { seq, body } => Writer::new(S_RELIABLE).u16(*seq).rest(body),
+            ServerMessage::Ack { seq } => Writer::new(S_ACK).u16(*seq).done(),
         }
     }
 
@@ -328,6 +349,8 @@ impl ServerMessage {
             S_SESSION_RESTART => ServerMessage::SessionRestart { host: r.u8()? },
             S_SESSION_READY => ServerMessage::SessionReady { host: r.u8()? },
             S_PONG => ServerMessage::Pong { stamp: r.u32()? },
+            S_RELIABLE => ServerMessage::Reliable { seq: r.u16()?, body: r.rest() },
+            S_ACK => ServerMessage::Ack { seq: r.u16()? },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -345,6 +368,8 @@ mod tests {
             ClientMessage::Tunnel { from_port: 1, to: BROADCAST, to_port: 2, payload: vec![] },
             ClientMessage::KeepAlive,
             ClientMessage::Ping { stamp: 123456 },
+            ClientMessage::Reliable { seq: 7, body: vec![1, 2, 3] },
+            ClientMessage::Ack { seq: 9 },
             ClientMessage::Bye,
             ClientMessage::Spawned { request: 7, object_id: 500 },
             ClientMessage::SessionRestart,
@@ -375,6 +400,8 @@ mod tests {
             ServerMessage::SessionRestart { host: 1 },
             ServerMessage::SessionReady { host: 1 },
             ServerMessage::Pong { stamp: 99 },
+            ServerMessage::Reliable { seq: 7, body: vec![4, 5] },
+            ServerMessage::Ack { seq: 3 },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize,
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use NetProtocol::reliable::{Accept, ReliableIn, ReliableOut};
 use NetProtocol::{ClientMessage, KEEPALIVE_SECS, MAX_GAME_PAYLOAD, PROTOCOL_VERSION, ServerMessage, virtual_ip};
 
 use crate::instance::SockAddrIn;
@@ -48,6 +49,11 @@ struct Connection {
 
 static CONNECTION: OnceLock<Connection> = OnceLock::new();
 /// Our client id once welcomed (0 = not yet).
+/// Control messages to the server that are resent until it acknowledges them, and the ones from
+/// the server (delivered once, in order). Both start over with each join.
+static RELIABLE_OUT: Mutex<Option<ReliableOut>> = Mutex::new(None);
+static RELIABLE_IN: Mutex<Option<ReliableIn>> = Mutex::new(None);
+
 static OUR_ID: AtomicU8 = AtomicU8::new(0);
 static HOST_ID: AtomicU8 = AtomicU8::new(0);
 /// The session's game mode and slots from the server (server.cfg); Free Mode, 32 until told.
@@ -98,7 +104,7 @@ pub fn tell_session_restart() {
     if is_host() {
         log!("net: telling the server we start a new session");
         RESTART_ANNOUNCED.store(true, Ordering::SeqCst);
-        send(&ClientMessage::SessionRestart);
+        send_reliable(&ClientMessage::SessionRestart);
     }
 }
 
@@ -107,7 +113,7 @@ pub fn tell_session_restart() {
 pub fn tell_session_ready() {
     if RESTART_ANNOUNCED.swap(false, Ordering::SeqCst) {
         log!("net: telling the server our new session is ready");
-        send(&ClientMessage::SessionReady);
+        send_reliable(&ClientMessage::SessionReady);
     }
 }
 
@@ -208,6 +214,16 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             let _ = connection.socket.send(&message);
             last_sent = Instant::now();
         }
+        // Control messages the server has not acknowledged yet.
+        if let Some(out) = RELIABLE_OUT.lock().unwrap().as_mut() {
+            let (resend, dropped) = out.due(Instant::now());
+            for packet in resend {
+                let _ = connection.socket.send(&packet);
+            }
+            if dropped > 0 {
+                log!("net: gave up on {dropped} control message(s) to the server: no acknowledgement");
+            }
+        }
         let len = match connection.socket.recv(&mut buf) {
             Ok(len) => len,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
@@ -215,21 +231,57 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
             Err(e) => return Err(e),
         };
-        match ServerMessage::decode(&buf[..len]) {
-            Ok(ServerMessage::Welcome { id, host }) => {
+        let message = match ServerMessage::decode(&buf[..len]) {
+            Ok(ServerMessage::Reliable { seq, body }) => {
+                let accepted = RELIABLE_IN.lock().unwrap().get_or_insert_with(ReliableIn::default).accept(seq);
+                match accepted {
+                    Accept::Deliver { ack } => {
+                        send(&ClientMessage::Ack { seq: ack });
+                        match ServerMessage::decode(&body) {
+                            Ok(inner) => inner,
+                            Err(e) => {
+                                log!("net: bad reliable message from the server: {e:?}");
+                                continue;
+                            }
+                        }
+                    }
+                    Accept::Duplicate { ack } => {
+                        send(&ClientMessage::Ack { seq: ack });
+                        continue;
+                    }
+                    Accept::Ahead => continue,
+                }
+            }
+            Ok(ServerMessage::Ack { seq }) => {
+                if let Some(out) = RELIABLE_OUT.lock().unwrap().as_mut() {
+                    out.ack(seq);
+                }
+                continue;
+            }
+            Ok(message) => message,
+            Err(e) => {
+                log!("net: bad packet from server: {e:?}");
+                continue;
+            }
+        };
+        match message {
+            ServerMessage::Welcome { id, host } => {
                 if our_id().is_none() {
                     log!("net: joined as {} (id {id}), host is id {host}", virtual_ip(id));
+                    // A new join starts new reliable streams (the server's side is fresh too).
+                    *RELIABLE_OUT.lock().unwrap() = Some(ReliableOut::default());
+                    *RELIABLE_IN.lock().unwrap() = Some(ReliableIn::default());
                 }
                 OUR_ID.store(id, Ordering::SeqCst);
                 HOST_ID.store(host, Ordering::SeqCst);
             }
-            Ok(ServerMessage::ObjectIds { first, count }) => {
+            ServerMessage::ObjectIds { first, count } => {
                 if object_ids().is_none() {
                     log!("net: server gave us object ids {first}..{}", first + count);
                 }
                 OBJECT_IDS.store((first as u32) << 16 | count as u32, Ordering::SeqCst);
             }
-            Ok(ServerMessage::GameSettings { mode, slots }) => {
+            ServerMessage::GameSettings { mode, slots } => {
                 let mode_changed = GAME_MODE.swap(mode, Ordering::SeqCst) != mode;
                 if mode_changed || SLOTS.swap(slots, Ordering::SeqCst) != slots {
                     log!("net: server game mode {mode}, {slots} slots (playing mode {})", game_settings().0);
@@ -241,27 +293,27 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 write_network_config();
             }
-            Ok(ServerMessage::Reject(reason)) => {
+            ServerMessage::Reject(reason) => {
                 log!("net: server rejected us: {reason:?}");
                 return Ok(());
             }
-            Ok(ServerMessage::PeerJoined { id, nickname }) => log!("net: {nickname} is {}", virtual_ip(id)),
-            Ok(ServerMessage::PeerLeft { id }) => log!("net: {} left", virtual_ip(id)),
-            Ok(ServerMessage::HostChanged { host }) => {
+            ServerMessage::PeerJoined { id, nickname } => log!("net: {nickname} is {}", virtual_ip(id)),
+            ServerMessage::PeerLeft { id } => log!("net: {} left", virtual_ip(id)),
+            ServerMessage::HostChanged { host } => {
                 HOST_ID.store(host, Ordering::SeqCst);
                 log!("net: host is now id {host}");
             }
-            Ok(ServerMessage::SessionRestart { host }) => {
+            ServerMessage::SessionRestart { host } => {
                 log!("net: the host {} starts a new session", virtual_ip(host));
                 SESSION_READY.store(false, Ordering::SeqCst);
                 SESSION_RESTART.store(true, Ordering::SeqCst);
             }
-            Ok(ServerMessage::Pong { stamp }) => PING_MS.store(clock_ms().wrapping_sub(stamp).max(1), Ordering::Relaxed),
-            Ok(ServerMessage::SessionReady { host }) => {
+            ServerMessage::Pong { stamp } => PING_MS.store(clock_ms().wrapping_sub(stamp).max(1), Ordering::Relaxed),
+            ServerMessage::SessionReady { host } => {
                 log!("net: the host {}'s new session is ready", virtual_ip(host));
                 SESSION_READY.store(true, Ordering::SeqCst);
             }
-            Ok(ServerMessage::Tunnel { from, from_port, to_port: _, payload }) => {
+            ServerMessage::Tunnel { from, from_port, to_port: _, payload } => {
                 if RECEIVED.fetch_add(1, Ordering::Relaxed) < LOG_PACKETS {
                     log!("net: <- {from}:{from_port} {} bytes", payload.len());
                 }
@@ -271,11 +323,12 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 inbox.push_back(Packet { from, from_port, payload });
             }
-            Ok(ServerMessage::Spawn { request, kind, model, position, heading }) => {
+            ServerMessage::Spawn { request, kind, model, position, heading } => {
                 crate::spawner::request(crate::spawner::Request { id: request, kind, model, position, heading });
             }
-            Ok(ServerMessage::Despawn { kind, object_id }) => crate::spawner::despawn(kind, object_id),
-            Err(e) => log!("net: bad packet from server: {e:?}"),
+            ServerMessage::Despawn { kind, object_id } => crate::spawner::despawn(kind, object_id),
+            // Handled above; a reliable message inside a reliable one is ignored.
+            ServerMessage::Reliable { .. } | ServerMessage::Ack { .. } => {}
         }
     }
 }
@@ -291,6 +344,19 @@ static PING_MS: AtomicU32 = AtomicU32::new(0);
 
 pub fn ping_ms() -> u32 {
     PING_MS.load(Ordering::Relaxed)
+}
+
+/// Sends a control message that is resent until the server acknowledges it (any thread).
+pub fn send_reliable(message: &ClientMessage) {
+    if let Some(connection) = connected() {
+        let body = message.encode();
+        let bytes = RELIABLE_OUT
+            .lock()
+            .unwrap()
+            .get_or_insert_with(ReliableOut::default)
+            .queue(|seq| ClientMessage::Reliable { seq, body }.encode());
+        let _ = connection.socket.send(&bytes);
+    }
 }
 
 /// Sends a message to the server (any thread). Dropped when not connected yet.

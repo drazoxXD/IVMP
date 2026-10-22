@@ -186,7 +186,7 @@ pub fn tick() {
 }
 
 fn answer(request: u32, object_id: u16) {
-    net::send(&ClientMessage::Spawned { request, object_id });
+    net::send_reliable(&ClientMessage::Spawned { request, object_id });
 }
 
 unsafe fn model_index(hash: u32) -> i32 {

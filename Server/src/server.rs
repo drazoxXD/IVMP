@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use ivmp_host::session::HostSession;
 use ivmp_sync::{ids, nodes, registry::Registry};
+use NetProtocol::reliable::Accept;
 use NetProtocol::{ClientId, ClientMessage, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
 
 use crate::capture::Capture;
@@ -97,6 +98,7 @@ impl Server {
                 Err(e) => say!("receive failed: {e}"),
             }
             self.host_tick();
+            self.resend_reliable();
             for id in self.lobby.timed_out() {
                 self.remove(id, "timed out");
             }
@@ -120,6 +122,36 @@ impl Server {
     fn send(&self, to: SocketAddr, message: &ServerMessage) {
         if let Err(e) = self.socket.send_to(&message.encode(), to) {
             say!("send to {to} failed: {e}");
+        }
+    }
+
+    /// Sends a control message that is resent until the client acknowledges it, and delivered once
+    /// and in order (spawns, session restarts, object ids, ...). Not for game packets.
+    fn reliable(&mut self, to: ClientId, message: &ServerMessage) {
+        let Some(client) = self.lobby.clients.get_mut(&to) else { return };
+        let body = message.encode();
+        let bytes = client.out.queue(|seq| ServerMessage::Reliable { seq, body }.encode());
+        let _ = self.socket.send_to(&bytes, client.addr);
+    }
+
+    fn reliable_broadcast(&mut self, except: Option<ClientId>, message: &ServerMessage) {
+        let ids: Vec<ClientId> = self.lobby.clients.keys().copied().filter(|id| Some(*id) != except).collect();
+        for id in ids {
+            self.reliable(id, message);
+        }
+    }
+
+    /// Sends reliable messages again that were not acknowledged in time.
+    fn resend_reliable(&mut self) {
+        let now = Instant::now();
+        for (id, client) in self.lobby.clients.iter_mut() {
+            let (packets, dropped) = client.out.due(now);
+            for packet in packets {
+                let _ = self.socket.send_to(&packet, client.addr);
+            }
+            if dropped > 0 {
+                say!("gave up on {dropped} control message(s) to client {id}: no acknowledgement");
+            }
         }
     }
 
@@ -174,18 +206,38 @@ impl Server {
             (ClientMessage::SessionRestart, Some(id)) => {
                 if self.lobby.host == Some(id) {
                     say!("client {id} (the host) is starting a new session; telling the others");
-                    self.broadcast(Some(id), &ServerMessage::SessionRestart { host: id });
+                    self.reliable_broadcast(Some(id), &ServerMessage::SessionRestart { host: id });
                 }
             }
             // The host's new session is in its lobby: the others may join it now.
             (ClientMessage::SessionReady, Some(id)) => {
                 if self.lobby.host == Some(id) {
                     say!("client {id} (the host) has its new session ready; telling the others");
-                    self.broadcast(Some(id), &ServerMessage::SessionReady { host: id });
+                    self.reliable_broadcast(Some(id), &ServerMessage::SessionReady { host: id });
                 }
             }
             (ClientMessage::KeepAlive, Some(_)) => {}
             (ClientMessage::Ping { stamp }, Some(_)) => self.send(from, &ServerMessage::Pong { stamp }),
+            // A control message from the client: acknowledge it, and process it once.
+            (ClientMessage::Reliable { seq, body }, Some(id)) => {
+                let accepted = self.lobby.clients.get_mut(&id).map(|c| c.inn.accept(seq));
+                match accepted {
+                    Some(Accept::Deliver { ack }) => {
+                        self.send(from, &ServerMessage::Ack { seq: ack });
+                        match ClientMessage::decode(&body) {
+                            Ok(inner) => self.handle(from, inner),
+                            Err(e) => say!("bad reliable message from {from}: {e:?}"),
+                        }
+                    }
+                    Some(Accept::Duplicate { ack }) => self.send(from, &ServerMessage::Ack { seq: ack }),
+                    Some(Accept::Ahead) | None => {}
+                }
+            }
+            (ClientMessage::Ack { seq }, Some(id)) => {
+                if let Some(client) = self.lobby.clients.get_mut(&id) {
+                    client.out.ack(seq);
+                }
+            }
             (ClientMessage::Bye, Some(id)) => self.remove(id, "left"),
             // Anything but hello from an unknown address is ignored.
             (_, None) => {}
@@ -231,11 +283,11 @@ impl Server {
             None => match self.lobby.join(from, nickname) {
                 Ok(id) => {
                     say!("{nickname} joined from {from} as {} (id {id}), object ids {:?}", virtual_ip(id), ids::block(id));
-                    self.broadcast(Some(id), &ServerMessage::PeerJoined { id, nickname: nickname.to_string() });
-                    for (other, client) in &self.lobby.clients {
-                        if *other != id {
-                            self.send(from, &ServerMessage::PeerJoined { id: *other, nickname: client.nickname.clone() });
-                        }
+                    self.reliable_broadcast(Some(id), &ServerMessage::PeerJoined { id, nickname: nickname.to_string() });
+                    let others: Vec<(ClientId, String)> =
+                        self.lobby.clients.iter().filter(|(other, _)| **other != id).map(|(other, c)| (*other, c.nickname.clone())).collect();
+                    for (other, other_nickname) in others {
+                        self.reliable(id, &ServerMessage::PeerJoined { id: other, nickname: other_nickname });
                     }
                     id
                 }
@@ -244,9 +296,13 @@ impl Server {
         };
         let host = if self.host.is_some() { HOST_ID } else { self.lobby.host.unwrap_or(id) };
         self.send(from, &ServerMessage::Welcome { id, host });
-        let (first, count) = ids::block(id);
-        self.send(from, &ServerMessage::ObjectIds { first, count });
-        self.send(from, &ServerMessage::GameSettings { mode: self.gamemode, slots: self.slots });
+        // Only on the first hello: a repeated one (the welcome was lost) is answered with the
+        // welcome alone, the reliable messages are already on their way.
+        if existing.is_none() {
+            let (first, count) = ids::block(id);
+            self.reliable(id, &ServerMessage::ObjectIds { first, count });
+            self.reliable(id, &ServerMessage::GameSettings { mode: self.gamemode, slots: self.slots });
+        }
     }
 
     /// Each client with its player's position, when the registry knows it.
@@ -269,11 +325,13 @@ impl Server {
     fn update_world(&mut self) {
         let clients = self.player_positions();
         for order in self.world.orders(&self.entities, &clients) {
-            let Some(client) = self.lobby.clients.get(&order.client) else { continue };
+            if !self.lobby.clients.contains_key(&order.client) {
+                continue;
+            }
             let e = &order.entity;
             say!("asking client {} to create server entity {} ({:?} {:#010x})", order.client, order.request, e.kind, e.model);
-            self.send(
-                client.addr,
+            self.reliable(
+                order.client,
                 &ServerMessage::Spawn {
                     request: order.request,
                     kind: e.kind,
@@ -306,9 +364,9 @@ impl Server {
                         let owner = self.entities.entities.get(&object_id).map(|e| e.owner);
                         owner.or(entity.creator.map(|(c, _)| c)).map(|owner| (owner, object_id))
                     });
-                    match owner.and_then(|(owner, object_id)| Some((self.lobby.clients.get(&owner)?.addr, owner, object_id))) {
-                        Some((addr, owner, object_id)) => {
-                            self.send(addr, &ServerMessage::Despawn { kind: entity.kind, object_id });
+                    match owner.filter(|(owner, _)| self.lobby.clients.contains_key(owner)) {
+                        Some((owner, object_id)) => {
+                            self.reliable(owner, &ServerMessage::Despawn { kind: entity.kind, object_id });
                             say!("server entity {id} deleted (asked client {owner})");
                         }
                         None => say!("server entity {id} forgotten (nobody has it)"),
@@ -342,11 +400,11 @@ impl Server {
         }
         let Some((client, new_host)) = self.lobby.leave(id) else { return };
         say!("{} ({}) {why}", client.nickname, virtual_ip(id));
-        self.broadcast(None, &ServerMessage::PeerLeft { id });
+        self.reliable_broadcast(None, &ServerMessage::PeerLeft { id });
         // With the server hosting, the session host never changes.
         if let Some(host) = new_host.filter(|_| self.host.is_none()) {
             say!("host is now {}", self.lobby.clients[&host].nickname);
-            self.broadcast(None, &ServerMessage::HostChanged { host });
+            self.reliable_broadcast(None, &ServerMessage::HostChanged { host });
         }
     }
 }
