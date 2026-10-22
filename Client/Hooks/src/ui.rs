@@ -796,7 +796,10 @@ impl Ui {
                     let right = filter_width + scroll_width + button_width + 24.0;
                     ui.set_next_item_width(-right);
                     // Keep the keyboard on the input unless something else is being used.
-                    if focus_input || (!ui.is_any_item_active() && !ui.is_mouse_clicked(MouseButton::Left)) {
+                    // (Not while a menu or popup is open: taking the focus closed the menus at once, so
+                    // no menu item could be clicked.)
+                    let popup_open = unsafe { imgui::sys::igIsPopupOpen(c"".as_ptr(), imgui::sys::ImGuiPopupFlags_AnyPopup as i32) };
+                    if focus_input || (!popup_open && !ui.is_any_item_active() && !ui.is_mouse_clicked(MouseButton::Left)) {
                         ui.set_keyboard_focus_here();
                     }
                     if ui
