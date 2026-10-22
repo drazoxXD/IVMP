@@ -239,7 +239,7 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
     let connection = CONNECTION.get_or_init(|| Connection { socket, inbox: Mutex::new(VecDeque::new()) });
     log!("net: connecting to {address} as {nickname:?}");
     set_status(format!("Connecting to {address}..."));
-    let started = Instant::now();
+    let mut started = Instant::now();
     let mut last_heard = Instant::now();
     let mut connected_text = String::new();
 
@@ -268,7 +268,16 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
         if our_id().is_none() && started.elapsed() > Duration::from_secs(5) {
             set_status(format!("No answer from {address}: is the server running, and is its UDP port open (firewall, port forwarding)?"));
         } else if our_id().is_some() && last_heard.elapsed() > Duration::from_secs(8) {
-            set_status(format!("Connection lost: nothing from the server for {} s", last_heard.elapsed().as_secs()));
+            // The server may have been restarted: it knows nobody then and ignores everything but a
+            // hello, so say hello again like on the first connect (the game's own session goes on
+            // between the players meanwhile). A new welcome starts new reliable streams.
+            set_status(format!("Connection lost: nothing from the server for {} s, reconnecting to {address}...", last_heard.elapsed().as_secs()));
+            OUR_ID.store(0, Ordering::SeqCst);
+            HOST_ID.store(0, Ordering::SeqCst);
+            connected_text.clear();
+            started = Instant::now();
+            last_heard = Instant::now();
+            last_sent = Instant::now() - Duration::from_secs(60);
         }
         let len = match connection.socket.recv(&mut buf) {
             Ok(len) => {
