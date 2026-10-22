@@ -36,6 +36,8 @@ pub struct Config {
     pub host: bool,
     /// -2 = IVMP freeroam, 16 = GTA IV's online Free Mode, other values = the game's modes.
     pub gamemode: i32,
+    /// Which content the game loads: 1 = GTA IV, 2 = EFLC (the episodes), 3 = both.
+    pub dlc: u8,
     pub slots: u8,
     /// Also log debugging detail (entities, game events).
     pub verbose: bool,
@@ -86,6 +88,12 @@ host = 0
 # 16\tFree Mode (NOT IVMP)
 gamemode = -2
 
+#DLC to load
+# 1 = GTA IV
+# 2 = EFLC
+# 3 = GTA IV + EFLC (Recommended)
+dlc = 3
+
 # Player slots of the session.
 slots = 32
 
@@ -110,6 +118,7 @@ impl Config {
             ids: Vec::new(),
             host: false,
             gamemode: -2,
+            dlc: 3,
             slots: 32,
             verbose: false,
             upnp: false,
@@ -176,6 +185,7 @@ impl Config {
                     _ => false,
                 },
                 "gamemode" => value.parse().map(|v| self.gamemode = v).is_ok(),
+                "dlc" => value.parse::<u8>().ok().filter(|v| (1..=3).contains(v)).map(|v| self.dlc = v).is_some(),
                 "slots" => value.parse::<u8>().ok().filter(|s| (1..=32).contains(s)).map(|s| self.slots = s).is_some(),
                 "verbose" => match value.to_ascii_lowercase().as_str() {
                     "0" | "false" | "off" => {
@@ -268,5 +278,16 @@ capture =");
         assert_eq!(config.slots, 8);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("line 5"));
+    }
+
+    #[test]
+    fn dlc_takes_1_to_3() {
+        let mut config = Config::defaults();
+        assert_eq!(config.dlc, 3);
+        assert!(config.apply_file("dlc = 2").is_empty());
+        assert_eq!(config.dlc, 2);
+        assert_eq!(config.apply_file("dlc = 4
+dlc = x").len(), 2);
+        assert_eq!(config.dlc, 2, "a bad value changes nothing");
     }
 }

@@ -91,7 +91,13 @@ impl Server {
         } else {
             say!("the first player hosts the game session (peer to peer)");
         }
-        say!("game mode {}, {} slots", config.gamemode, config.slots);
+        say!(
+            "game mode {}, {} slots, dlc {} ({})",
+            config.gamemode,
+            config.slots,
+            config.dlc,
+            ["GTA IV", "EFLC", "GTA IV + EFLC"][config.dlc as usize - 1]
+        );
         say!("{}", console::HELP);
         let resources_dir = match &config.resources {
             Some(dir) => std::path::PathBuf::from(dir),
