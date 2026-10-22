@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use NetProtocol::reliable::{Accept, ReliableIn, ReliableOut};
-use NetProtocol::{ClientMessage, KEEPALIVE_SECS, MAX_GAME_PAYLOAD, PROTOCOL_VERSION, ServerMessage, virtual_ip};
+use NetProtocol::{ClientMessage, KEEPALIVE_SECS, MAX_GAME_PAYLOAD, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
 
 use crate::instance::SockAddrIn;
 use crate::{log, memory};
@@ -180,14 +180,50 @@ pub fn is_host() -> bool {
     our_id().is_some_and(|id| id == HOST_ID.load(Ordering::SeqCst))
 }
 
+/// What the connection to the IVMP server is doing, in words (for the overlay and the console).
+static STATUS: Mutex<String> = Mutex::new(String::new());
+
+fn set_status(text: impl Into<String>) {
+    let text = text.into();
+    let mut status = STATUS.lock().unwrap();
+    if *status != text {
+        log!("net: {text}");
+        *status = text;
+    }
+}
+
+/// The connection state as a sentence: "Connecting to ...", "Connected ...", or what is wrong.
+pub fn status() -> String {
+    let status = STATUS.lock().unwrap();
+    if status.is_empty() { "Not started".to_string() } else { status.clone() }
+}
+
+/// The status when something is wrong (the server doesn't answer, was lost, refused us, ...), None
+/// while connecting or connected.
+pub fn connection_problem() -> Option<String> {
+    let status = status();
+    (!status.starts_with("Connecting") && !status.starts_with("Connected") && status != "Not started").then_some(status)
+}
+
+fn reject_text(reason: &RejectReason) -> String {
+    match reason {
+        RejectReason::VersionMismatch => {
+            format!("The server refused us: version mismatch (this client speaks protocol {PROTOCOL_VERSION}; update the client or the server)")
+        }
+        RejectReason::ServerFull => "The server refused us: it is full".to_string(),
+        RejectReason::BadNickname => "The server refused us: the nickname is not allowed".to_string(),
+    }
+}
+
 /// Connects to the server in the background and installs the netSocket hooks.
 pub fn start(server: &str, nickname: &str) {
     let _ = crate::NICKNAME.set(nickname.to_string());
     install_socket_hooks();
     let (server, nickname) = (server.to_string(), nickname.to_string());
     std::thread::spawn(move || {
+        set_status(format!("Connecting to {server}..."));
         if let Err(e) = run(&server, &nickname) {
-            log!("net: {e}");
+            set_status(format!("Could not connect to {server}: {e}"));
         }
     });
 }
@@ -202,6 +238,10 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_millis(250)))?;
     let connection = CONNECTION.get_or_init(|| Connection { socket, inbox: Mutex::new(VecDeque::new()) });
     log!("net: connecting to {address} as {nickname:?}");
+    set_status(format!("Connecting to {address}..."));
+    let started = Instant::now();
+    let mut last_heard = Instant::now();
+    let mut connected_text = String::new();
 
     let hello = ClientMessage::Hello { version: PROTOCOL_VERSION, nickname: nickname.to_string() }.encode();
     let mut last_sent = Instant::now() - Duration::from_secs(60);
@@ -224,8 +264,20 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 log!("net: gave up on {dropped} control message(s) to the server: no acknowledgement");
             }
         }
+        // What is wrong, if anything: no answer to the hello, or a connection that went quiet.
+        if our_id().is_none() && started.elapsed() > Duration::from_secs(5) {
+            set_status(format!("No answer from {address}: is the server running, and is its UDP port open (firewall, port forwarding)?"));
+        } else if our_id().is_some() && last_heard.elapsed() > Duration::from_secs(8) {
+            set_status(format!("Connection lost: nothing from the server for {} s", last_heard.elapsed().as_secs()));
+        }
         let len = match connection.socket.recv(&mut buf) {
-            Ok(len) => len,
+            Ok(len) => {
+                last_heard = Instant::now();
+                if our_id().is_some() && !connected_text.is_empty() {
+                    set_status(connected_text.clone());
+                }
+                len
+            }
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
             // The server isn't up yet (ICMP port unreachable); keep trying.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
@@ -274,6 +326,8 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 OUR_ID.store(id, Ordering::SeqCst);
                 HOST_ID.store(host, Ordering::SeqCst);
+                connected_text = format!("Connected to {address} as {} (id {id})", virtual_ip(id));
+                set_status(connected_text.clone());
             }
             ServerMessage::ObjectIds { first, count } => {
                 if object_ids().is_none() {
@@ -294,7 +348,7 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 write_network_config();
             }
             ServerMessage::Reject(reason) => {
-                log!("net: server rejected us: {reason:?}");
+                set_status(reject_text(&reason));
                 return Ok(());
             }
             ServerMessage::PeerJoined { id, nickname } => log!("net: {nickname} is {}", virtual_ip(id)),

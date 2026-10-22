@@ -586,6 +586,7 @@ impl Ui {
             "status" => {
                 let (sent, received) = ivmp_networking::net::packet_counts();
                 let (mode, slots) = ivmp_networking::net::game_settings();
+                self.print(OUTPUT_COLOR, ivmp_networking::net::status());
                 self.print(
                     OUTPUT_COLOR,
                     format!(
@@ -873,6 +874,27 @@ impl Stats {
 }
 
 fn draw_overlay(ui: &imgui::Ui, stats: &Stats, top: f32) {
+    // A connection that is not working says so, always (not only with the Network overlay on).
+    if let Some(problem) = ivmp_networking::net::connection_problem() {
+        let width = ui.io().display_size[0];
+        ui.window("##net_problem")
+            .position([width / 2.0, 10.0 + top], Condition::Always)
+            .position_pivot([0.5, 0.0])
+            .size([width * 0.6, 0.0], Condition::Always)
+            .flags(
+                WindowFlags::NO_DECORATION
+                    | WindowFlags::NO_INPUTS
+                    | WindowFlags::NO_MOVE
+                    | WindowFlags::NO_SAVED_SETTINGS
+                    | WindowFlags::NO_FOCUS_ON_APPEARING
+                    | WindowFlags::NO_NAV,
+            )
+            .bg_alpha(0.7)
+            .build(|| {
+                ui.text_colored([1.0, 0.55, 0.45, 1.0], "IVMP: not connected");
+                ui.text_wrapped(&problem);
+            });
+    }
     let (fps, ping, net, perf) = (
         SHOW_FPS.load(Ordering::Relaxed),
         SHOW_PING.load(Ordering::Relaxed),
