@@ -29,6 +29,7 @@ pub mod net;
 pub mod netobjects;
 pub mod peer;
 pub mod relay;
+pub mod resources;
 pub mod session;
 pub mod spawner;
 pub mod synctrace;

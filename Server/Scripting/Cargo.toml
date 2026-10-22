@@ -1,5 +1,5 @@
 [package]
-name = "Scripting"
+name = "IvmpScripting"
 description = "FiveM style resources for the IVMP server: manifest, Lua runtime, events, threads, commands."
 version = "0.1.0"
 edition = "2024"

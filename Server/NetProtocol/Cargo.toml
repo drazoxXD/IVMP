@@ -8,3 +8,4 @@ edition = "2024"
 name = "NetProtocol"
 
 [dependencies]
+sha2 = "0.10"

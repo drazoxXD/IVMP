@@ -280,3 +280,48 @@ fn player_connecting_can_be_refused() {
     assert_eq!(scripting.player_connecting("Bad").as_deref(), Some("no bad names"));
     assert_eq!(scripting.player_connecting("Niko"), None, "the reason does not stick");
 }
+
+fn client_scripting(folder: &Folder) -> (Scripting, Rc<RefCell<Vec<String>>>) {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let sink = log.clone();
+    (Scripting::client(folder.0.clone(), move |line| sink.borrow_mut().push(line)), log)
+}
+
+#[test]
+fn the_client_runs_client_scripts_and_talks_to_the_server() {
+    let folder = Folder::new("client_side");
+    folder.resource(
+        "r",
+        "server_script 's.lua'\nclient_script 'c.lua'",
+        &[
+            ("s.lua", "print('server side')"),
+            (
+                "c.lua",
+                "print('client side', DropPlayer, TriggerClientEvent)\n\
+                 AddEventHandler('onClientResourceStart', function(name) print('started', name) end)\n\
+                 RegisterNetEvent('news', function(a, t) print('news', a, t.x) TriggerServerEvent('thanks', a, { y = 2 }) end)",
+            ),
+        ],
+    );
+    let (scripting, log) = client_scripting(&folder);
+    scripting.start("r").unwrap();
+    let out = lines(&log);
+    assert!(out.contains(&"[r] client side\tnil\tnil".to_string()), "{out:?}");
+    assert!(out.contains(&"[r] started\tr".to_string()), "{out:?}");
+    assert!(!out.iter().any(|l| l.contains("server side")), "a client must not run server scripts");
+    scripting.client_event_json("news", br#"["hi", {"x": 7}]"#).unwrap();
+    assert!(lines(&log).contains(&"[r] news\thi\t7".to_string()));
+    assert_eq!(scripting.take_server_events(), vec![("thanks".to_string(), r#"["hi",{"y":2}]"#.to_string())]);
+}
+
+#[test]
+fn an_endless_loop_is_stopped() {
+    let folder = Folder::new("endless");
+    folder.resource("loop", "client_script 'c.lua'", &[("c.lua", "print('before') while true do end print('never')")]);
+    let (scripting, log) = client_scripting(&folder);
+    scripting.start("loop").unwrap();
+    let out = lines(&log);
+    assert!(out.contains(&"[loop] before".to_string()), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("ran too long")), "{out:?}");
+    assert!(!out.iter().any(|l| l.contains("never")));
+}

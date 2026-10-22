@@ -62,7 +62,10 @@ Client: `TriggerServerEvent(name, ...)`, natives (`Citizen.InvokeNative`-style p
    `TriggerClientEvent(name, player|-1, ...)` reaches the client queue (`net::take_script_events`),
    `playerConnecting` with `SetKickReason` + `CancelEvent` refuses a join. The client console has
    `triggerserver <event> [json]` for testing until the client runtime (stage 3) exists.
-3. **Resource distribution and the client runtime.** The server sends client scripts and files
+3. **Resource distribution and the client runtime.** (Done, protocol 11: the server announces
+   `ivmp.lua`, client scripts, `files` and the `ui_page` with SHA-256 hashes, the client downloads
+   what its `cache` folder lacks in 800 byte chunks over the reliable stream, verifies and starts the
+   resource; start/stop/restart reach clients live. Client Lua has a 30M instruction budget per call.) The server sends client scripts and files
    (hash, chunks over the reliable channel, local cache); the client DLL runs them in Lua on the
    game thread (`game_process`), with the same event API.
 4. **Natives.** Name to hash table for GTA IV's natives (generated), typed wrappers, a safe

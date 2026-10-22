@@ -12,7 +12,7 @@ pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
 pub mod reliable;
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 /// The most a script event's JSON arguments may take: it travels in one reliable packet.
 pub const MAX_SCRIPT_PAYLOAD: usize = 900;
 pub const DEFAULT_PORT: u16 = 9999;
@@ -35,6 +35,30 @@ pub fn virtual_ip(id: ClientId) -> Ipv4Addr {
 pub fn client_id_of(ip: Ipv4Addr) -> Option<ClientId> {
     let o = ip.octets();
     (o[..3] == VIRTUAL_NETWORK && o[3] != 0 && o[3] != 255).then_some(o[3])
+}
+
+/// Bytes of a file in one [`ServerMessage::FileChunk`].
+pub const FILE_CHUNK: usize = 800;
+/// The most a single resource file, and all files of one resource together, may weigh.
+pub const MAX_FILE_BYTES: u32 = 16 * 1024 * 1024;
+pub const MAX_RESOURCE_BYTES: u32 = 64 * 1024 * 1024;
+
+/// SHA-256 of a file's content, as announced in [`ServerMessage::ResourceFile`].
+pub fn file_hash(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).into()
+}
+
+/// Whether `path` is a plain relative path with `/` separators (no `..`, no drive, no empty or
+/// absolute parts): the client writes files below its cache folder by this name, so it must not
+/// trust a path the server sends.
+pub fn safe_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 200
+        && !path.starts_with('/')
+        && path.split('/').all(|part| {
+            !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':', '\0']) && !part.ends_with(['.', ' '])
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +87,8 @@ pub enum ClientMessage {
     /// `TriggerServerEvent(name, ...)`: the arguments as JSON (see [`MAX_SCRIPT_PAYLOAD`]). Sent
     /// as a reliable message.
     ScriptEvent { name: String, payload: Vec<u8> },
+    /// Asks for a file the server announced with [`ServerMessage::ResourceFile`].
+    FileRequest { resource: String, path: String },
 }
 
 /// What a [`ServerMessage::Spawn`] creates.
@@ -117,6 +143,15 @@ pub enum ServerMessage {
     Ack { seq: u16 },
     /// `TriggerClientEvent(name, ...)`: the arguments as JSON. Sent as a reliable message.
     ScriptEvent { name: String, payload: Vec<u8> },
+    /// A file of a resource the client needs (its `ivmp.lua`, client scripts, `files`): the size and
+    /// the SHA-256 of its content, so the client can tell whether its cached copy is current.
+    ResourceFile { resource: String, path: String, size: u32, hash: [u8; 32] },
+    /// Every file of the resource has been announced: the client can fetch what it lacks and start it.
+    ResourceReady { resource: String },
+    /// The resource stopped (or restarts: it is announced again afterwards).
+    ResourceStop { resource: String },
+    /// Part of a file the client asked for, in order; the file is complete at `size` bytes.
+    FileChunk { resource: String, path: String, offset: u32, data: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +174,7 @@ const C_SPAWNED: u8 = 0x05;
 const C_SESSION_RESTART: u8 = 0x06;
 const C_SESSION_READY: u8 = 0x07;
 const C_SCRIPT_EVENT: u8 = 0x08;
+const C_FILE_REQUEST: u8 = 0x09;
 const S_WELCOME: u8 = 0x81;
 const S_REJECT: u8 = 0x82;
 const S_PEER_JOINED: u8 = 0x83;
@@ -155,6 +191,10 @@ const S_PONG: u8 = 0x8D;
 const S_RELIABLE: u8 = 0x8E;
 const S_ACK: u8 = 0x8F;
 const S_SCRIPT_EVENT: u8 = 0x90;
+const S_RESOURCE_FILE: u8 = 0x91;
+const S_RESOURCE_READY: u8 = 0x92;
+const S_RESOURCE_STOP: u8 = 0x93;
+const S_FILE_CHUNK: u8 = 0x94;
 
 fn kind_byte(kind: SpawnKind) -> u8 {
     match kind {
@@ -276,6 +316,7 @@ impl ClientMessage {
             ClientMessage::SessionRestart => Writer::new(C_SESSION_RESTART).done(),
             ClientMessage::SessionReady => Writer::new(C_SESSION_READY).done(),
             ClientMessage::ScriptEvent { name, payload } => Writer::new(C_SCRIPT_EVENT).str(name).rest(payload),
+            ClientMessage::FileRequest { resource, path } => Writer::new(C_FILE_REQUEST).str(resource).str(path).done(),
         }
     }
 
@@ -293,6 +334,7 @@ impl ClientMessage {
             C_SESSION_RESTART => ClientMessage::SessionRestart,
             C_SESSION_READY => ClientMessage::SessionReady,
             C_SCRIPT_EVENT => ClientMessage::ScriptEvent { name: r.str()?, payload: r.rest() },
+            C_FILE_REQUEST => ClientMessage::FileRequest { resource: r.str()?, path: r.str()? },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -338,6 +380,14 @@ impl ServerMessage {
             ServerMessage::Reliable { seq, body } => Writer::new(S_RELIABLE).u16(*seq).rest(body),
             ServerMessage::Ack { seq } => Writer::new(S_ACK).u16(*seq).done(),
             ServerMessage::ScriptEvent { name, payload } => Writer::new(S_SCRIPT_EVENT).str(name).rest(payload),
+            ServerMessage::ResourceFile { resource, path, size, hash } => {
+                Writer::new(S_RESOURCE_FILE).str(resource).str(path).u32(*size).rest(hash)
+            }
+            ServerMessage::ResourceReady { resource } => Writer::new(S_RESOURCE_READY).str(resource).done(),
+            ServerMessage::ResourceStop { resource } => Writer::new(S_RESOURCE_STOP).str(resource).done(),
+            ServerMessage::FileChunk { resource, path, offset, data } => {
+                Writer::new(S_FILE_CHUNK).str(resource).str(path).u32(*offset).rest(data)
+            }
         }
     }
 
@@ -371,6 +421,14 @@ impl ServerMessage {
             S_RELIABLE => ServerMessage::Reliable { seq: r.u16()?, body: r.rest() },
             S_ACK => ServerMessage::Ack { seq: r.u16()? },
             S_SCRIPT_EVENT => ServerMessage::ScriptEvent { name: r.str()?, payload: r.rest() },
+            S_RESOURCE_FILE => {
+                let (resource, path, size) = (r.str()?, r.str()?, r.u32()?);
+                let hash: [u8; 32] = r.rest().try_into().map_err(|_| DecodeError::Truncated)?;
+                ServerMessage::ResourceFile { resource, path, size, hash }
+            }
+            S_RESOURCE_READY => ServerMessage::ResourceReady { resource: r.str()? },
+            S_RESOURCE_STOP => ServerMessage::ResourceStop { resource: r.str()? },
+            S_FILE_CHUNK => ServerMessage::FileChunk { resource: r.str()?, path: r.str()?, offset: r.u32()?, data: r.rest() },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -395,6 +453,7 @@ mod tests {
             ClientMessage::SessionRestart,
             ClientMessage::SessionReady,
             ClientMessage::ScriptEvent { name: "chat:message".into(), payload: b"[\"hi\",1]".to_vec() },
+            ClientMessage::FileRequest { resource: "chat".into(), path: "ui/index.html".into() },
         ] {
             assert_eq!(ClientMessage::decode(&m.encode()), Ok(m));
         }
@@ -424,6 +483,10 @@ mod tests {
             ServerMessage::Reliable { seq: 7, body: vec![4, 5] },
             ServerMessage::Ack { seq: 3 },
             ServerMessage::ScriptEvent { name: "news".into(), payload: b"{}".to_vec() },
+            ServerMessage::ResourceFile { resource: "chat".into(), path: "client.lua".into(), size: 1234, hash: [7; 32] },
+            ServerMessage::ResourceReady { resource: "chat".into() },
+            ServerMessage::ResourceStop { resource: "chat".into() },
+            ServerMessage::FileChunk { resource: "chat".into(), path: "client.lua".into(), offset: 800, data: vec![1, 2, 3] },
             ServerMessage::Tunnel { from: virtual_ip(1), from_port: 6672, to_port: 6672, payload: vec![9; 100] },
         ] {
             assert_eq!(ServerMessage::decode(&m.encode()), Ok(m));
@@ -444,5 +507,16 @@ mod tests {
         assert_eq!(client_id_of(virtual_ip(7)), Some(7));
         assert_eq!(client_id_of(Ipv4Addr::new(192, 168, 0, 7)), None);
         assert_eq!(client_id_of(Ipv4Addr::new(10, 0, 0, 255)), None);
+    }
+
+    #[test]
+    fn only_plain_relative_paths_are_safe() {
+        for good in ["client.lua", "ui/index.html", "a/b/c.js"] {
+            assert!(safe_path(good), "{good}");
+        }
+        for bad in ["", "/etc/passwd", "../x", "a/../b", "a//b", "C:/x", "a\\b", "a/.", "x.", "a/b:stream"] {
+            assert!(!safe_path(bad), "{bad}");
+        }
+        assert_eq!(file_hash(b"abc")[..4], [0xba, 0x78, 0x16, 0xbf]);
     }
 }

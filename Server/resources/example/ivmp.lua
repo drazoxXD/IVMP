@@ -5,3 +5,4 @@ description 'Shows the server scripting API'
 version '1.0.0'
 
 server_scripts { 'server.lua' }
+client_scripts { 'client.lua' }

@@ -12,7 +12,7 @@ path = "src/main.rs"
 NetProtocol = { path = "NetProtocol" }
 Sync = { path = "Sync" }
 Host = { path = "Host" }
-Scripting = { path = "Scripting" }
+IvmpScripting = { path = "Scripting" }
 igd-next = "0.15"
 
 [workspace]

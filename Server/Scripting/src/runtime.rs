@@ -9,12 +9,27 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use mlua::{Function, Lua, LuaOptions, StdLib, Thread, Value, Variadic};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Thread, Value, Variadic, VmState};
 
 use crate::manifest::{self, Manifest};
 use crate::variant::Variant;
 
 type Log = Box<dyn Fn(String)>;
+
+/// Which half of a resource this runtime runs: the server runs `server_scripts`, a client
+/// `client_scripts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Server,
+    Client,
+}
+
+/// The Lua VM instructions between two checks of the budget, and the budget one call (a thread
+/// resume, an event handler, a command) gets before it is stopped: an endless loop in a script
+/// must not freeze the server or the game.
+const HOOK_STEP: u32 = 10_000;
+const SERVER_BUDGET: u64 = 400_000_000;
+const CLIENT_BUDGET: u64 = 30_000_000;
 
 #[derive(Debug, Clone)]
 pub struct Player {
@@ -56,6 +71,12 @@ struct Resource {
 
 /// What the resources share: the other resources, the players, the log.
 pub struct World {
+    me: Weak<World>,
+    side: Side,
+    /// What is left of the current call's instruction budget.
+    budget: Cell<u64>,
+    /// `TriggerServerEvent` calls of client scripts.
+    server_events: RefCell<Vec<(String, Vec<Variant>)>>,
     dir: PathBuf,
     log: Log,
     started: Instant,
@@ -81,13 +102,38 @@ fn safe_join(base: &Path, relative: &str) -> Option<PathBuf> {
     path.components().all(|c| matches!(c, Component::Normal(_))).then(|| base.join(path))
 }
 
+/// The hook that stops a call when its instruction budget runs out. A hook belongs to one Lua
+/// thread, so every coroutine the runtime makes gets it ([`limited_thread`]).
+fn budget_hook(world: Weak<World>) -> impl Fn(&Lua, &mlua::debug::Debug) -> mlua::Result<VmState> + 'static {
+    move |_, _| {
+        let Some(world) = world.upgrade() else { return Ok(VmState::Continue) };
+        let left = world.budget.get().saturating_sub(HOOK_STEP as u64);
+        world.budget.set(left);
+        if left == 0 {
+            Err(mlua::Error::runtime("the script ran too long (an endless loop?)"))
+        } else {
+            Ok(VmState::Continue)
+        }
+    }
+}
+
+fn limited_thread(lua: &Lua, function: Function, world: Weak<World>) -> mlua::Result<Thread> {
+    let thread = lua.create_thread(function)?;
+    thread.set_hook(HookTriggers::new().every_nth_instruction(HOOK_STEP), budget_hook(world))?;
+    Ok(thread)
+}
+
 fn lua_error(message: impl Into<String>) -> mlua::Error {
     mlua::Error::runtime(message.into())
 }
 
 impl World {
-    pub fn new(dir: PathBuf, log: Log) -> Rc<World> {
-        Rc::new(World {
+    pub fn new(side: Side, dir: PathBuf, log: Log) -> Rc<World> {
+        Rc::new_cyclic(|me| World {
+            me: me.clone(),
+            side,
+            budget: Cell::new(0),
+            server_events: RefCell::new(Vec::new()),
             dir,
             log,
             started: Instant::now(),
@@ -100,6 +146,20 @@ impl World {
             kick_reason: RefCell::new(String::new()),
             starting: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Gives the call about to run a fresh instruction budget.
+    fn arm(&self) {
+        self.budget.set(if self.side == Side::Server { SERVER_BUDGET } else { CLIENT_BUDGET });
+    }
+
+    pub fn side(&self) -> Side {
+        self.side
+    }
+
+    /// What client scripts asked the server for since the last call.
+    pub fn take_server_events(&self) -> Vec<(String, Vec<Variant>)> {
+        std::mem::take(&mut *self.server_events.borrow_mut())
     }
 
     fn say(&self, line: String) {
@@ -142,6 +202,7 @@ impl World {
                 let converted: Result<Vec<Value>, _> = args.iter().map(|a| a.to_lua(&resource.lua)).collect();
                 let Ok(converted) = converted else { continue };
                 let _ = resource.lua.globals().set("source", source.map_or(Value::Nil, |s| Value::Integer(s as _)));
+                self.arm();
                 if let Err(e) = handler.call::<()>(Variadic::from(converted)) {
                     self.say(format!("[{}] error in the handler of '{event}': {e}", resource.name));
                 }
@@ -188,19 +249,22 @@ impl World {
         let state = Rc::new(RefCell::new(State::default()));
         let lua = Lua::new_with(StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::COROUTINE | StdLib::UTF8, LuaOptions::default())
             .map_err(|e| e.to_string())?;
+        lua.set_hook(HookTriggers::new().every_nth_instruction(HOOK_STEP), budget_hook(self.me.clone())).map_err(|e| e.to_string())?;
         install_api(&lua, self, name, &dir, &state).map_err(|e| format!("resource '{name}': {e}"))?;
         let resource = Rc::new(Resource { name: name.to_string(), dir, manifest, lua, state });
         self.resources.borrow_mut().insert(name.to_string(), resource.clone());
         self.order.borrow_mut().push(name.to_string());
-        for script in resource.manifest.server_scripts.clone() {
+        let scripts = if self.side == Side::Server { resource.manifest.server_scripts.clone() } else { resource.manifest.client_scripts.clone() };
+        for script in scripts {
             if let Err(e) = resource.run_script(self, &script) {
                 self.say(format!("[{name}] {script}: {e}"));
                 // The resource stays loaded with what ran, like FiveM; the error is in the log.
             }
         }
         self.say(format!("started resource {name}"));
+        let kind = if self.side == Side::Server { "Server" } else { "Client" };
         self.dispatch("onResourceStart", &[Variant::Str(name.to_string())], None, None);
-        self.dispatch("onServerResourceStart", &[Variant::Str(name.to_string())], None, None);
+        self.dispatch(&format!("on{kind}ResourceStart"), &[Variant::Str(name.to_string())], None, None);
         Ok(())
     }
 
@@ -218,8 +282,9 @@ impl World {
         if !dependents.is_empty() {
             return Err(format!("stop {} first, they depend on '{name}'", dependents.join(", ")));
         }
+        let kind = if self.side == Side::Server { "Server" } else { "Client" };
         self.dispatch("onResourceStop", &[Variant::Str(name.to_string())], None, None);
-        self.dispatch("onServerResourceStop", &[Variant::Str(name.to_string())], None, None);
+        self.dispatch(&format!("on{kind}ResourceStop"), &[Variant::Str(name.to_string())], None, None);
         self.resources.borrow_mut().remove(name);
         self.order.borrow_mut().retain(|n| n != name);
         self.say(format!("stopped resource {name}"));
@@ -246,6 +311,7 @@ impl World {
             let raw = resource.lua.create_string(line).map(Value::String);
             match (table, raw) {
                 (Ok(table), Ok(raw)) => {
+                    self.arm();
                     if let Err(e) = handler.call::<()>((source, table, raw)) {
                         self.say(format!("[{}] error in the command '{name}': {e}", resource.name));
                     }
@@ -309,13 +375,14 @@ impl Resource {
         let path = safe_join(&self.dir, relative).ok_or_else(|| format!("'{relative}' is not a file of this resource"))?;
         let source = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {relative}: {e}"))?;
         let function = self.lua.load(source).set_name(format!("@{}/{relative}", self.name)).into_function().map_err(|e| e.to_string())?;
-        let thread = self.lua.create_thread(function).map_err(|e| e.to_string())?;
+        let thread = limited_thread(&self.lua, function, world.me.clone()).map_err(|e| e.to_string())?;
         self.resume(world, Th { thread, wake: Instant::now() }, Instant::now());
         Ok(())
     }
 
     /// Resumes a thread once; if it yields, it goes back to the scheduler for later.
     fn resume(&self, world: &World, th: Th, now: Instant) {
+        world.arm();
         match th.thread.resume::<Value>(()) {
             Ok(value) => {
                 if th.thread.is_resumable() {
@@ -471,10 +538,11 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
     // threads: Wait yields to the scheduler (see the prelude)
     {
         let state = state.clone();
+        let thread_world = weak.clone();
         globals.set(
             "CreateThread",
             lua.create_function(move |lua, function: Function| {
-                let thread = lua.create_thread(function)?;
+                let thread = limited_thread(lua, function, thread_world.clone())?;
                 state.borrow_mut().threads.push(Th { thread, wake: Instant::now() });
                 Ok(())
             })?,
@@ -599,6 +667,29 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
                 let value = if matches!(value, Value::Nil) { Value::Boolean(true) } else { value };
                 cache.borrow_mut().insert(module, value.clone());
                 Ok(value)
+            })?,
+        )?;
+    }
+
+    // The halves of the API that belong to one side only.
+    if world.side == Side::Client {
+        for name in ["DropPlayer", "TriggerClientEvent", "SetKickReason"] {
+            globals.set(name, Value::Nil)?;
+        }
+        let weak2 = weak.clone();
+        globals.set(
+            "TriggerServerEvent",
+            lua.create_function(move |_, args: Variadic<Value>| {
+                let mut args = args.into_iter();
+                let Some(Value::String(event)) = args.next() else {
+                    return Err(lua_error("TriggerServerEvent(name, ...)"));
+                };
+                let variants: Result<Vec<Variant>, String> = args.map(|v| Variant::from_lua(&v)).collect();
+                let variants = variants.map_err(|e| lua_error(format!("TriggerServerEvent: {e}")))?;
+                if let Some(world) = weak2.upgrade() {
+                    world.server_events.borrow_mut().push((event.to_string_lossy().to_string(), variants));
+                }
+                Ok(())
             })?,
         )?;
     }

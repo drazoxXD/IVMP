@@ -347,6 +347,7 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                     // A new join starts new reliable streams (the server's side is fresh too).
                     *RELIABLE_OUT.lock().unwrap() = Some(ReliableOut::default());
                     *RELIABLE_IN.lock().unwrap() = Some(ReliableIn::default());
+                    crate::resources::reset();
                 }
                 OUR_ID.store(id, Ordering::SeqCst);
                 HOST_ID.store(host, Ordering::SeqCst);
@@ -419,6 +420,10 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 events.push_back((name, json));
             }
+            ServerMessage::ResourceFile { resource, path, size, hash } => crate::resources::on_file(&resource, &path, size, hash),
+            ServerMessage::ResourceReady { resource } => crate::resources::on_ready(&resource),
+            ServerMessage::ResourceStop { resource } => crate::resources::on_stop(&resource),
+            ServerMessage::FileChunk { resource, path, offset, data } => crate::resources::on_chunk(&resource, &path, offset, &data),
             // Handled above; a reliable message inside a reliable one is ignored.
             ServerMessage::Reliable { .. } | ServerMessage::Ack { .. } => {}
         }

@@ -19,6 +19,7 @@ mod web;
 mod focus;
 mod hang;
 mod mods;
+mod scripts;
 mod window;
 
 pub(crate) use ivmp_core::{log, memory};
@@ -114,6 +115,7 @@ fn on_attach() {
             ivmp_networking::synctrace::install();
             ivmp_networking::netobjects::install();
             ivmp_networking::crypt::install();
+            scripts::init();
             net::start(&config.server, &config.nickname);
         }
         boot::hooks_installed();

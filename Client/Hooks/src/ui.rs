@@ -416,7 +416,7 @@ static COMPLETION_OUTPUT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Every command the console knows, for Tab completion and suggestions.
 fn command_names() -> Vec<&'static str> {
-    let mut names = vec!["help", "clear", "echo", "overlay", "status", "devtools", "quit", "triggerserver"];
+    let mut names = vec!["help", "clear", "echo", "overlay", "status", "devtools", "quit", "triggerserver", "resources"];
     names.extend(WIP_TOOLS.iter().map(|(_, name, _)| *name));
     names.sort_unstable();
     names
@@ -614,6 +614,8 @@ impl Ui {
             _ if WIP_TOOLS.iter().any(|(_, n, _)| n.eq_ignore_ascii_case(&name)) => {
                 self.print(ERROR_COLOR, format!("{name} is WIP: not implemented yet"));
             }
+            "resources" => self.print(OUTPUT_COLOR, format!("{} resource(s) running on this client", crate::scripts::running())),
+            _ if crate::scripts::queue_command(command) => {}
             _ => self.print(ERROR_COLOR, format!("unknown command '{name}', try help")),
         }
     }

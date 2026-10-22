@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use ivmp_host::session::HostSession;
 use ivmp_scripting::Scripting;
 use ivmp_sync::{events::EventLog, ids, nodes, registry::Registry};
+use crate::resources;
 use NetProtocol::reliable::Accept;
 use NetProtocol::{ClientId, ClientMessage, MAX_SCRIPT_PAYLOAD, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};
 
@@ -49,10 +50,17 @@ pub struct Server {
     scripting: Scripting,
     /// Script events each client triggered in the current second (a flood is dropped).
     script_rate: HashMap<ClientId, (Instant, u32)>,
+    /// What clients download of each running resource that has client files.
+    offers: HashMap<String, Vec<resources::FileEntry>>,
+    /// Files on their way to each client.
+    transfers: HashMap<ClientId, resources::Queue>,
     /// What clients host and join (server.cfg `gamemode`, `slots`).
     gamemode: i32,
     slots: u8,
 }
+
+/// How many unacknowledged messages a client may have outstanding while files are sent to it.
+const TRANSFER_WINDOW: usize = 24;
 
 /// Script events one player may trigger per second.
 const SCRIPT_EVENTS_PER_SECOND: u32 = 100;
@@ -98,6 +106,8 @@ impl Server {
         Ok(Server {
             scripting,
             script_rate: HashMap::new(),
+            offers: HashMap::new(),
+            transfers: HashMap::new(),
             socket,
             lobby: Lobby { preset_ids: config.ids.clone(), ..Lobby::default() },
             capture,
@@ -114,6 +124,8 @@ impl Server {
     }
 
     pub fn run(mut self) -> std::io::Result<()> {
+        // The resources the config started have files for clients too.
+        self.sync_resources(None);
         let mut buf = [0u8; 2048];
         loop {
             match self.socket.recv_from(&mut buf) {
@@ -130,6 +142,7 @@ impl Server {
             self.resend_reliable();
             self.scripting.tick();
             self.script_requests();
+            self.pump_transfers();
             for id in self.lobby.timed_out() {
                 self.remove(id, "timed out");
             }
@@ -202,6 +215,113 @@ impl Server {
         }
     }
 
+    /// Tells every client what changed among the running resources: resources that stopped, and
+    /// new ones (or `restarted`) with their files.
+    fn sync_resources(&mut self, restarted: Option<&str>) {
+        let running = self.scripting.running();
+        let gone: Vec<String> = self.offers.keys().filter(|name| !running.contains(name)).cloned().collect();
+        for name in gone {
+            self.offers.remove(&name);
+            self.reliable_broadcast(None, &ServerMessage::ResourceStop { resource: name });
+        }
+        for name in running {
+            let is_new = !self.offers.contains_key(&name);
+            let restart = restarted == Some(name.as_str());
+            if !is_new && !restart {
+                continue;
+            }
+            let Some(manifest) = self.scripting.manifest_of(&name) else { continue };
+            match resources::offer(&self.scripting.resource_dir(&name), &manifest) {
+                Ok(Some(files)) => {
+                    if restart {
+                        self.reliable_broadcast(None, &ServerMessage::ResourceStop { resource: name.clone() });
+                    }
+                    self.offers.insert(name.clone(), files);
+                    self.announce(&name, None);
+                }
+                Ok(None) => {
+                    if restart {
+                        self.offers.remove(&name);
+                        self.reliable_broadcast(None, &ServerMessage::ResourceStop { resource: name.clone() });
+                    }
+                }
+                Err(e) => say!("resource {name}: nothing is sent to clients: {e}"),
+            }
+        }
+    }
+
+    /// Announces a resource's files to one client, or to everyone.
+    fn announce(&mut self, name: &str, to: Option<ClientId>) {
+        let Some(files) = self.offers.get(name).cloned() else { return };
+        let mut messages: Vec<ServerMessage> = files
+            .into_iter()
+            .map(|f| ServerMessage::ResourceFile { resource: name.to_string(), path: f.path, size: f.size, hash: f.hash })
+            .collect();
+        messages.push(ServerMessage::ResourceReady { resource: name.to_string() });
+        for message in messages {
+            match to {
+                Some(id) => self.reliable(id, &message),
+                None => self.reliable_broadcast(None, &message),
+            }
+        }
+    }
+
+    /// Everything running that has client files, for a client that just joined.
+    fn announce_all(&mut self, id: ClientId) {
+        let names: Vec<String> = self.offers.keys().cloned().collect();
+        for name in names {
+            self.announce(&name, Some(id));
+        }
+    }
+
+    /// A client asks for a file it was told about.
+    fn file_request(&mut self, id: ClientId, resource: String, path: String) {
+        let Some(entry) = self.offers.get(&resource).and_then(|files| files.iter().find(|f| f.path == path)).cloned() else {
+            say!("player {id} asked for {resource}/{path}, which was not offered");
+            return;
+        };
+        let file = self.scripting.resource_dir(&resource).join(&path);
+        match std::fs::read(&file) {
+            Ok(data) if NetProtocol::file_hash(&data) == entry.hash => {
+                let queue = self.transfers.entry(id).or_default();
+                // The same file asked for twice is sent once.
+                if !queue.iter().any(|t| t.resource == resource && t.path == path) {
+                    queue.push_back(resources::Transfer::new(resource, path, data));
+                }
+            }
+            Ok(_) => say!("{resource}/{path} changed on disk after it was announced; restart the resource to send the new version"),
+            Err(e) => say!("cannot read {resource}/{path}: {e}"),
+        }
+    }
+
+    /// Sends file chunks, as many as each client's reliable window has room for.
+    fn pump_transfers(&mut self) {
+        let ids: Vec<ClientId> = self.transfers.keys().copied().collect();
+        for id in ids {
+            loop {
+                let Some(client) = self.lobby.clients.get(&id) else {
+                    self.transfers.remove(&id);
+                    break;
+                };
+                if client.out.pending() >= TRANSFER_WINDOW {
+                    break;
+                }
+                let Some(queue) = self.transfers.get_mut(&id) else { break };
+                let Some(transfer) = queue.front_mut() else {
+                    self.transfers.remove(&id);
+                    break;
+                };
+                let (resource, path) = (transfer.resource.clone(), transfer.path.clone());
+                match transfer.next_chunk() {
+                    Some((offset, data)) => self.reliable(id, &ServerMessage::FileChunk { resource, path, offset, data }),
+                    None => {
+                        queue.pop_front();
+                    }
+                }
+            }
+        }
+    }
+
     /// `TriggerServerEvent` from a client: the handlers a resource registered with RegisterNetEvent.
     fn script_event(&mut self, id: ClientId, name: &str, payload: &[u8]) {
         let now = Instant::now();
@@ -259,6 +379,7 @@ impl Server {
         match (message, sender) {
             (ClientMessage::Hello { version, nickname }, existing) => self.hello(from, version, &nickname, existing),
             (ClientMessage::ScriptEvent { name, payload }, Some(id)) => self.script_event(id, &name, &payload),
+            (ClientMessage::FileRequest { resource, path }, Some(id)) => self.file_request(id, resource, path),
             (ClientMessage::Tunnel { from_port, to, to_port, payload }, Some(id)) => {
                 if let Some(client) = self.lobby.clients.get(&id) {
                     client.up.set(client.up.get().wrapping_add(1));
@@ -395,6 +516,7 @@ impl Server {
                     say!("{nickname} joined from {from} as {} (id {id}), object ids {:?}", virtual_ip(id), ids::block(id));
                     self.scripting.player_joined(id as u32, nickname);
                     self.reliable_broadcast(Some(id), &ServerMessage::PeerJoined { id, nickname: nickname.to_string() });
+                    self.announce_all(id);
                     let others: Vec<(ClientId, String)> =
                         self.lobby.clients.iter().filter(|(other, _)| **other != id).map(|(other, c)| (*other, c.nickname.clone())).collect();
                     for (other, other_nickname) in others {
@@ -523,6 +645,7 @@ impl Server {
                 if let Err(e) = result {
                     say!("{action} {name}: {e}");
                 }
+                self.sync_resources(if action == "restart" { Some(name.as_str()) } else { None });
             }
             Command::Other(line) => {
                 if !self.scripting.run_command(0, &line) {
@@ -534,6 +657,7 @@ impl Server {
 
     fn remove(&mut self, id: ClientId, why: &str) {
         self.script_rate.remove(&id);
+        self.transfers.remove(&id);
         if let Some(host) = self.host.as_mut() {
             host.remove(id);
         }

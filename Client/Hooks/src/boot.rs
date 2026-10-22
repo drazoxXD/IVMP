@@ -702,6 +702,7 @@ fn menu_diag() {
 
 extern "C" fn game_process() {
     menu_diag();
+    crate::scripts::tick();
     crate::hang::heartbeat();
     crate::focus::hook_input();
     ensure_player();

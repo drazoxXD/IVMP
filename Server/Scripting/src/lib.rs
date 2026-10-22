@@ -5,7 +5,7 @@ pub mod manifest;
 mod runtime;
 pub mod variant;
 
-pub use runtime::{ClientEvent, Player};
+pub use runtime::{ClientEvent, Player, Side};
 pub use variant::Variant;
 
 use std::path::PathBuf;
@@ -21,7 +21,24 @@ pub struct Scripting {
 impl Scripting {
     /// `dir` holds the resource folders; `log` receives every line scripts print or fail with.
     pub fn new(dir: PathBuf, log: impl Fn(String) + 'static) -> Scripting {
-        Scripting { world: World::new(dir, Box::new(log)) }
+        Scripting { world: World::new(Side::Server, dir, Box::new(log)) }
+    }
+
+    /// The client's runtime: `dir` holds the downloaded resources, it runs their `client_scripts`.
+    pub fn client(dir: PathBuf, log: impl Fn(String) + 'static) -> Scripting {
+        Scripting { world: World::new(Side::Client, dir, Box::new(log)) }
+    }
+
+    /// What client scripts asked the server for (`TriggerServerEvent`), as (name, JSON arguments).
+    pub fn take_server_events(&self) -> Vec<(String, String)> {
+        self.world.take_server_events().into_iter().map(|(name, args)| (name, args_to_json(&args))).collect()
+    }
+
+    /// An event the server triggered on this client: the arguments are a JSON array.
+    pub fn client_event_json(&self, name: &str, json: &[u8]) -> Result<(), String> {
+        let args = args_from_json(json)?;
+        self.world.dispatch(name, &args, None, None);
+        Ok(())
     }
 
     pub fn start(&self, name: &str) -> Result<(), String> {
@@ -61,6 +78,11 @@ impl Scripting {
             .collect();
         out.sort();
         out
+    }
+
+    /// The folder of a resource.
+    pub fn resource_dir(&self, name: &str) -> PathBuf {
+        self.world.resource_dir(name)
     }
 
     pub fn manifest_of(&self, name: &str) -> Option<manifest::Manifest> {

@@ -17,6 +17,7 @@ Shared = { path = "../Shared" }
 Core = { path = "../Core" }
 NativeInvoker = { path = "../NativeInvoker" }
 Networking = { path = "../Networking" }
+IvmpScripting = { path = "../../Server/Scripting" }
 imgui = "0.12"
 
 [dependencies.windows]
