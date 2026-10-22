@@ -14,7 +14,6 @@ mod enginelog;
 mod events;
 mod imgui_dx9;
 mod render;
-mod socialclub;
 mod ui;
 mod web;
 mod focus;
@@ -84,8 +83,6 @@ fn on_attach() {
             log!("game code never finished unpacking, no patches applied");
             return;
         }
-        // No Social Club (no sign-in, no window, our own nickname): before the game starts it.
-        socialclub::install();
         // Mods first, so FusionFix and the file overlay are in before the game loads its data.
         // The second client (-cl2) runs without mods.
         if !instance::second_client() {
