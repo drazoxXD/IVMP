@@ -160,54 +160,6 @@ fn module_of(address: usize) -> String {
     String::from_utf16_lossy(&name[..len])
 }
 
-/// Overwrites the start of the function at `target` with a jump to `hook` and returns the address
-/// of a stub that runs the original. Only for the standard `mov edi, edi; push ebp; mov ebp, esp`
-/// prologue (exactly 5 bytes, so the copy needs no instruction decoding).
-fn inline_hook(target: usize, hook: usize) -> Option<usize> {
-    use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
-    let mut start = [0u8; 8];
-    if !memory::read(target, &mut start) {
-        return None;
-    }
-    let stub = unsafe { VirtualAlloc(None, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
-    if stub == 0 {
-        return None;
-    }
-    let mut code = [0u8; 16];
-    // How many bytes the jump to the hook overwrites (whole instructions only).
-    let length;
-    if start[0] == 0xE9 {
-        // Somebody else (the Steam overlay, FusionFix, ...) already jumps from here: chain to
-        // wherever that jump goes.
-        length = 5;
-        let destination = (target + 5).wrapping_add(u32::from_le_bytes([start[1], start[2], start[3], start[4]]) as usize);
-        log!("render: {target:#x} already jumps to {destination:#x} ({}), chaining to it", module_of(destination));
-        code[0] = 0xE9;
-        code[1..5].copy_from_slice(&destination.wrapping_sub(stub + 5).to_le_bytes());
-    } else if start[..5] == [0x8B, 0xFF, 0x55, 0x8B, 0xEC] {
-        // mov edi, edi; push ebp; mov ebp, esp
-        length = 5;
-        code[..5].copy_from_slice(&start[..5]);
-    } else if start[..3] == [0x6A, 0x14, 0xB8] {
-        // push 14h; mov eax, imm32 (an SEH prologue, no relative operands)
-        length = 7;
-        code[..7].copy_from_slice(&start[..7]);
-    } else {
-        log!("render: unexpected prologue at {target:#x}: {start:02x?}");
-        return None;
-    }
-    if start[0] != 0xE9 {
-        code[length] = 0xE9;
-        code[length + 1..length + 5].copy_from_slice(&(target + length).wrapping_sub(stub + length + 5).to_le_bytes());
-    }
-    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len()) };
-    let mut patch = [0x90u8; 7];
-    patch[0] = 0xE9;
-    patch[1..5].copy_from_slice(&hook.wrapping_sub(target + 5).to_le_bytes());
-    unsafe { memory::patch(target, &patch[..length]) }.ok()?;
-    Some(stub)
-}
-
 /// Hooks Present and Reset. Call once, after the game has unpacked.
 pub fn install() {
     // Only EndScene is hooked in d3d9's code (to learn the game's device); Present and Reset are
@@ -219,10 +171,10 @@ pub fn install() {
     REAL_RESET.store(reset_target, Ordering::SeqCst);
     REAL_PRESENT.store(present_target, Ordering::SeqCst);
     REAL_CHAIN_PRESENT.store(chain_present_target, Ordering::SeqCst);
-    match inline_hook(end_scene_target, end_scene as usize) {
-        Some(stub) => ORIGINAL_END_SCENE.store(stub, Ordering::SeqCst),
-        None => {
-            log!("render: could not hook EndScene at {end_scene_target:#x}");
+    match unsafe { ivmp_core::hook::install(end_scene_target, end_scene as usize) } {
+        Ok(hook) => ORIGINAL_END_SCENE.store(hook.trampoline, Ordering::SeqCst),
+        Err(e) => {
+            log!("render: could not hook EndScene at {end_scene_target:#x}: {e}");
             return;
         }
     }
