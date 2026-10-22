@@ -37,7 +37,10 @@ const size_t kHeader = 16;
 volatile uint32_t* g_frame_header = nullptr;
 uint8_t* g_frame_data = nullptr;
 
-HANDLE g_pipe = INVALID_HANDLE_VALUE;
+// Two pipes, one per direction: a synchronous pipe handle with a pending read blocks writes on the
+// same handle, which hung the game.
+HANDLE g_pipe = INVALID_HANDLE_VALUE;     // to the game
+HANDLE g_pipe_in = INVALID_HANDLE_VALUE;  // from the game
 std::mutex g_pipe_lock;
 
 std::atomic<int> g_width{1280};
@@ -315,9 +318,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   g_frame_header = (volatile uint32_t*)view;
   g_frame_data = view + kHeader;
 
-  g_pipe = CreateNamedPipeW(Widen("\\\\.\\pipe\\" + pipe_name).c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 1 << 16, 1 << 16, 0, nullptr);
-  if (g_pipe == INVALID_HANDLE_VALUE) return 6;
+  g_pipe = CreateNamedPipeW(Widen("\\\\.\\pipe\\" + pipe_name + "_out").c_str(), PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 1 << 16, 1 << 16, 0, nullptr);
+  g_pipe_in = CreateNamedPipeW(Widen("\\\\.\\pipe\\" + pipe_name + "_in").c_str(), PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 1 << 16, 1 << 16, 0, nullptr);
+  if (g_pipe == INVALID_HANDLE_VALUE || g_pipe_in == INVALID_HANDLE_VALUE) return 6;
+  // The game opens _out first, then _in.
   if (!ConnectNamedPipe(g_pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) return 7;
+  if (!ConnectNamedPipe(g_pipe_in, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) return 7;
   ivmp::g_log = LogToGame;
 
   std::string folder = ExeDir();
@@ -361,9 +367,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   // The game's messages, until it closes the pipe.
   for (;;) {
     uint32_t length = 0;
-    if (!ReadExactly(g_pipe, &length, 4) || length == 0 || length > (1 << 20)) break;
+    if (!ReadExactly(g_pipe_in, &length, 4) || length == 0 || length > (1 << 20)) break;
     std::string body(length, 0);
-    if (!ReadExactly(g_pipe, body.data(), length)) break;
+    if (!ReadExactly(g_pipe_in, body.data(), length)) break;
     Handle((uint8_t)body[0], body.substr(1));
   }
   CefShutdown();

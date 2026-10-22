@@ -116,17 +116,30 @@ fn start() {
 
     // The process creates the pipe and the mapping; wait for them.
     let started = Instant::now();
-    let pipe = loop {
-        match OpenOptions::new().read(true).write(true).open(format!(r"\\.\pipe\{pipe_name}")) {
-            Ok(file) => break file,
-            Err(_) if started.elapsed() < Duration::from_secs(20) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    return fail(&format!("IVMP_Web.exe exited early ({status})"));
+    // Two pipes, one per direction (a synchronous handle with a pending read blocks writes).
+    let mut open = |suffix: &str, write: bool| -> Result<File, String> {
+        let name = format!(r"\\.\pipe\{pipe_name}{suffix}");
+        let started = Instant::now();
+        loop {
+            match OpenOptions::new().read(!write).write(write).open(&name) {
+                Ok(file) => return Ok(file),
+                Err(_) if started.elapsed() < Duration::from_secs(20) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return Err(format!("IVMP_Web.exe exited early ({status})"));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                Err(e) => return Err(format!("no pipe {suffix} from IVMP_Web.exe: {e}")),
             }
-            Err(e) => return fail(&format!("no pipe from IVMP_Web.exe: {e}")),
         }
+    };
+    let reader = match open("_out", false) {
+        Ok(file) => file,
+        Err(why) => return fail(&why),
+    };
+    let pipe = match open("_in", true) {
+        Ok(file) => file,
+        Err(why) => return fail(&why),
     };
     let mapping = match unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, &HSTRING::from(frame_name.as_str())) } {
         Ok(handle) => handle,
@@ -136,10 +149,6 @@ fn start() {
     if view.Value.is_null() {
         return fail("could not map the frame");
     }
-    let reader = match pipe.try_clone() {
-        Ok(reader) => reader,
-        Err(e) => return fail(&format!("pipe: {e}")),
-    };
     let _ = HOST.set(Host { pipe: Mutex::new(pipe), frame: Frame { base: view.Value as *const u8 } });
     std::thread::spawn(move || read_messages(reader));
     // Hidden until shown (the first F2 asked for it, so show it now).
