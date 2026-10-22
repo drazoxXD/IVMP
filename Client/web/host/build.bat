@@ -1,6 +1,6 @@
 @echo off
-rem Builds the CEF part of the client 32-bit: IVMP_Web.dll loaded by the game and IVMP_Web.exe
-rem the helper processes, and assembles the separate "cef" folder that sits next to
+rem Builds the CEF part of the client 32-bit: IVMP_Web.exe, CEF in its own process that is also
+rem the helper process for CEF, and assembles the separate cef folder next to IVMP_Client.dll.
 rem IVMP_Client.dll. Needs the CEF windows32 minimal distribution under Client\web\cef.
 rem Output: Client\web\host\out\cef
 setlocal
@@ -20,8 +20,7 @@ rem The wrapper library is shared with the spike build.
 set "WRAP=%HERE%..\spike\obj\libcef_dll_wrapper.lib"
 if not exist "%WRAP%" echo build the spike first for libcef_dll_wrapper.lib & exit /b 1
 
-cl %FLAGS% /Fo"%OBJ%\\" "%HERE%web_host.cc" /LD /Fe"%OUT%\IVMP_Web.dll" /link /nologo "%WRAP%" "%CEF%\Release\libcef.lib" user32.lib gdi32.lib shell32.lib advapi32.lib ole32.lib || exit /b 1
-cl %FLAGS% /Fo"%OBJ%\\" "%HERE%helper.cc" /Fe"%OUT%\IVMP_Web.exe" /link /nologo /SUBSYSTEM:WINDOWS "%WRAP%" "%CEF%\Release\libcef.lib" user32.lib gdi32.lib shell32.lib advapi32.lib ole32.lib || exit /b 1
+cl %FLAGS% /Fo"%OBJ%\\" "%HERE%host_main.cc" /Fe"%OUT%\IVMP_Web.exe" /link /nologo /SUBSYSTEM:WINDOWS "%WRAP%" "%CEF%\Release\libcef.lib" user32.lib gdi32.lib shell32.lib advapi32.lib ole32.lib || exit /b 1
 
 rem CEF's runtime what the DLL and helper need, nothing else and the pages.
 xcopy /Y /Q /E "%CEF%\Release\*" "%OUT%\" >nul
