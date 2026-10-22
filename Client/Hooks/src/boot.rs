@@ -178,12 +178,21 @@ const GAME_MODE_REQUEST_PATTERN: &str = "8B 44 24 04 A3 ?? ?? ?? ?? C6 05 ?? ?? 
 static GAME_MODE_VAR: AtomicUsize = AtomicUsize::new(0);
 static GAME_MODE_PENDING: AtomicUsize = AtomicUsize::new(0);
 
-/// GameMode_Request, filtered: the game stays in network mode (a request for single player, 0,
-/// is ignored), but network requests go through. Changing the game type in the lobby stores the
-/// new match settings (0x47B990) and requests the network game again (native 0x1BC5050E ->
-/// 0xBDC960 -> GameMode_Request(1)) so the session reloads with them; ignoring every request
-/// left the host on the loading screen for good.
+/// GameMode_Request, filtered: the game stays in network mode, network requests go through.
+/// Changing the game type in the lobby stores the new match settings (0x47B990) and requests the
+/// network game again (native 0x1BC5050E -> 0xBDC960 -> GameMode_Request(1)) so the session
+/// reloads with them; ignoring every request left the host on the loading screen for good.
+/// Leaving the session (after a race, or "Leave" in the lobby) asks for single player (0):
+/// ignoring that left the host on a loading screen that never ended too. In a lobby game
+/// (`gamemode = -1`) it becomes a network reload: a fresh lobby, which the others follow.
+/// Otherwise it is ignored (nothing to go back to).
 extern "C" fn game_mode_request(mode: i32) {
+    let mode = if mode == 0 && ivmp_networking::net::lobby_mode() {
+        log!("boot: the game left its session (asked for single player): loading the network game again for a fresh lobby");
+        1
+    } else {
+        mode
+    };
     if mode == 0 {
         log!("boot: ignored a request for single player, staying in network mode");
         return;

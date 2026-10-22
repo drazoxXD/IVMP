@@ -258,3 +258,9 @@ admission; an earlier guess, the reservation table at 0x19392E0, was always empt
 resets the stamps of slots without a CPlayerInfo whenever we host a freshly loaded session
 (`host: player slot stamps [...] -> [...]`) and logs the stamps in the players line, so the first
 joiner gets slot 31 again, which is what the joiner's player uses (boot.rs `player_slot`).
+Thirteenth test: after a race the host went lobby (state 8) -> left (state 0) and sat on a loading
+screen for good: leaving a session asks GameMode_Request(0) (single player) and IVMP's filter ignored
+it. In a lobby game (`gamemode = -1`) a request for single player now becomes the network reload
+(`boot.rs game_mode_request`): the host gets a fresh lobby and the joiners follow it (SessionRestart /
+SessionReady); a joiner that leaves its lobby reloads and joins the host again. Outside lobby mode
+single player requests are still ignored.
