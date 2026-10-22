@@ -49,7 +49,7 @@ impl Default for LaunchConfig {
             nickname: "Player".into(),
             server: "127.0.0.1:9999".into(),
             direct_online: true,
-            network_test: false,
+            network_test: true,
             game_path: String::new(),
             window_mode: "windowed".into(),
             width: 1280,

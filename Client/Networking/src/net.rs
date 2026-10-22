@@ -228,9 +228,23 @@ pub fn start(server: &str, nickname: &str) {
     });
 }
 
+/// The port a server listens on unless its address says otherwise.
+const DEFAULT_PORT: u16 = 9999;
+
+/// `host` or `host:port` to something `to_socket_addrs` takes: no port means the default one.
+fn with_port(server: &str) -> String {
+    let server = server.trim();
+    if server.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>().is_ok()) {
+        server.to_string()
+    } else {
+        format!("{server}:{DEFAULT_PORT}")
+    }
+}
+
 fn run(server: &str, nickname: &str) -> std::io::Result<()> {
-    let address = server
-        .to_socket_addrs()?
+    let address = with_port(server)
+        .to_socket_addrs()
+        .map_err(|e| std::io::Error::other(format!("{e} (write the server as host:port, e.g. play.example.com:25568)")))?
         .find(|a| a.is_ipv4())
         .ok_or_else(|| std::io::Error::other(format!("no IPv4 address for {server}")))?;
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;

@@ -138,6 +138,8 @@ impl Launcher {
             server: self.server.text().trim().to_string(),
             // IVMP always boots straight into online (no option for the story mode boot).
             direct_online: true,
+            // IVMP is the network game: always on, whatever an older ivmp.json says.
+            network_test: true,
             // Keep settings the launcher has no UI for.
             ..LaunchConfig::load(&exe_dir(), second_client())
         };
