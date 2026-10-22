@@ -2,12 +2,12 @@
 //! overlay (FPS, ping, network, client performance). `render.rs` calls `frame` before every
 //! Present; `input` feeds it the window messages the game would otherwise get.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use imgui::{Condition, Context, ItemHoveredFlags, Key, MouseButton, StyleColor, TreeNodeFlags, WindowFlags};
+use imgui::{Condition, HistoryDirection, InputTextCallback, InputTextCallbackHandler, TextCallbackData, Context, ItemHoveredFlags, Key, MouseButton, StyleColor, TreeNodeFlags, WindowFlags};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct3D9::*;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -207,12 +207,99 @@ fn tools_panel(ui: &imgui::Ui) {
 struct Line {
     text: String,
     color: [f32; 4],
+    /// The log channel (the word before the first colon of a log line), empty for console lines.
+    channel: String,
+}
+
+/// "net: connecting" -> "net".
+fn channel_of(text: &str) -> String {
+    match text.split_once(':') {
+        Some((channel, _)) if !channel.is_empty() && channel.len() <= 16 && !channel.contains(' ') => channel.to_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// A stable muted color per channel, red for failures.
+fn log_color(channel: &str, text: &str) -> [f32; 4] {
+    let lower = text.to_lowercase();
+    if lower.contains("failed") || lower.contains("error") || lower.contains("could not") || lower.contains("crash") {
+        return ERROR_LOG_COLOR;
+    }
+    const PALETTE: [[f32; 4]; 7] = [
+        [0.55, 0.78, 1.0, 1.0],
+        [0.6, 0.9, 0.6, 1.0],
+        [0.95, 0.8, 0.5, 1.0],
+        [0.85, 0.65, 0.95, 1.0],
+        [0.5, 0.9, 0.9, 1.0],
+        [0.95, 0.65, 0.7, 1.0],
+        [0.8, 0.8, 0.55, 1.0],
+    ];
+    if channel.is_empty() {
+        return LOG_COLOR;
+    }
+    let hash = channel.bytes().fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
+    PALETTE[hash % PALETTE.len()]
+}
+
+/// Every command the console knows, for Tab completion and suggestions.
+fn command_names() -> Vec<&'static str> {
+    let mut names = vec!["help", "clear", "echo", "overlay", "status"];
+    names.extend(WIP_TOOLS.iter().map(|(_, name, _)| *name));
+    names.sort_unstable();
+    names
+}
+
+/// History (Up / Down) and Tab completion for the command line.
+struct CommandLine<'a> {
+    history: &'a [String],
+    position: &'a mut Option<usize>,
+}
+
+impl InputTextCallbackHandler for CommandLine<'_> {
+    fn on_history(&mut self, direction: HistoryDirection, mut data: TextCallbackData) {
+        if self.history.is_empty() {
+            return;
+        }
+        let last = self.history.len() - 1;
+        let next = match (direction, *self.position) {
+            (HistoryDirection::Up, None) => Some(last),
+            (HistoryDirection::Up, Some(p)) => Some(p.saturating_sub(1)),
+            (HistoryDirection::Down, Some(p)) if p < last => Some(p + 1),
+            (HistoryDirection::Down, _) => None,
+        };
+        *self.position = next;
+        data.clear();
+        if let Some(p) = next {
+            data.push_str(&self.history[p]);
+        }
+    }
+
+    fn on_completion(&mut self, mut data: TextCallbackData) {
+        let typed = data.str().to_string();
+        if typed.contains(' ') {
+            return;
+        }
+        let matches: Vec<&str> = command_names().into_iter().filter(|n| n.to_lowercase().starts_with(&typed.to_lowercase())).collect();
+        let Some(first) = matches.first() else { return };
+        // Complete as far as all matches agree.
+        let mut common = first.len();
+        for m in &matches {
+            common = common.min(first.bytes().zip(m.bytes()).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count());
+        }
+        let completed = if matches.len() == 1 { format!("{first} ") } else { first[..common].to_string() };
+        if completed.len() >= typed.len() {
+            data.clear();
+            data.push_str(&completed);
+        }
+    }
 }
 
 const LOG_COLOR: [f32; 4] = [0.62, 0.64, 0.68, 1.0];
 const INPUT_COLOR: [f32; 4] = [0.55, 0.8, 1.0, 1.0];
 const OUTPUT_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
 const ERROR_COLOR: [f32; 4] = [1.0, 0.45, 0.4, 1.0];
+/// Log lines that look like failures.
+const ERROR_LOG_COLOR: [f32; 4] = [1.0, 0.5, 0.45, 1.0];
 
 struct Ui {
     context: Context,
@@ -221,6 +308,11 @@ struct Ui {
     log_seen: u64,
     input: String,
     history: Vec<String>,
+    history_position: Option<usize>,
+    filter: String,
+    errors_only: bool,
+    channels: BTreeSet<String>,
+    hidden_channels: HashSet<String>,
     focus_input: bool,
     scroll_to_end: bool,
     last_frame: Instant,
@@ -254,6 +346,11 @@ impl Ui {
             log_seen: 0,
             input: String::new(),
             history: Vec::new(),
+            history_position: None,
+            filter: String::new(),
+            errors_only: false,
+            channels: BTreeSet::new(),
+            hidden_channels: HashSet::new(),
             focus_input: true,
             scroll_to_end: true,
             last_frame: Instant::now(),
@@ -265,11 +362,18 @@ impl Ui {
 
     fn print(&mut self, color: [f32; 4], text: impl Into<String>) {
         for line in text.into().lines() {
-            if self.lines.len() == MAX_LINES {
-                self.lines.pop_front();
-            }
-            self.lines.push_back(Line { text: line.to_string(), color });
+            self.push_line(line, color, String::new());
         }
+    }
+
+    fn push_line(&mut self, text: &str, color: [f32; 4], channel: String) {
+        if self.lines.len() == MAX_LINES {
+            self.lines.pop_front();
+        }
+        if !channel.is_empty() {
+            self.channels.insert(channel.clone());
+        }
+        self.lines.push_back(Line { text: text.to_string(), color, channel });
         self.scroll_to_end = true;
     }
 
@@ -280,6 +384,7 @@ impl Ui {
         }
         self.print(INPUT_COLOR, format!("> {command}"));
         self.history.push(command.to_string());
+        self.history_position = None;
         let mut words = command.split_whitespace();
         let name = words.next().unwrap_or("").to_lowercase();
         let args: Vec<&str> = words.collect();
@@ -353,7 +458,9 @@ impl Ui {
         let (next, lines) = log::tail(self.log_seen);
         self.log_seen = next;
         for line in lines {
-            self.print(LOG_COLOR, line);
+            let channel = channel_of(&line);
+            let color = log_color(&channel, &line);
+            self.push_line(&line, color, channel);
         }
 
         // Display size: the back buffer's viewport.
@@ -399,6 +506,13 @@ impl Ui {
         let focus_input = std::mem::take(&mut self.focus_input);
         let scroll = std::mem::take(&mut self.scroll_to_end);
         let lines = &self.lines;
+        let channels = &self.channels;
+        let history = &self.history;
+        let position = &mut self.history_position;
+        let mut filter = std::mem::take(&mut self.filter);
+        let mut errors_only = self.errors_only;
+        let mut hidden = std::mem::take(&mut self.hidden_channels);
+        let mut clear_log = false;
 
         let ui = self.context.frame();
         draw_overlay(ui, &stats);
@@ -411,9 +525,39 @@ impl Ui {
                 .bg_alpha(0.85)
                 .build(|| {
                     tools_panel(ui);
-                    let footer = ui.frame_height_with_spacing() + 4.0;
+                    ui.set_next_item_width(240.0);
+                    ui.input_text("Filter", &mut filter).build();
+                    ui.same_line();
+                    ui.checkbox("Errors only", &mut errors_only);
+                    ui.same_line();
+                    if ui.button("Clear") {
+                        clear_log = true;
+                    }
+                    if ui.collapsing_header("Channels", TreeNodeFlags::empty()) {
+                        for channel in channels {
+                            let mut shown = !hidden.contains(channel);
+                            if ui.checkbox(channel, &mut shown) {
+                                if shown {
+                                    hidden.remove(channel);
+                                } else {
+                                    hidden.insert(channel.clone());
+                                }
+                            }
+                            ui.same_line();
+                        }
+                        ui.new_line();
+                    }
+
+                    let footer = ui.frame_height_with_spacing() * 2.0 + 4.0;
                     ui.child_window("log").size([0.0, -footer]).build(|| {
+                        let needle = filter.to_lowercase();
                         for line in lines {
+                            if hidden.contains(&line.channel)
+                                || (errors_only && line.color != ERROR_LOG_COLOR)
+                                || (!needle.is_empty() && !line.text.to_lowercase().contains(&needle))
+                            {
+                                continue;
+                            }
                             let _style = ui.push_style_color(StyleColor::Text, line.color);
                             ui.text_wrapped(&line.text);
                         }
@@ -421,11 +565,25 @@ impl Ui {
                             ui.set_scroll_here_y_with_ratio(1.0);
                         }
                     });
+
+                    // Suggestions for what is being typed (Tab completes).
+                    let typed = input.to_lowercase();
+                    if !typed.is_empty() && !typed.contains(' ') {
+                        let matches: Vec<&str> = command_names().into_iter().filter(|n| n.to_lowercase().starts_with(&typed)).collect();
+                        ui.text_disabled(if matches.is_empty() { "no such command".to_string() } else { matches.join("  ") });
+                    } else {
+                        ui.text_disabled("Tab completes, Up / Down browse the history");
+                    }
                     ui.set_next_item_width(-1.0);
                     if focus_input {
                         ui.set_keyboard_focus_here();
                     }
-                    if ui.input_text("##command", &mut input).enter_returns_true(true).build() {
+                    if ui
+                        .input_text("##command", &mut input)
+                        .enter_returns_true(true)
+                        .callback(InputTextCallback::HISTORY | InputTextCallback::COMPLETION, CommandLine { history, position })
+                        .build()
+                    {
                         command = Some(std::mem::take(&mut input));
                         // Keep typing after Enter.
                         ui.set_keyboard_focus_here_with_offset(imgui::FocusedWidget::Previous);
@@ -436,6 +594,12 @@ impl Ui {
         self.renderer.render(device, draw_data);
 
         self.input = input;
+        self.filter = filter;
+        self.errors_only = errors_only;
+        self.hidden_channels = hidden;
+        if clear_log {
+            self.lines.clear();
+        }
         if let Some(command) = command {
             self.run_command(&command);
         }
