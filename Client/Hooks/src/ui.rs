@@ -2,12 +2,12 @@
 //! overlay (FPS, ping, network, client performance). `render.rs` calls `frame` before every
 //! Present; `input` feeds it the window messages the game would otherwise get.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use imgui::{Condition, HistoryDirection, InputTextCallback, InputTextCallbackHandler, TextCallbackData, Context, ItemHoveredFlags, Key, MouseButton, StyleColor, TreeNodeFlags, WindowFlags};
+use imgui::{Condition, HistoryDirection, InputTextCallback, InputTextCallbackHandler, TextCallbackData, Context, ItemHoveredFlags, Key, MouseButton, StyleColor, WindowFlags};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct3D9::*;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -155,53 +155,112 @@ const WIP_TOOLS: &[(&str, &str, &str)] = &[
     ("Scripting", "script_debug", "Script engine debugger: native calls, running scripts (needs the native hook)"),
 ];
 
-/// A disabled checkbox whose tooltip says it's not implemented.
-fn wip_item(ui: &imgui::Ui, name: &str, about: &str) {
-    ui.disabled(true, || {
-        let mut off = false;
-        ui.checkbox(name, &mut off);
-    });
-    if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
-        ui.tooltip_text(format!("WIP: not implemented yet.
-{about}"));
-    }
+/// FiveM's look (conhost-v2): dark translucent window, blue accent, square corners.
+fn set_style(context: &mut Context) {
+    let accent = [81.0 / 255.0, 179.0 / 255.0, 236.0 / 255.0, 1.0];
+    let style = context.style_mut();
+    style.window_rounding = 0.0;
+    style.window_border_size = 0.0;
+    style.window_padding = [4.0, 3.0];
+    style[StyleColor::WindowBg] = [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 200.0 / 255.0];
+    style[StyleColor::PopupBg] = [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 240.0 / 255.0];
+    style[StyleColor::Border] = accent;
+    style[StyleColor::TitleBg] = accent;
+    style[StyleColor::TitleBgActive] = accent;
+    style[StyleColor::FrameBg] = [50.0 / 255.0, 50.0 / 255.0, 50.0 / 255.0, 0.6];
+    style[StyleColor::FrameBgHovered] = [80.0 / 255.0, 80.0 / 255.0, 80.0 / 255.0, 0.6];
+    style[StyleColor::FrameBgActive] = [80.0 / 255.0, 80.0 / 255.0, 80.0 / 255.0, 0.8];
+    style[StyleColor::TextSelectedBg] = [accent[0], accent[1], accent[2], 180.0 / 255.0];
 }
 
-/// A checkbox for a panel flag.
-fn flag_item(ui: &imgui::Ui, label: &str, flag: &AtomicBool, about: &str) {
+/// Rounded tag color per channel: hue from the name, saturation 0.8, lightness 0.4.
+fn channel_color(channel: &str) -> [f32; 4] {
+    let hash = channel.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    let hue = (hash % 360) as f32 / 360.0;
+    let (s, l) = (0.8f32, 0.4f32);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((hue * 6.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (hue * 6.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r + m, g + m, b + m, 1.0]
+}
+
+/// The menu bar across the top (FiveM's dev GUI). Returns its height.
+fn menu_bar(ui: &imgui::Ui) -> f32 {
+    ui.main_menu_bar(|| {
+        ui.menu("Overlays", || {
+            flag_menu(ui, "Draw FPS", &SHOW_FPS);
+            flag_menu(ui, "Ping", &SHOW_PING);
+            flag_menu(ui, "Network info", &SHOW_NET);
+            wip_menu(ui, "NetGraph", "Real-time graph of ping, packets, bytes and routing");
+            ui.menu("Performance", || {
+                flag_menu(ui, "Draw Performance", &SHOW_PERF);
+            });
+        });
+        ui.menu("Launch", || {
+            ui.menu("MP", || {
+                wip_menu(ui, "Localhost", "Connect to a server on this PC");
+                wip_menu(ui, "Connect to host", "Connect to a typed address");
+                wip_menu(ui, "Disconnect", "Leave the server");
+            });
+            wip_menu(ui, "Quit", "Close the game");
+        });
+        ui.menu("Tools", || {
+            ui.menu("Performance", || {
+                ui.menu("Profiler", || {
+                    wip_menu(ui, "Start Recording - 5 frames", "Record a profiler capture");
+                    wip_menu(ui, "View Last Recording", "Open the last capture");
+                });
+                wip_menu(ui, "Resource Monitor", "CPU and memory use per script/resource");
+                wip_menu(ui, "Streaming Memory Viewer", "Streaming memory use per asset");
+            });
+            wip_menu(ui, "Windowed Console", "The console in its own window");
+            for g in ["Streaming", "Network", "Game", "Console"] {
+                ui.menu(g, || {
+                    for (group, name, about) in WIP_TOOLS {
+                        if *group == g {
+                            wip_menu(ui, name, about);
+                        }
+                    }
+                });
+            }
+            ui.menu("NUI", || {
+                wip_menu(ui, "Open DevTools", "Dev tools for the web UI (needs the web engine, stage 2)");
+            });
+            ui.menu("Scripting", || {
+                wip_menu(ui, "Script debugger", "Native calls and running scripts (needs the native hook)");
+            });
+        });
+        ui.menu("Game", || {
+            wip_menu(ui, "SFX Volume", "Sound effects volume");
+            wip_menu(ui, "Mute", "Mute the game");
+            wip_menu(ui, "Unmute", "Unmute the game");
+        });
+    });
+    ui.frame_height()
+}
+
+/// A menu checkbox bound to an overlay flag.
+fn flag_menu(ui: &imgui::Ui, label: &str, flag: &AtomicBool) {
     let mut value = flag.load(Ordering::Relaxed);
-    if ui.checkbox(label, &mut value) {
+    if ui.menu_item_config(label).build_with_ref(&mut value) {
         flag.store(value, Ordering::Relaxed);
     }
-    if ui.is_item_hovered() {
-        ui.tooltip_text(about);
-    }
 }
 
-fn tools_panel(ui: &imgui::Ui) {
-    if !ui.collapsing_header("Overlays and debug tools", TreeNodeFlags::empty()) {
-        return;
+/// A disabled menu entry whose tooltip says it's not implemented.
+fn wip_menu(ui: &imgui::Ui, label: &str, about: &str) {
+    ui.menu_item_config(label).enabled(false).build();
+    if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
+        ui.tooltip_text(format!("WIP: not implemented yet.\n{about}"));
     }
-    ui.text_disabled("Working");
-    flag_item(ui, "FPS", &SHOW_FPS, "overlay fps: frames per second");
-    ui.same_line();
-    flag_item(ui, "Ping", &SHOW_PING, "overlay ping: round trip to the server");
-    ui.same_line();
-    flag_item(ui, "Network info", &SHOW_NET, "overlay net: ids, mode, packets");
-    ui.same_line();
-    flag_item(ui, "Client performance", &SHOW_PERF, "overlay perf: frame and game update times");
-    let mut group = "";
-    for (g, name, about) in WIP_TOOLS {
-        if *g != group {
-            group = g;
-            ui.separator();
-            ui.text_disabled(format!("{g} (WIP)"));
-        } else {
-            ui.same_line();
-        }
-        wip_item(ui, name, about);
-    }
-    ui.separator();
 }
 
 struct Line {
@@ -240,6 +299,9 @@ fn log_color(channel: &str, text: &str) -> [f32; 4] {
     let hash = channel.bytes().fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
     PALETTE[hash % PALETTE.len()]
 }
+
+/// Lines the Tab completion wants in the log (the callback can't reach the console).
+static COMPLETION_OUTPUT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Every command the console knows, for Tab completion and suggestions.
 fn command_names() -> Vec<&'static str> {
@@ -280,7 +342,15 @@ impl InputTextCallbackHandler for CommandLine<'_> {
             return;
         }
         let matches: Vec<&str> = command_names().into_iter().filter(|n| n.to_lowercase().starts_with(&typed.to_lowercase())).collect();
-        let Some(first) = matches.first() else { return };
+        let Some(first) = matches.first() else {
+            COMPLETION_OUTPUT.lock().unwrap().push(format!("No match for {typed}"));
+            return;
+        };
+        if matches.len() > 1 {
+            let mut output = COMPLETION_OUTPUT.lock().unwrap();
+            output.push("Possible matches:".to_string());
+            output.extend(matches.iter().map(|m| format!("- {m}")));
+        }
         // Complete as far as all matches agree.
         let mut common = first.len();
         for m in &matches {
@@ -310,9 +380,8 @@ struct Ui {
     history: Vec<String>,
     history_position: Option<usize>,
     filter: String,
-    errors_only: bool,
+    auto_scroll: bool,
     channels: BTreeSet<String>,
-    hidden_channels: HashSet<String>,
     focus_input: bool,
     scroll_to_end: bool,
     last_frame: Instant,
@@ -333,6 +402,7 @@ impl Ui {
         context.set_ini_filename(None);
         context.set_log_filename(None);
         context.io_mut().mouse_draw_cursor = true;
+        set_style(&mut context);
         let mut renderer = Renderer::new();
         let font = context.fonts().build_rgba32_texture();
         if !renderer.create_font(device, font.width, font.height, font.data) {
@@ -348,9 +418,8 @@ impl Ui {
             history: Vec::new(),
             history_position: None,
             filter: String::new(),
-            errors_only: false,
+            auto_scroll: true,
             channels: BTreeSet::new(),
-            hidden_channels: HashSet::new(),
             focus_input: true,
             scroll_to_end: true,
             last_frame: Instant::now(),
@@ -454,6 +523,9 @@ impl Ui {
             self.frame_ms.pop_front();
         }
 
+        for line in std::mem::take(&mut *COMPLETION_OUTPUT.lock().unwrap()) {
+            self.print(OUTPUT_COLOR, line);
+        }
         // New log lines.
         let (next, lines) = log::tail(self.log_seen);
         self.log_seen = next;
@@ -510,83 +582,110 @@ impl Ui {
         let history = &self.history;
         let position = &mut self.history_position;
         let mut filter = std::mem::take(&mut self.filter);
-        let mut errors_only = self.errors_only;
-        let mut hidden = std::mem::take(&mut self.hidden_channels);
+        let mut auto_scroll = self.auto_scroll;
         let mut clear_log = false;
+        let mut open_log = false;
 
+        // Larger text on bigger screens (FiveM uses 18 px up to 1080p, 22 px above).
+        self.context.io_mut().font_global_scale = if size[1] <= 1080.0 { 1.4 } else { 1.7 };
         let ui = self.context.frame();
         draw_overlay(ui, &stats);
         if open {
+            let menu_height = menu_bar(ui);
             let [width, height] = size;
-            ui.window("IVMP console")
-                .position([0.0, 0.0], Condition::Always)
-                .size([width, height * 0.45], Condition::Always)
-                .flags(WindowFlags::NO_MOVE | WindowFlags::NO_RESIZE | WindowFlags::NO_COLLAPSE)
-                .bg_alpha(0.85)
+            let line_height = ui.frame_height_with_spacing();
+            let _border = ui.push_style_var(imgui::StyleVar::WindowBorderSize(0.0));
+            let _padding = ui.push_style_var(imgui::StyleVar::WindowPadding([4.0, 3.0]));
+            ui.window("##_BigConsole")
+                .position([0.0, menu_height], Condition::Always)
+                .size([width, line_height * 12.0], Condition::FirstUseEver)
+                .size_constraints([width, line_height * 6.0], [width, height - menu_height])
+                .flags(
+                    WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+                        | WindowFlags::NO_TITLE_BAR
+                        | WindowFlags::NO_SCROLLBAR
+                        | WindowFlags::NO_MOVE
+                        | WindowFlags::NO_SAVED_SETTINGS,
+                )
                 .build(|| {
-                    tools_panel(ui);
-                    ui.set_next_item_width(240.0);
-                    ui.input_text("Filter", &mut filter).build();
-                    ui.same_line();
-                    ui.checkbox("Errors only", &mut errors_only);
-                    ui.same_line();
-                    if ui.button("Clear") {
-                        clear_log = true;
-                    }
-                    if ui.collapsing_header("Channels", TreeNodeFlags::empty()) {
-                        for channel in channels {
-                            let mut shown = !hidden.contains(channel);
-                            if ui.checkbox(channel, &mut shown) {
-                                if shown {
-                                    hidden.remove(channel);
-                                } else {
-                                    hidden.insert(channel.clone());
-                                }
-                            }
-                            ui.same_line();
-                        }
-                        ui.new_line();
-                    }
+                    let needle = filter.to_lowercase();
+                    let visible: Vec<&Line> = lines
+                        .iter()
+                        .filter(|l| needle.is_empty() || l.text.to_lowercase().contains(&needle) || l.channel.contains(&needle))
+                        .collect();
+                    let tag_width = channels.iter().map(|c| ui.calc_text_size(c)[0]).fold(0.0, f32::max) + 16.0;
 
-                    let footer = ui.frame_height_with_spacing() * 2.0 + 4.0;
-                    ui.child_window("log").size([0.0, -footer]).build(|| {
-                        let needle = filter.to_lowercase();
-                        for line in lines {
-                            if hidden.contains(&line.channel)
-                                || (errors_only && line.color != ERROR_LOG_COLOR)
-                                || (!needle.is_empty() && !line.text.to_lowercase().contains(&needle))
-                            {
+                    let spacing = ui.push_style_var(imgui::StyleVar::ItemSpacing([4.0, 1.0]));
+                    ui.child_window("ScrollingRegion").size([0.0, -ui.frame_height_with_spacing() - 8.0]).build(|| {
+                        let clipper = imgui::ListClipper::new(visible.len() as i32).begin(ui);
+                        for index in clipper.iter() {
+                            let line = visible[index as usize];
+                            if line.channel.is_empty() {
+                                let _style = ui.push_style_color(StyleColor::Text, line.color);
+                                ui.text_wrapped(&line.text);
                                 continue;
                             }
+                            // Rounded tag with the channel name, then the message.
+                            let start = ui.cursor_screen_pos();
+                            let size = ui.calc_text_size(&line.channel);
+                            ui.get_window_draw_list()
+                                .add_rect(
+                                    [start[0] - 3.0, start[1]],
+                                    [start[0] + size[0] + 3.0, start[1] + size[1]],
+                                    channel_color(&line.channel),
+                                )
+                                .filled(true)
+                                .rounding(6.0)
+                                .build();
+                            ui.text(&line.channel);
+                            ui.same_line_with_pos(tag_width);
+                            let message = line.text.split_once(':').map(|(_, m)| m.trim_start()).unwrap_or(&line.text);
                             let _style = ui.push_style_color(StyleColor::Text, line.color);
-                            ui.text_wrapped(&line.text);
+                            ui.text_wrapped(message);
                         }
-                        if scroll {
+                        if scroll && auto_scroll {
                             ui.set_scroll_here_y_with_ratio(1.0);
                         }
+                        if let Some(_popup) = ui.begin_popup_context_window() {
+                            ui.menu_item_config("Copy").enabled(false).build();
+                            if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
+                                ui.tooltip_text("WIP: not implemented yet.\nSelect and copy console text");
+                            }
+                            if ui.menu_item("Clear") {
+                                clear_log = true;
+                            }
+                        }
                     });
+                    drop(spacing);
+                    ui.separator();
 
-                    // Suggestions for what is being typed (Tab completes).
-                    let typed = input.to_lowercase();
-                    if !typed.is_empty() && !typed.contains(' ') {
-                        let matches: Vec<&str> = command_names().into_iter().filter(|n| n.to_lowercase().starts_with(&typed)).collect();
-                        ui.text_disabled(if matches.is_empty() { "no such command".to_string() } else { matches.join("  ") });
-                    } else {
-                        ui.text_disabled("Tab completes, Up / Down browse the history");
-                    }
-                    ui.set_next_item_width(-1.0);
-                    if focus_input {
+                    // Input line on the left; filter, auto scroll and the log button on the right.
+                    let filter_width = width * 0.15;
+                    let scroll_width = ui.calc_text_size("Auto scroll")[0] + ui.frame_height() + 12.0;
+                    let button_width = ui.calc_text_size("Open log")[0] + 16.0;
+                    let right = filter_width + scroll_width + button_width + 24.0;
+                    ui.set_next_item_width(-right);
+                    // Keep the keyboard on the input unless something else is being used.
+                    if focus_input || (!ui.is_any_item_active() && !ui.is_mouse_clicked(MouseButton::Left)) {
                         ui.set_keyboard_focus_here();
                     }
                     if ui
-                        .input_text("##command", &mut input)
+                        .input_text("##_Input", &mut input)
                         .enter_returns_true(true)
                         .callback(InputTextCallback::HISTORY | InputTextCallback::COMPLETION, CommandLine { history, position })
                         .build()
                     {
                         command = Some(std::mem::take(&mut input));
-                        // Keep typing after Enter.
                         ui.set_keyboard_focus_here_with_offset(imgui::FocusedWidget::Previous);
+                    }
+                    ui.same_line();
+                    ui.set_next_item_width(filter_width);
+                    ui.input_text("##LogFilter", &mut filter).hint("Filter").build();
+                    ui.same_line();
+                    ui.checkbox("Auto scroll", &mut auto_scroll);
+                    ui.same_line();
+                    if ui.button("Open log") {
+                        open_log = true;
                     }
                 });
         }
@@ -595,8 +694,11 @@ impl Ui {
 
         self.input = input;
         self.filter = filter;
-        self.errors_only = errors_only;
-        self.hidden_channels = hidden;
+        self.auto_scroll = auto_scroll;
+        if open_log {
+            let name = if crate::instance::second_client() { "IVMP_Client_cl2.log" } else { "IVMP_Client.log" };
+            let _ = std::process::Command::new("notepad").arg(crate::dll_dir().join(name)).spawn();
+        }
         if clear_log {
             self.lines.clear();
         }
