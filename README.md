@@ -82,6 +82,7 @@ Releases are built by the [Build workflow](.github/workflows/build.yml), which i
 
 - [docs/onesync-plan.md](docs/onesync-plan.md): the server-host plan
 - [docs/networking-plan.md](docs/networking-plan.md): how the game's networking works
+- [docs/web-engine-research.md](docs/web-engine-research.md): the web UI engine (WebView2) research and spike plan
 - [docs/boot-flow-research.md](docs/boot-flow-research.md): the game's boot flow, and the intro-skip patch note
 
 ## Images
