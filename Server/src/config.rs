@@ -37,6 +37,8 @@ pub struct Config {
     /// -2 = IVMP freeroam, 16 = GTA IV's online Free Mode, other values = the game's modes.
     pub gamemode: i32,
     pub slots: u8,
+    /// Also log debugging detail (entities, game events).
+    pub verbose: bool,
 }
 
 const DEFAULT_FILE: &str = "\
@@ -77,6 +79,10 @@ gamemode = -2
 # Player slots of the session.
 slots = 32
 
+# Log only what matters (joins, leaves, warnings, errors). 1 = also the debugging detail: entities,
+# game events, summaries.
+verbose = 0
+
 # Record game packets to this file (empty = off).
 capture =
 ";
@@ -90,6 +96,7 @@ impl Config {
             host: false,
             gamemode: -2,
             slots: 32,
+            verbose: false,
         }
     }
 
@@ -147,6 +154,17 @@ impl Config {
                 },
                 "gamemode" => value.parse().map(|v| self.gamemode = v).is_ok(),
                 "slots" => value.parse::<u8>().ok().filter(|s| (1..=32).contains(s)).map(|s| self.slots = s).is_some(),
+                "verbose" => match value.to_ascii_lowercase().as_str() {
+                    "0" | "false" | "off" => {
+                        self.verbose = false;
+                        true
+                    }
+                    "1" | "true" | "on" => {
+                        self.verbose = true;
+                        true
+                    }
+                    _ => false,
+                },
                 "capture" => {
                     self.capture = (!value.is_empty()).then(|| value.to_string());
                     true
@@ -169,6 +187,7 @@ impl Config {
             match arg.as_str() {
                 "--capture" => self.capture = args.next(),
                 "--host" => self.host = true,
+                "--verbose" => self.verbose = true,
                 "--ids" => {
                     self.ids = args
                         .next()

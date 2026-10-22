@@ -29,6 +29,7 @@ mod world;
 fn main() -> std::io::Result<()> {
     log::open();
     let (config, notes) = config::Config::load(std::env::args().skip(1));
+    log::VERBOSE.store(config.verbose, std::sync::atomic::Ordering::Relaxed);
     for note in notes {
         say!("{note}");
     }

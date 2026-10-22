@@ -117,9 +117,9 @@ impl Server {
             }
             if self.last_summary.elapsed() > SUMMARY_EVERY && self.entities.packets > 0 {
                 self.last_summary = Instant::now();
-                say!("{}", self.entities.summary());
+                debug!("{}", self.entities.summary());
                 if let Some(events) = self.events.summary() {
-                    say!("{events}");
+                    debug!("{events}");
                 }
             }
         }
@@ -189,10 +189,12 @@ impl Server {
                     capture.record(id, if let Target::Client(to) = target { to } else { 0 }, &payload);
                 }
                 for line in self.entities.observe(id, &payload) {
-                    say!("{line}");
+                    debug!("{line}");
                 }
-                for line in self.events.observe(id, &payload) {
-                    say!("{line}");
+                if crate::log::verbose() {
+                    for line in self.events.observe(id, &payload) {
+                        say!("{line}");
+                    }
                 }
                 if to == virtual_ip(HOST_ID) && self.host.is_some() {
                     return self.to_host(id, from_port, &payload);
@@ -213,7 +215,7 @@ impl Server {
                 if self.world.spawned(request, id, object_id).is_some() {
                     match object_id {
                         0 => say!("client {id} could not create server entity {request}"),
-                        _ => say!("server entity {request} is object {object_id} (created by client {id})"),
+                        _ => debug!("server entity {request} is object {object_id} (created by client {id})"),
                     }
                 }
             }
@@ -221,14 +223,14 @@ impl Server {
             // tell the others now, or they only notice when the old session times out (~30 s).
             (ClientMessage::SessionRestart, Some(id)) => {
                 if self.lobby.host == Some(id) {
-                    say!("client {id} (the host) is starting a new session; telling the others");
+                    debug!("client {id} (the host) is starting a new session; telling the others");
                     self.reliable_broadcast(Some(id), &ServerMessage::SessionRestart { host: id });
                 }
             }
             // The host's new session is in its lobby: the others may join it now.
             (ClientMessage::SessionReady, Some(id)) => {
                 if self.lobby.host == Some(id) {
-                    say!("client {id} (the host) has its new session ready; telling the others");
+                    debug!("client {id} (the host) has its new session ready; telling the others");
                     self.reliable_broadcast(Some(id), &ServerMessage::SessionReady { host: id });
                 }
             }
@@ -351,7 +353,7 @@ impl Server {
                 continue;
             }
             let e = &order.entity;
-            say!("asking client {} to create server entity {} ({:?} {:#010x})", order.client, order.request, e.kind, e.model);
+            debug!("asking client {} to create server entity {} ({:?} {:#010x})", order.client, order.request, e.kind, e.model);
             self.reliable(
                 order.client,
                 &ServerMessage::Spawn {

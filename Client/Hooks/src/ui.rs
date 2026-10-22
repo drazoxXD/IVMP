@@ -377,6 +377,10 @@ struct Line {
     channel: String,
 }
 
+/// Log channels the console does not show: the host state machine prints a lot, and it is only
+/// useful when debugging a join (read IVMP_Client.log for it).
+const HIDDEN_CHANNELS: &[&str] = &["host"];
+
 /// "net: connecting" -> "net".
 fn channel_of(text: &str) -> String {
     match text.split_once(':') {
@@ -646,6 +650,10 @@ impl Ui {
         self.log_seen = next;
         for line in lines {
             let channel = channel_of(&line);
+            // Chatty channels stay out of the console (they are all in IVMP_Client.log).
+            if HIDDEN_CHANNELS.contains(&channel.as_str()) {
+                continue;
+            }
             let color = log_color(&channel, &line);
             self.push_line(&line, color, channel);
         }
