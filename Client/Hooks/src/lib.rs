@@ -19,6 +19,7 @@ mod web;
 mod focus;
 mod hang;
 mod memstats;
+mod luanatives;
 mod mods;
 mod scripts;
 mod window;

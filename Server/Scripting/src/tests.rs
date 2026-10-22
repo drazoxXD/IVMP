@@ -325,3 +325,21 @@ fn an_endless_loop_is_stopped() {
     assert!(out.iter().any(|l| l.contains("ran too long")), "{out:?}");
     assert!(!out.iter().any(|l| l.contains("never")));
 }
+
+#[test]
+fn extra_api_and_the_console_line() {
+    let folder = Folder::new("eval");
+    folder.resource("r", "client_script 'c.lua'", &[("c.lua", "print('twice', Twice(4))")]);
+    let (scripting, log) = client_scripting(&folder);
+    scripting.set_extra_api(|lua| {
+        lua.globals().set("Twice", lua.create_function(|_, n: i64| Ok(n * 2))?)
+    });
+    scripting.start("r").unwrap();
+    assert!(lines(&log).contains(&"[r] twice\t8".to_string()), "{:?}", lines(&log));
+    scripting.eval("Twice(21)").unwrap();
+    assert!(lines(&log).contains(&"42".to_string()), "{:?}", lines(&log));
+    scripting.eval("x = 5 print('x is', x)").unwrap();
+    assert!(lines(&log).contains(&"[console] x is\t5".to_string()));
+    assert!(scripting.eval("error('boom')").unwrap_err().contains("boom"));
+    assert!(scripting.eval("this is not lua").is_err());
+}

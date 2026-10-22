@@ -70,8 +70,15 @@ struct Resource {
 }
 
 /// What the resources share: the other resources, the players, the log.
+/// Extra functions every new Lua state gets (the client adds natives this way).
+pub type ExtraApi = Rc<dyn Fn(&Lua) -> mlua::Result<()>>;
+
+/// The resource that `eval` (the F1 console) runs its lines in.
+pub const CONSOLE: &str = "console";
+
 pub struct World {
     me: Weak<World>,
+    extra_api: RefCell<Option<ExtraApi>>,
     side: Side,
     /// What is left of the current call's instruction budget.
     budget: Cell<u64>,
@@ -131,6 +138,7 @@ impl World {
     pub fn new(side: Side, dir: PathBuf, log: Log) -> Rc<World> {
         Rc::new_cyclic(|me| World {
             me: me.clone(),
+            extra_api: RefCell::new(None),
             side,
             budget: Cell::new(0),
             server_events: RefCell::new(Vec::new()),
@@ -151,6 +159,34 @@ impl World {
     /// Gives the call about to run a fresh instruction budget.
     fn arm(&self) {
         self.budget.set(if self.side == Side::Server { SERVER_BUDGET } else { CLIENT_BUDGET });
+    }
+
+    pub fn set_extra_api(&self, api: ExtraApi) {
+        *self.extra_api.borrow_mut() = Some(api);
+    }
+
+    /// Runs a line of Lua in the `console` resource (made on first use) and logs what it returns:
+    /// `1 + 2` prints 3, `print('x')` runs. For trying things out from the F1 console.
+    pub fn eval(self: &Rc<World>, code: &str) -> Result<(), String> {
+        if !self.is_running(CONSOLE) {
+            self.start_loaded(CONSOLE, self.dir.clone(), Manifest::default())?;
+        }
+        let resource = self.resources.borrow().get(CONSOLE).cloned().ok_or("the console resource is gone")?;
+        let lua = &resource.lua;
+        let function = lua
+            .load(format!("return {code}"))
+            .set_name("=console")
+            .into_function()
+            .or_else(|_| lua.load(code).set_name("=console").into_function())
+            .map_err(|e| e.to_string())?;
+        self.arm();
+        let values: mlua::MultiValue = function.call(()).map_err(|e| e.to_string())?;
+        if !values.is_empty() {
+            let tostring: Function = lua.globals().get("tostring").map_err(|e| e.to_string())?;
+            let shown: Vec<String> = values.iter().map(|v| tostring.call::<String>(v.clone()).unwrap_or_default()).collect();
+            self.say(shown.join("\t"));
+        }
+        Ok(())
     }
 
     pub fn side(&self) -> Side {
@@ -251,6 +287,10 @@ impl World {
             .map_err(|e| e.to_string())?;
         lua.set_hook(HookTriggers::new().every_nth_instruction(HOOK_STEP), budget_hook(self.me.clone())).map_err(|e| e.to_string())?;
         install_api(&lua, self, name, &dir, &state).map_err(|e| format!("resource '{name}': {e}"))?;
+        let extra = self.extra_api.borrow().clone();
+        if let Some(extra) = extra {
+            extra(&lua).map_err(|e| format!("resource '{name}': {e}"))?;
+        }
         let resource = Rc::new(Resource { name: name.to_string(), dir, manifest, lua, state });
         self.resources.borrow_mut().insert(name.to_string(), resource.clone());
         self.order.borrow_mut().push(name.to_string());
@@ -261,7 +301,9 @@ impl World {
                 // The resource stays loaded with what ran, like FiveM; the error is in the log.
             }
         }
-        self.say(format!("started resource {name}"));
+        if name != CONSOLE {
+            self.say(format!("started resource {name}"));
+        }
         let kind = if self.side == Side::Server { "Server" } else { "Client" };
         self.dispatch("onResourceStart", &[Variant::Str(name.to_string())], None, None);
         self.dispatch(&format!("on{kind}ResourceStart"), &[Variant::Str(name.to_string())], None, None);

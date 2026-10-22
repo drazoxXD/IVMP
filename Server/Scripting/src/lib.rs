@@ -5,6 +5,7 @@ pub mod manifest;
 mod runtime;
 pub mod variant;
 
+pub use mlua;
 pub use runtime::{ClientEvent, Player, Side};
 pub use variant::Variant;
 
@@ -27,6 +28,16 @@ impl Scripting {
     /// The client's runtime: `dir` holds the downloaded resources, it runs their `client_scripts`.
     pub fn client(dir: PathBuf, log: impl Fn(String) + 'static) -> Scripting {
         Scripting { world: World::new(Side::Client, dir, Box::new(log)) }
+    }
+
+    /// Functions every Lua state made from now on gets, besides the standard API.
+    pub fn set_extra_api(&self, api: impl Fn(&mlua::Lua) -> mlua::Result<()> + 'static) {
+        self.world.set_extra_api(Rc::new(api));
+    }
+
+    /// Runs a line of Lua in the `console` resource and logs what it returns (F1 `lua` command).
+    pub fn eval(&self, code: &str) -> Result<(), String> {
+        self.world.eval(code)
     }
 
     /// What client scripts asked the server for (`TriggerServerEvent`), as (name, JSON arguments).

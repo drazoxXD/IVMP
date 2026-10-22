@@ -18,6 +18,7 @@ Core = { path = "../Core" }
 NativeInvoker = { path = "../NativeInvoker" }
 Networking = { path = "../Networking" }
 IvmpScripting = { path = "../../Server/Scripting" }
+serde_json = "1"
 imgui = "0.12"
 
 [dependencies.windows]

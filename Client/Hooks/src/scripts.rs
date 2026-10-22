@@ -18,6 +18,8 @@ use crate::log;
 /// thread), and how many resources run, so the console knows whether to pass a line on.
 static PENDING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
+/// Lua lines typed into the console (`lua ...`).
+static PENDING_LUA: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
 thread_local! {
     static RUNTIME: RefCell<Option<Scripting>> = const { RefCell::new(None) };
@@ -26,12 +28,17 @@ thread_local! {
 /// Where the downloaded resources are kept (`cache` next to the DLL).
 pub fn init() {
     resources::set_cache_dir(crate::dll_dir().join("cache"));
+    crate::luanatives::load_file(&crate::dll_dir().join("natives.json"));
 }
 
 fn with_runtime<R>(f: impl FnOnce(&Scripting) -> R) -> R {
     RUNTIME.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let runtime = slot.get_or_insert_with(|| Scripting::client(crate::dll_dir().join("cache"), |line| log!("script: {line}")));
+        let runtime = slot.get_or_insert_with(|| {
+            let runtime = Scripting::client(crate::dll_dir().join("cache"), |line| log!("script: {line}"));
+            runtime.set_extra_api(crate::luanatives::install);
+            runtime
+        });
         f(runtime)
     })
 }
@@ -42,7 +49,8 @@ pub fn tick() {
     let events = net::take_script_events();
     // Nothing downloaded and nothing running: nothing to do, and no Lua state is made.
     let commands: Vec<String> = PENDING.lock().unwrap().drain(..).collect();
-    let idle = changes.is_empty() && events.is_empty() && commands.is_empty();
+    let lua_lines: Vec<String> = PENDING_LUA.lock().unwrap().drain(..).collect();
+    let idle = changes.is_empty() && events.is_empty() && commands.is_empty() && lua_lines.is_empty();
     let started = RUNTIME.with(|cell| cell.borrow().is_some());
     if idle && !started {
         return;
@@ -77,6 +85,11 @@ pub fn tick() {
                 log!("script: no resource registered the command '{}'", line.split_whitespace().next().unwrap_or(""));
             }
         }
+        for line in lua_lines {
+            if let Err(e) = runtime.eval(&line) {
+                log!("script: lua: {e}");
+            }
+        }
         runtime.tick();
         RUNNING.store(runtime.running().len(), Ordering::Relaxed);
         for (name, json) in runtime.take_server_events() {
@@ -95,6 +108,11 @@ pub fn queue_command(line: &str) -> bool {
     }
     PENDING.lock().unwrap().push_back(line.to_string());
     true
+}
+
+/// A line of Lua from the console, run on the game thread next frame (the output goes to the log).
+pub fn queue_lua(code: &str) {
+    PENDING_LUA.lock().unwrap().push_back(code.to_string());
 }
 
 /// How many resources run on this client.

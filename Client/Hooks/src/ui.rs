@@ -418,7 +418,7 @@ static COMPLETION_OUTPUT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Every command the console knows, for Tab completion and suggestions.
 fn command_names() -> Vec<&'static str> {
-    let mut names = vec!["help", "clear", "echo", "overlay", "status", "devtools", "quit", "triggerserver", "resources"];
+    let mut names = vec!["help", "clear", "echo", "overlay", "status", "devtools", "quit", "triggerserver", "resources", "lua", "nativetrace"];
     names.extend(WIP_TOOLS.iter().map(|(_, name, _)| *name));
     names.sort_unstable();
     names
@@ -615,6 +615,19 @@ impl Ui {
             }
             _ if WIP_TOOLS.iter().any(|(_, n, _)| n.eq_ignore_ascii_case(&name)) => {
                 self.print(ERROR_COLOR, format!("{name} is WIP: not implemented yet"));
+            }
+            "lua" => {
+                let code = command.trim_start().strip_prefix(command.split_whitespace().next().unwrap_or("")).unwrap_or("").trim();
+                if code.is_empty() {
+                    self.print(ERROR_COLOR, "usage: lua <code>   e.g. lua print(NativeExists('NETWORK_HOST_GAME'))");
+                } else {
+                    crate::scripts::queue_lua(code);
+                }
+            }
+            "nativetrace" => {
+                let seconds = args.first().and_then(|a| a.parse::<u32>().ok()).unwrap_or(10).clamp(1, 120);
+                ivmp_natives::nativelog::trace(seconds);
+                self.print(OUTPUT_COLOR, format!("logging every native the scripts call for {seconds} s (see the log)"));
             }
             "resources" => self.print(OUTPUT_COLOR, format!("{} resource(s) running on this client", crate::scripts::running())),
             _ if crate::scripts::queue_command(command) => {}

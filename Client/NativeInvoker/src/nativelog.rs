@@ -7,7 +7,7 @@
 //! are replaced by a call to [`native_thunk`], which logs and then jumps to the handler.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::{log, memory};
@@ -25,6 +25,25 @@ pub fn handler_for(hash: u32) -> Option<usize> {
     HANDLERS.get().and_then(|h| h.get(&hash).copied())
 }
 static SEEN: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// A trace in progress: every script call of a native is logged with its arguments until then
+/// (milliseconds since the Unix epoch), at most [`TRACE_MAX_LINES`] lines.
+static TRACE_UNTIL: AtomicU64 = AtomicU64::new(0);
+static TRACE_LINES: AtomicUsize = AtomicUsize::new(0);
+const TRACE_MAX_LINES: usize = 3000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Logs every native the scripts call, with its arguments, for `seconds`: do something in the
+/// game, read the log, and the hashes and arguments of what it did are there. (The names of this
+/// game version's natives aren't known, see `natives.json`.)
+pub fn trace(seconds: u32) {
+    TRACE_LINES.store(0, Ordering::SeqCst);
+    TRACE_UNTIL.store(now_ms() + seconds as u64 * 1000, Ordering::SeqCst);
+    log!("natives: tracing every call for {seconds} s");
+}
 
 /// Builds the handler -> hash table and patches the VM. Call from a background thread at startup.
 pub fn install() {
@@ -88,12 +107,40 @@ pub fn set_override(hash: u32, replacement: usize) -> Option<usize> {
     None
 }
 
-/// Logs the first call of each native; returns the handler to run.
-extern "C" fn record(handler: usize) -> usize {
+/// What a script passes to a native (see [`crate::natives`]).
+#[repr(C)]
+struct CallContext {
+    ret: *mut u32,
+    argc: u32,
+    args: *const u32,
+}
+
+/// Logs the first call of each native (and every call while a trace runs); returns the handler to run.
+extern "C" fn record(handler: usize, context: *const CallContext) -> usize {
     let handler_to_run = OVERRIDES
         .iter()
         .find(|(from, _)| from.load(Ordering::Relaxed) == handler)
         .map_or(handler, |(_, to)| to.load(Ordering::Relaxed));
+    if TRACE_UNTIL.load(Ordering::Relaxed) != 0 && !context.is_null() {
+        if now_ms() > TRACE_UNTIL.load(Ordering::Relaxed) {
+            TRACE_UNTIL.store(0, Ordering::SeqCst);
+            log!("natives: trace over");
+        } else if TRACE_LINES.fetch_add(1, Ordering::Relaxed) < TRACE_MAX_LINES {
+            let context = unsafe { &*context };
+            let count = (context.argc as usize).min(16);
+            let args: Vec<String> = (0..count)
+                .map(|i| {
+                    let value = if context.args.is_null() { 0 } else { unsafe { *context.args.add(i) } };
+                    // A float and a small integer both read fine as hex.
+                    format!("{value:#x}")
+                })
+                .collect();
+            match HASHES.get().and_then(|h| h.get(&handler)) {
+                Some(hash) => log!("native {hash:#010x}({})", args.join(", ")),
+                None => log!("native ?({})", args.join(", ")),
+            }
+        }
+    }
     if !ENABLED.load(Ordering::Relaxed) {
         return handler_to_run;
     }
@@ -117,9 +164,11 @@ extern "C" fn native_thunk() {
         "mov dword ptr [esp + 0xA4], 0",
         "pushad",
         "pushfd",
+        // The native context the VM pushed before the call: at [esp+4] on entry, 36 bytes deeper now.
+        "push dword ptr [esp + 0x28]",
         "push ecx",
         "call {record}",
-        "add esp, 4",
+        "add esp, 8",
         // ECX in the saved registers (flags at [esp], then EDI..EAX) = the handler to run.
         "mov [esp + 0x1C], eax",
         "popfd",
