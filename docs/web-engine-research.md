@@ -161,3 +161,35 @@ only as a note; revisit only if the CEF runtime size becomes a blocker.
 | Servo / Blitz | not production ready |
 | RmlUi / litehtml / Sciter | not full web engines (limited JS / modern CSS): only a fallback for a simple HUD |
 | Coherent GT | paid, proprietary: out |
+
+## Reference: how HappinessMP's WebUI works
+
+Looked at an installed HappinessMP (build "Deploy 303", `HappinessMP.WebUI.exe`, `cef\`, logs, and the
+strings of `HappinessMP.Core.dll` / the WebUI exe). It is the same architecture as ours:
+
+- **CEF in its own process**: `HappinessMP.WebUI.exe` with CEF 288 MB in a `cef` folder; the game's
+  `Core.dll` starts it (inside a **job object**, so it dies with the game) and **restarts it** if it
+  crashes (gives up after N restarts per minute). A protocol number is checked on connect ("WebUI
+  process doesn't match the game").
+- **IPC**: a shared-memory message channel in each direction (the cpp-ipc library, `ipc-core-webui`
+  and `ipc-webui-core`), not named pipes. Messages: create / destroy a webui, load url, resize, call a
+  JS event, and back `webUIReady` and script events.
+- **Frames**: a `SharedFrameWriter` in the WebUI exe and a `SharedFrameReader` in the game. The
+  mapping is sized for the largest screen (3440x1440 in their log, `size = 3440*1440*4*3`, so
+  **three buffers**), has a version number (mismatch is refused), skips frames larger than the
+  mapping, and the game recreates its texture when the size changes (`LockRect` upload).
+- **Pages**: a custom `resource://<resource name>/...` scheme (like our `ivmp://`), pages come from
+  server resources; they can have several browsers (an id each, a limit), hidden ones can't get the
+  focus, and events sent before a page is ready are queued (and the oldest dropped past a limit).
+- **JS API**: only `Events.Subscribe(name, fn)` and `Events.Call(name, [args])` in the page; the game
+  calls `callJSEvent` into the page and `callScriptEvent` comes back to the scripts. Same single
+  channel idea as our `ivmp.send` / `ivmp.on`.
+- **Rendering settings**: `renderGPU` (when off: `--disable-gpu --disable-gpu-compositing`),
+  `--enable-begin-frame-scheduling` (the game drives the frames), `webuiDebugPort` (DevTools only
+  when set in `settings.xml`), renderer crash recovery (reload, up to N crashes a minute).
+- Own build of the CEF wrapper with the CEF API hash checked against `libcef.dll`.
+
+What to take over (not done yet): a job object around `IVMP_Web.exe`, restarting it when it exits,
+a protocol version in the first message, triple-buffered frames with a size field (ours is a
+single seqlock buffer), several browsers with ids, a ready queue, `--enable-begin-frame-scheduling`
+with `SendExternalBeginFrame`, a GPU on/off setting, a DevTools port setting, renderer crash reload.
