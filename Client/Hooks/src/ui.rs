@@ -19,13 +19,25 @@ use crate::log;
 
 /// The console is open: the game gets no keyboard or mouse input.
 static CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
+/// Last display size, for centring the raw cursor.
+static DISPLAY_SIZE: (AtomicU32, AtomicU32) = (AtomicU32::new(0), AtomicU32::new(0));
 
 pub fn capturing() -> bool {
     CONSOLE_OPEN.load(Ordering::Relaxed)
 }
 
+/// The console shuts when the game can't show it (loading screens).
+pub fn close_console() {
+    CONSOLE_OPEN.store(false, Ordering::Relaxed);
+}
+
 pub fn toggle_console() {
     let open = !CONSOLE_OPEN.load(Ordering::Relaxed);
+    if open {
+        // The raw cursor starts at the middle of the screen.
+        RAW_SEEN.store(false, Ordering::Relaxed);
+        *RAW_POSITION.lock().unwrap() = [DISPLAY_SIZE.0.load(Ordering::Relaxed) as f32 / 2.0, DISPLAY_SIZE.1.load(Ordering::Relaxed) as f32 / 2.0];
+    }
     CONSOLE_OPEN.store(open, Ordering::Relaxed);
 }
 
@@ -37,6 +49,29 @@ static SHOW_PERF: AtomicBool = AtomicBool::new(false);
 
 /// Microseconds the game's own update took last frame (set by `game_process` in boot.rs).
 pub static GAME_TICK_US: AtomicU32 = AtomicU32::new(0);
+
+/// The mouse as DirectInput reports it: the game's exclusive mouse sends no window messages, so
+/// while the console is open `focus.rs` hands the raw movement and buttons over.
+static RAW_SEEN: AtomicBool = AtomicBool::new(false);
+static RAW_POSITION: Mutex<[f32; 2]> = Mutex::new([0.0, 0.0]);
+
+pub fn raw_mouse(dx: i32, dy: i32, wheel: i32) {
+    RAW_SEEN.store(true, Ordering::Relaxed);
+    let mut position = RAW_POSITION.lock().unwrap();
+    position[0] += dx as f32;
+    position[1] += dy as f32;
+    if wheel != 0 {
+        push(Event::Wheel(wheel as f32 / 120.0));
+    }
+}
+
+pub fn raw_button(index: usize, down: bool) {
+    static STATE: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+    if index < 3 && STATE[index].swap(down, Ordering::Relaxed) != down {
+        let button = [MouseButton::Left, MouseButton::Right, MouseButton::Middle][index];
+        push(Event::Button(button, down));
+    }
+}
 
 enum Event {
     Char(char),
@@ -87,7 +122,7 @@ pub fn window_message(message: u32, wparam: usize, lparam: isize) -> bool {
     match message {
         WM_KEYDOWN | WM_SYSKEYDOWN if wparam as u16 == VK_F1.0 => {
             // Only the first press, not the key repeat.
-            if lparam & (1 << 30) == 0 {
+            if lparam & (1 << 30) == 0 && crate::hang::game_running() {
                 toggle_console();
             }
             return true;
@@ -110,6 +145,7 @@ pub fn window_message(message: u32, wparam: usize, lparam: isize) -> bool {
             }
             true
         }
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP if RAW_SEEN.load(Ordering::Relaxed) => true,
         WM_LBUTTONDOWN | WM_LBUTTONUP => {
             push(Event::Button(MouseButton::Left, message == WM_LBUTTONDOWN));
             true
@@ -542,6 +578,8 @@ impl Ui {
         }
         let size = [viewport.Width as f32, viewport.Height as f32];
         let open = capturing();
+        DISPLAY_SIZE.0.store(size[0] as u32, Ordering::Relaxed);
+        DISPLAY_SIZE.1.store(size[1] as u32, Ordering::Relaxed);
 
         // Input.
         let io = self.context.io_mut();
@@ -550,7 +588,12 @@ impl Ui {
         if open {
             let mut cursor = POINT::default();
             let mut client = RECT::default();
-            if unsafe { GetCursorPos(&mut cursor) }.is_ok() && unsafe { ScreenToClient(window, &mut cursor) }.as_bool() {
+            if RAW_SEEN.load(Ordering::Relaxed) {
+                let mut position = RAW_POSITION.lock().unwrap();
+                position[0] = position[0].clamp(0.0, size[0] - 1.0);
+                position[1] = position[1].clamp(0.0, size[1] - 1.0);
+                io.add_mouse_pos_event(*position);
+            } else if unsafe { GetCursorPos(&mut cursor) }.is_ok() && unsafe { ScreenToClient(window, &mut cursor) }.as_bool() {
                 let _ = unsafe { GetClientRect(window, &mut client) };
                 let scale_x = size[0] / (client.right - client.left).max(1) as f32;
                 let scale_y = size[1] / (client.bottom - client.top).max(1) as f32;

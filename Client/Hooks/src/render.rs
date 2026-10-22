@@ -19,6 +19,11 @@ const END_SCENE_SLOT: usize = 42;
 static ORIGINAL_PRESENT: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_RESET: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_END_SCENE: AtomicUsize = AtomicUsize::new(0);
+/// The game device's own vtable slots (the Steam overlay and friends patch those, and their
+/// trampolines skip the start of d3d9's functions, so only this sees every Present).
+static VTABLE_PRESENT: AtomicUsize = AtomicUsize::new(0);
+static VTABLE_RESET: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 
@@ -181,6 +186,17 @@ pub fn install() {
 /// the usual place.
 fn draw(device: *mut c_void, only_back_buffer: bool) {
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    // Never on a loading screen (another thread draws it while the game thread loads: touching
+    // the device then froze the game), and only ever from the one thread that draws the frames.
+    static DRAW_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !crate::hang::game_running() {
+        ui::close_console();
+        return;
+    }
+    let thread = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    if DRAW_THREAD.compare_exchange(0, thread, Ordering::SeqCst, Ordering::SeqCst).is_err_and(|owner| owner != thread) {
+        return;
+    }
     let Some(d3d) = (unsafe { IDirect3DDevice9::from_raw_borrowed(&device) }) else { return };
     if only_back_buffer {
         let target = unsafe { d3d.GetRenderTarget(0) }.ok().map(|t| t.as_raw() as usize);
@@ -213,10 +229,49 @@ unsafe extern "system" fn present(device: *mut c_void, source: *const RECT, dest
     unsafe { original(device, source, dest, window, dirty) }
 }
 
+/// Patches the device's own vtable (Present and Reset), once, from the first EndScene.
+fn hook_device_vtable(device: *mut c_void) {
+    let vtable = unsafe { *(device as *const usize) };
+    for (slot, hook, original) in [
+        (PRESENT_SLOT, vtable_present as usize, &VTABLE_PRESENT),
+        (RESET_SLOT, vtable_reset as usize, &VTABLE_RESET),
+    ] {
+        let address = vtable + slot * 4;
+        original.store(unsafe { *(address as *const usize) }, Ordering::SeqCst);
+        if let Err(e) = unsafe { memory::patch(address, &(hook as u32).to_le_bytes()) } {
+            log!("render: could not hook the device vtable slot {slot}: {e}");
+            return;
+        }
+    }
+    PRESENT_HOOKED.store(true, Ordering::SeqCst);
+    log!("render: hooked the game device's own vtable {vtable:#x} (Present, Reset)");
+}
+
+unsafe extern "system" fn vtable_present(device: *mut c_void, source: *const RECT, dest: *const RECT, window: HWND, dirty: *const c_void) -> i32 {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| log!("render: first Present through the device vtable"));
+    draw(device, false);
+    let original: Present = unsafe { std::mem::transmute(VTABLE_PRESENT.load(Ordering::SeqCst)) };
+    unsafe { original(device, source, dest, window, dirty) }
+}
+
+unsafe extern "system" fn vtable_reset(device: *mut c_void, parameters: *mut D3DPRESENT_PARAMETERS) -> i32 {
+    ui::device_lost();
+    events::emit(events::GameEvent::DeviceReset);
+    let original: Reset = unsafe { std::mem::transmute(VTABLE_RESET.load(Ordering::SeqCst)) };
+    unsafe { original(device, parameters) }
+}
+
 unsafe extern "system" fn end_scene(device: *mut c_void) -> i32 {
     static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| log!("render: first EndScene, device {device:p}"));
-    draw(device, true);
+    FIRST.call_once(|| {
+        log!("render: first EndScene, device {device:p}");
+        hook_device_vtable(device);
+    });
+    // The frame is drawn once, at Present, as the last thing; EndScene only until that hook is in.
+    if !PRESENT_HOOKED.load(Ordering::SeqCst) {
+        draw(device, true);
+    }
     let original: EndScene = unsafe { std::mem::transmute(ORIGINAL_END_SCENE.load(Ordering::SeqCst)) };
     unsafe { original(device) }
 }

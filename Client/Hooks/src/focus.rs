@@ -138,6 +138,11 @@ fn focused() -> bool {
     }
 }
 
+/// Whether `device` is the game's DirectInput mouse.
+fn is_mouse(device: *mut c_void) -> bool {
+    device as usize == unsafe { *(memory::from_ghidra(MOUSE_DEVICE) as *const usize) }
+}
+
 /// Finds the originals for the device's vtable.
 fn originals_of(device: *mut c_void) -> Option<usize> {
     let vtable = unsafe { *(device as *const usize) };
@@ -148,6 +153,15 @@ unsafe extern "system" fn get_device_state(device: *mut c_void, size: u32, data:
     let Some(index) = originals_of(device) else { return DI_OK };
     let original: GetDeviceState = unsafe { std::mem::transmute(STATE_ORIGINALS[index].load(Ordering::SeqCst)) };
     let result = unsafe { original(device, size, data) };
+    if crate::ui::capturing() && is_mouse(device) && size >= 16 && !data.is_null() && result == DI_OK {
+        // DIMOUSESTATE(2): lX, lY, lZ, then the button bytes. The console reads the mouse itself.
+        let state = unsafe { std::slice::from_raw_parts(data, size as usize) };
+        let axis = |at: usize| i32::from_le_bytes([state[at], state[at + 1], state[at + 2], state[at + 3]]);
+        crate::ui::raw_mouse(axis(0), axis(4), axis(8));
+        for button in 0..3 {
+            crate::ui::raw_button(button, state[12 + button] & 0x80 != 0);
+        }
+    }
     if (!focused() || crate::ui::capturing()) && !data.is_null() {
         unsafe { std::ptr::write_bytes(data, 0, size as usize) };
         return DI_OK;
@@ -159,6 +173,20 @@ unsafe extern "system" fn get_device_data(device: *mut c_void, size: u32, data: 
     let Some(index) = originals_of(device) else { return DI_OK };
     let original: GetDeviceData = unsafe { std::mem::transmute(DATA_ORIGINALS[index].load(Ordering::SeqCst)) };
     let result = unsafe { original(device, size, data, count, flags) };
+    if crate::ui::capturing() && is_mouse(device) && size >= 16 && !data.is_null() && !count.is_null() && result == DI_OK {
+        // DIDEVICEOBJECTDATA entries: offset (0 = X, 4 = Y, 8 = wheel, 12.. = buttons), data.
+        for entry in 0..unsafe { *count } as usize {
+            let at = unsafe { data.add(entry * size as usize) };
+            let (offset, value) = unsafe { (*(at as *const u32), *(at.add(4) as *const i32)) };
+            match offset {
+                0 => crate::ui::raw_mouse(value, 0, 0),
+                4 => crate::ui::raw_mouse(0, value, 0),
+                8 => crate::ui::raw_mouse(0, 0, value),
+                12..=14 => crate::ui::raw_button((offset - 12) as usize, value & 0x80 != 0),
+                _ => {}
+            }
+        }
+    }
     if (!focused() || crate::ui::capturing()) && !count.is_null() {
         // Read (and so drop) the buffered events, but hand none to the game.
         unsafe { *count = 0 };

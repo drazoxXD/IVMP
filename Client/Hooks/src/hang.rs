@@ -37,6 +37,13 @@ pub fn heartbeat() {
     }
 }
 
+/// Whether the game thread ran a frame in the last half second. False on loading screens (the
+/// game thread is busy loading and a separate thread draws the progress), when the device must
+/// not be touched from our side.
+pub fn game_running() -> bool {
+    now_ms().saturating_sub(LAST_FRAME_MS.load(Ordering::Relaxed)) < 500
+}
+
 fn watchdog() {
     let mut reported = 0;
     loop {
@@ -49,12 +56,33 @@ fn watchdog() {
         if reported < REPORTS {
             reported += 1;
             log!("hang: game thread has not run a frame for {} s", stalled / 1000);
-            report(GAME_THREAD.load(Ordering::Relaxed));
+            report(GAME_THREAD.load(Ordering::Relaxed), 24);
+            if reported == 1 {
+                report_other_threads();
+            }
         }
     }
 }
 
-fn report(thread_id: u32) {
+/// Where every other thread of the process is (the game thread is often waiting for one of them).
+fn report_other_threads() {
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else { return };
+    let mut entry = THREADENTRY32 { dwSize: size_of::<THREADENTRY32>() as u32, ..Default::default() };
+    let own = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
+    let me = unsafe { GetCurrentThreadId() };
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) }.is_ok();
+    while more {
+        if entry.th32OwnerProcessID == own && entry.th32ThreadID != me && entry.th32ThreadID != GAME_THREAD.load(Ordering::Relaxed) {
+            log!("hang: thread {}", entry.th32ThreadID);
+            report(entry.th32ThreadID, 6);
+        }
+        more = unsafe { Thread32Next(snapshot, &mut entry) }.is_ok();
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+}
+
+fn report(thread_id: u32, max_frames: usize) {
     unsafe {
         let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, false, thread_id)
         else {
@@ -98,7 +126,7 @@ fn report(thread_id: u32) {
             if (start..end).contains(&value) {
                 log!("hang:   [esp+{:#05x}] {}", slot * 4, crate::crash::describe(value));
                 found += 1;
-                if found == 24 {
+                if found == max_frames {
                     break;
                 }
             }
