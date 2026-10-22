@@ -331,6 +331,9 @@ pub fn install() {
     }
     install_spawn_hook();
     install_menu_guard();
+    if crate::config().dlc >= 2 {
+        crate::dlc::install();
+    }
 }
 
 // Without the startup script nothing creates the player ped, and the first world update
@@ -643,6 +646,45 @@ fn network_test_tick() {
 // The M menu of the lobby (the MP frontend, `CViewportFrontend3DScene`): its close routine
 // (0x5BD8B0) runs on a null UI object when the setup (0x5B9AA0) never finished, which crashes the
 // game thread. Guard it, and log the setup's state once a second while the menu is up.
+// The model-info pools (docs/dlc.md): every kind of model definition (peds, vehicles, weapons,
+// instances, interiors, the 2dfx attributes, ...) lives in a fixed-size pool `{capacity, used, base}`,
+// 12 bytes each in a table at 0x0103AD64, built once at the game's start from the capacity in the
+// data section. The base game nearly fills several of them, and a game that also loads the
+// episodes' content (TLAD, TBoGT: `dlc` 2 and 3) takes more slots than exist, so the next
+// allocation is a garbage slot (a crash in the IDE parser). The capacities are raised before the
+// game builds the pools. The game's own capacities, in table order (the first pool, the 28000 base
+// model infos, is left alone: the model table has 31000 slots):
+const MODEL_POOL_TABLE: usize = 0x0103_AD64;
+const MODEL_POOL_CAPACITIES: [u32; 23] = [
+    550, 1800, 100, 205, 585, 220, 17000, 300, 11000, 13250, 10900, 2700, 50, 100, 122, 10900, 600, 35, 20, 100, 280, 250, 30,
+];
+
+/// Three times the room for the small pools, twice for the big ones (indices into them are 16 bit).
+fn raised(capacity: u32) -> u32 {
+    if capacity >= 10_000 { capacity * 2 } else { capacity * 3 }
+}
+
+pub fn raise_model_pools() {
+    if crate::config().dlc < 2 {
+        return;
+    }
+    let mut raised_count = 0;
+    for (index, original) in MODEL_POOL_CAPACITIES.iter().enumerate() {
+        let address = MODEL_POOL_TABLE + 12 * (index + 1);
+        let at = memory::from_ghidra(address);
+        let mut current = [0u8; 4];
+        if !memory::read(at, &mut current) || u32::from_le_bytes(current) != *original {
+            log!("pools: {address:#x} holds {}, not {original}: left alone", u32::from_le_bytes(current));
+            continue;
+        }
+        match unsafe { memory::patch(at, &raised(*original).to_le_bytes()) } {
+            Ok(()) => raised_count += 1,
+            Err(e) => log!("pools: {address:#x} could not be raised: {e}"),
+        }
+    }
+    log!("pools: {raised_count} of {} model pools raised for the episodes", MODEL_POOL_CAPACITIES.len());
+}
+
 static MENU_CLOSE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 const MENU_CLOSE: usize = 0x005B_D8B0;
 const MENU_UI_OBJECT: usize = 0x018B_6EAC;

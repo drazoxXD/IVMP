@@ -31,6 +31,9 @@ pub struct LaunchConfig {
     /// Experiment: once in the world, ask the engine to switch to its own network game mode.
     /// Not shown in the launcher; set it by hand in ivmp.json.
     pub network_test: bool,
+    /// Which content the game loads: 1 = GTA IV, 2 = EFLC (the episodes), 3 = both. With the
+    /// episodes the game's model pools are made bigger (hooks/boot.rs).
+    pub dlc: u8,
     /// GTAIV.exe to start for the second client (FiveM's `PathCL2`), e.g. a second copy of the
     /// game folder. Empty: use the exe of the copy that is already running.
     pub game_path: String,
@@ -50,6 +53,7 @@ impl Default for LaunchConfig {
             server: "127.0.0.1:9999".into(),
             direct_online: true,
             network_test: true,
+            dlc: 3,
             game_path: String::new(),
             window_mode: "windowed".into(),
             width: 1280,

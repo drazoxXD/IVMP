@@ -9,6 +9,7 @@
 
 mod boot;
 mod crash;
+mod dlc;
 mod dump;
 mod enginelog;
 mod events;
@@ -19,9 +20,9 @@ mod web;
 mod focus;
 mod hang;
 mod memstats;
+mod luacompat;
 mod luanatives;
 mod luaui;
-mod luacompat;
 mod mods;
 mod scripts;
 mod window;
@@ -92,6 +93,10 @@ fn on_attach() {
             log!("game code never finished unpacking, no patches applied");
             return;
         }
+        // Before anything else: the game builds its model pools early in its start, with the capacities
+        // in its data section (boot.rs).
+        boot::raise_model_pools();
+        dlc::relocate_handling();
         // Mods first, so FusionFix and the file overlay are in before the game loads its data.
         // The second client (-cl2) runs without mods.
         if !instance::second_client() {

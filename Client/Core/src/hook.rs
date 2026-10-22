@@ -138,3 +138,40 @@ mod tests {
         assert!(relocate(&code, 0x1000, 0x9000).is_err());
     }
 }
+
+/// The 4-byte fields in the game's code that hold an address in `range`: memory displacements and
+/// 32-bit immediates of instructions, found by decoding the code (a plain search of the bytes for
+/// the numbers finds many that are no operands, bytes of other instructions that happen to match).
+/// Each is the address of the field itself, to be patched.
+pub fn find_address_operands(range: std::ops::Range<usize>) -> Vec<usize> {
+    let mut found = Vec::new();
+    for (start, bytes) in crate::memory::snapshot(crate::memory::code_section()) {
+        let mut decoder = Decoder::with_ip(32, &bytes, start as u64, DecoderOptions::NONE);
+        let mut instruction = Instruction::default();
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instruction);
+            if instruction.is_invalid() {
+                continue;
+            }
+            let offsets = decoder.get_constant_offsets(&instruction);
+            let ip = instruction.ip() as usize;
+            let mut fields = Vec::new();
+            if offsets.has_displacement() && offsets.displacement_size() == 4 {
+                fields.push(ip + offsets.displacement_offset());
+            }
+            if offsets.has_immediate() && offsets.immediate_size() == 4 {
+                fields.push(ip + offsets.immediate_offset());
+            }
+            for field in fields {
+                let at = field - start;
+                if at + 4 <= bytes.len() {
+                    let value = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+                    if range.contains(&value) {
+                        found.push(field);
+                    }
+                }
+            }
+        }
+    }
+    found
+}
