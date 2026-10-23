@@ -494,3 +494,22 @@ fn a_client_command_runs_locally_or_goes_to_the_server() {
     assert!(out.contains(&"[r] citizen thread".to_string()), "{out:?}");
     assert_eq!(scripting.take_server_events(), vec![(runtime::COMMAND_EVENT.to_string(), r#"["say hi"]"#.to_string())]);
 }
+
+#[test]
+fn a_command_may_wait() {
+    let folder = Folder::new("command_wait");
+    folder.resource(
+        "w",
+        "client_script 'c.lua'",
+        &[("c.lua", "RegisterCommand('slow', function(source, args) print('first', args[1]) Wait(30) print('second', args[1]) end)")],
+    );
+    let (scripting, log) = client_scripting(&folder);
+    scripting.start("w").unwrap();
+    assert!(scripting.run_command(0, "slow now"));
+    let early = lines(&log);
+    assert!(early.contains(&"[w] first\tnow".to_string()), "{early:?}");
+    assert!(!early.iter().any(|l| l.contains("second")), "it waits first");
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    scripting.tick();
+    assert!(lines(&log).contains(&"[w] second\tnow".to_string()), "{:?}", lines(&log));
+}

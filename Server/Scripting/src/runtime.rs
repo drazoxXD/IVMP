@@ -401,9 +401,20 @@ impl World {
             let raw = resource.lua.create_string(line).map(Value::String);
             match (table, raw) {
                 (Ok(table), Ok(raw)) => {
-                    self.arm();
-                    if let Err(e) = handler.call::<()>((source, table, raw)) {
-                        self.say(format!("[{}] error in the command '{name}': {e}", resource.name));
+                    // A command runs as a thread, so it may Wait (it then goes on later, like FiveM).
+                    match limited_thread(&resource.lua, handler, self.me.clone()) {
+                        Ok(thread) => {
+                            self.arm();
+                            match thread.resume::<Value>((source, table, raw)) {
+                                Ok(value) if thread.is_resumable() => {
+                                    let wake = Instant::now() + Duration::from_millis(wait_ms(&value));
+                                    resource.state.borrow_mut().threads.push(Th { thread, wake });
+                                }
+                                Ok(_) => {}
+                                Err(e) => self.say(format!("[{}] error in the command '{name}': {e}", resource.name)),
+                            }
+                        }
+                        Err(e) => self.say(format!("[{}] error in the command '{name}': {e}", resource.name)),
                     }
                 }
                 _ => self.say(format!("[{}] could not run the command '{name}'", resource.name)),
