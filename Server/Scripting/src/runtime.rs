@@ -46,6 +46,14 @@ pub struct ClientEvent {
     pub args: Vec<Variant>,
 }
 
+/// What a script asks the server to do with world entities (the server owns them, a client creates
+/// them): `CreateVehicle` / `CreatePed` and `DeleteEntity`. The token is what the script got back.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntityRequest {
+    Create { token: u32, ped: bool, model: String, position: [f32; 3], heading: f32 },
+    Delete { token: u32 },
+}
+
 struct Th {
     thread: Thread,
     wake: Instant,
@@ -113,6 +121,11 @@ pub struct World {
     players: RefCell<Vec<Player>>,
     drops: RefCell<Vec<(u32, String)>>,
     client_events: RefCell<Vec<ClientEvent>>,
+    /// `CreateVehicle` and friends, for the server to carry out; the next token to give out.
+    entity_requests: RefCell<Vec<EntityRequest>>,
+    next_token: Cell<u32>,
+    /// Where the players are (the server sets it), for `GetPlayerCoords`.
+    positions: RefCell<HashMap<u32, [f32; 3]>>,
     canceled: Cell<bool>,
     /// Why `playerConnecting` was canceled (SetKickReason).
     kick_reason: RefCell<String>,
@@ -179,6 +192,9 @@ impl World {
             players: RefCell::new(Vec::new()),
             drops: RefCell::new(Vec::new()),
             client_events: RefCell::new(Vec::new()),
+            entity_requests: RefCell::new(Vec::new()),
+            next_token: Cell::new(1),
+            positions: RefCell::new(HashMap::new()),
             canceled: Cell::new(false),
             kick_reason: RefCell::new(String::new()),
             starting: RefCell::new(Vec::new()),
@@ -479,6 +495,14 @@ impl World {
         std::mem::take(&mut *self.client_events.borrow_mut())
     }
 
+    pub fn take_entity_requests(&self) -> Vec<EntityRequest> {
+        std::mem::take(&mut *self.entity_requests.borrow_mut())
+    }
+
+    pub fn set_positions(&self, positions: HashMap<u32, [f32; 3]>) {
+        *self.positions.borrow_mut() = positions;
+    }
+
     /// A network event from player `source`: only handlers of resources that registered it with
     /// `RegisterNetEvent` run (a script can't be triggered by a client that way otherwise).
     pub fn net_event(&self, source: u32, name: &str, args: &[Variant]) {
@@ -762,6 +786,59 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
                 Ok(weak2.upgrade().and_then(|w| w.players.borrow().iter().find(|p| p.id == id).map(|p| p.name.clone())))
             })?,
         )?;
+        // World entities: the server owns them, a client creates them with the engine's factories.
+        for (name, ped) in [("CreateVehicle", false), ("CreatePed", true)] {
+            let weak2 = weak.clone();
+            globals.set(
+                name,
+                lua.create_function(move |_, (model, x, y, z, heading): (Value, f64, f64, f64, Option<f64>)| {
+                    let model = match model {
+                        Value::String(s) => s.to_string_lossy().to_string(),
+                        Value::Integer(i) => format!("0x{:x}", i as u32),
+                        Value::Number(n) => format!("0x{:x}", n as u32),
+                        _ => return Err(lua_error(format!("{name}(model, x, y, z, heading): the model is a name or a hash"))),
+                    };
+                    let Some(world) = weak2.upgrade() else { return Ok(0) };
+                    let token = world.next_token.get();
+                    world.next_token.set(token + 1);
+                    world.entity_requests.borrow_mut().push(EntityRequest::Create {
+                        token,
+                        ped,
+                        model,
+                        position: [x as f32, y as f32, z as f32],
+                        heading: heading.unwrap_or(0.0) as f32,
+                    });
+                    Ok(token)
+                })?,
+            )?;
+        }
+        let weak2 = weak.clone();
+        globals.set(
+            "DeleteEntity",
+            lua.create_function(move |_, token: u32| {
+                if let Some(world) = weak2.upgrade() {
+                    world.entity_requests.borrow_mut().push(EntityRequest::Delete { token });
+                }
+                Ok(())
+            })?,
+        )?;
+        let weak2 = weak.clone();
+        globals.set(
+            "GetPlayerCoords",
+            lua.create_function(move |_, id: Value| {
+                let id = match id {
+                    Value::Integer(i) => i as u32,
+                    Value::Number(n) => n as u32,
+                    Value::String(s) => s.to_string_lossy().parse().unwrap_or(u32::MAX),
+                    _ => return Ok((Value::Nil, Value::Nil, Value::Nil)),
+                };
+                let position = weak2.upgrade().and_then(|w| w.positions.borrow().get(&id).copied());
+                Ok(match position {
+                    Some([x, y, z]) => (Value::Number(x as f64), Value::Number(y as f64), Value::Number(z as f64)),
+                    None => (Value::Nil, Value::Nil, Value::Nil),
+                })
+            })?,
+        )?;
         let weak2 = weak.clone();
         globals.set(
             "DropPlayer",
@@ -883,7 +960,7 @@ fn install_api(lua: &Lua, world: &Rc<World>, name: &str, dir: &Path, state: &Rc<
 
     // The halves of the API that belong to one side only.
     if world.side == Side::Client {
-        for name in ["DropPlayer", "TriggerClientEvent", "SetKickReason"] {
+        for name in ["DropPlayer", "TriggerClientEvent", "SetKickReason", "CreateVehicle", "CreatePed", "DeleteEntity", "GetPlayerCoords"] {
             globals.set(name, Value::Nil)?;
         }
         let weak2 = weak.clone();

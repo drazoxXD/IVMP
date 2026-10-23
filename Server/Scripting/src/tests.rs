@@ -513,3 +513,38 @@ fn a_command_may_wait() {
     scripting.tick();
     assert!(lines(&log).contains(&"[w] second\tnow".to_string()), "{:?}", lines(&log));
 }
+
+#[test]
+fn scripts_ask_the_server_for_entities_and_player_positions() {
+    let folder = Folder::new("entities");
+    folder.resource(
+        "e",
+        "server_script 's.lua'",
+        &[(
+            "s.lua",
+            "RegisterCommand('car', function(source, args)\n\
+               local x, y, z = GetPlayerCoords(source)\n\
+               local a = CreateVehicle(args[1], x + 5, y, z, 90.0)\n\
+               local b = CreatePed('0x1234', 1, 2, 3)\n\
+               DeleteEntity(a)\n\
+               print(a, b, x, y, z, GetPlayerCoords(99))\n\
+             end)",
+        )],
+    );
+    let (scripting, log) = scripting(&folder);
+    scripting.start("e").unwrap();
+    scripting.set_positions(std::collections::HashMap::from([(3, [10.0, 20.0, 30.0])]));
+    assert!(scripting.run_command(3, "car sultan"));
+    assert!(lines(&log).contains(&"[e] 1\t2\t10.0\t20.0\t30.0\tnil\tnil\tnil".to_string()), "{:?}", lines(&log));
+    let requests = scripting.take_entity_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0],
+        EntityRequest::Create { token: 1, ped: false, model: "sultan".into(), position: [15.0, 20.0, 30.0], heading: 90.0 }
+    );
+    assert_eq!(
+        requests[1],
+        EntityRequest::Create { token: 2, ped: true, model: "0x1234".into(), position: [1.0, 2.0, 3.0], heading: 0.0 }
+    );
+    assert_eq!(requests[2], EntityRequest::Delete { token: 1 });
+}

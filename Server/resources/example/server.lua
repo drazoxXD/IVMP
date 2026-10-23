@@ -57,3 +57,19 @@ end)
 -- AddEventHandler('playerConnecting', function(name)
 --     if name == 'Banned' then SetKickReason('you are banned') CancelEvent() end
 -- end)
+
+-- `/car <model>` in the chat (or `car <model>` in the F1 console): a vehicle next to the player. The
+-- server owns it and a client creates it with the engine's factory, like the `spawn car` command.
+-- GetPlayerCoords(source) is where the server last saw that player.
+RegisterCommand('car', function(source, args)
+    local x, y, z = GetPlayerCoords(source)
+    if not x then
+        print('no position known yet for player ' .. tostring(source))
+        return
+    end
+    local model = args[1] or 'sultan'
+    local vehicle = CreateVehicle(model, x + 5.0, y, z, 0.0)
+    print(GetPlayerName(source) .. ' spawned a ' .. model .. ' (entity ' .. vehicle .. ')')
+end)
+
+-- DeleteEntity(entity) removes it again; CreatePed(model, x, y, z, heading) makes a ped.

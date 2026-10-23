@@ -48,8 +48,28 @@ fn with_runtime<R>(f: impl FnOnce(&Scripting) -> R) -> R {
     })
 }
 
+/// Tells the server where the player is, twice a second (peer to peer, it can't see it in the game's
+/// traffic): `GetPlayerCoords` and `spawn` use it.
+fn report_position() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    // Only in a loaded network game: before it there is no player to ask.
+    if !ivmp_networking::session::network_ready() || ivmp_networking::net::our_id().is_none() {
+        return;
+    }
+    let mut last = LAST.lock().unwrap();
+    if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+    if let Some(position) = ivmp_natives::natives::player_position() {
+        net::send_position(position);
+    }
+}
+
 /// Call once per frame on the game thread.
 pub fn tick() {
+    report_position();
     let changes = resources::take_changes();
     let events = net::take_script_events();
     // Nothing downloaded and nothing running: nothing to do, and no Lua state is made.

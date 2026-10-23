@@ -12,7 +12,7 @@ pub const MAGIC: [u8; 2] = *b"IV";
 /// Bump when the wire format changes; the server rejects other versions.
 pub mod reliable;
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 /// The most a script event's JSON arguments may take: it travels in one reliable packet.
 pub const MAX_SCRIPT_PAYLOAD: usize = 900;
 pub const DEFAULT_PORT: u16 = 9999;
@@ -61,7 +61,7 @@ pub fn safe_path(path: &str) -> bool {
         })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientMessage {
     Hello { version: u16, nickname: String },
     /// A game packet from the local engine (`from_port` = its socket port) to a virtual address.
@@ -87,6 +87,10 @@ pub enum ClientMessage {
     /// `TriggerServerEvent(name, ...)`: the arguments as JSON (see [`MAX_SCRIPT_PAYLOAD`]). Sent
     /// as a reliable message.
     ScriptEvent { name: String, payload: Vec<u8> },
+    /// Where the player is (a couple of times a second, not reliable): the server can't read it from
+    /// the game's traffic in a peer to peer session, and scripts (`GetPlayerCoords`) and `spawn`
+    /// need it.
+    Position { position: [f32; 3] },
     /// Asks for a file the server announced with [`ServerMessage::ResourceFile`].
     FileRequest { resource: String, path: String },
 }
@@ -176,6 +180,7 @@ const C_SESSION_RESTART: u8 = 0x06;
 const C_SESSION_READY: u8 = 0x07;
 const C_SCRIPT_EVENT: u8 = 0x08;
 const C_FILE_REQUEST: u8 = 0x09;
+const C_POSITION: u8 = 0x0D;
 const S_WELCOME: u8 = 0x81;
 const S_REJECT: u8 = 0x82;
 const S_PEER_JOINED: u8 = 0x83;
@@ -318,6 +323,7 @@ impl ClientMessage {
             ClientMessage::SessionReady => Writer::new(C_SESSION_READY).done(),
             ClientMessage::ScriptEvent { name, payload } => Writer::new(C_SCRIPT_EVENT).str(name).rest(payload),
             ClientMessage::FileRequest { resource, path } => Writer::new(C_FILE_REQUEST).str(resource).str(path).done(),
+            ClientMessage::Position { position } => Writer::new(C_POSITION).f32(position[0]).f32(position[1]).f32(position[2]).done(),
         }
     }
 
@@ -336,6 +342,7 @@ impl ClientMessage {
             C_SESSION_READY => ClientMessage::SessionReady,
             C_SCRIPT_EVENT => ClientMessage::ScriptEvent { name: r.str()?, payload: r.rest() },
             C_FILE_REQUEST => ClientMessage::FileRequest { resource: r.str()?, path: r.str()? },
+            C_POSITION => ClientMessage::Position { position: [r.f32()?, r.f32()?, r.f32()?] },
             other => return Err(DecodeError::UnknownTag(other)),
         })
     }
@@ -455,6 +462,7 @@ mod tests {
             ClientMessage::SessionReady,
             ClientMessage::ScriptEvent { name: "chat:message".into(), payload: b"[\"hi\",1]".to_vec() },
             ClientMessage::FileRequest { resource: "chat".into(), path: "ui/index.html".into() },
+            ClientMessage::Position { position: [894.5, -500.25, 15.0] },
         ] {
             assert_eq!(ClientMessage::decode(&m.encode()), Ok(m));
         }

@@ -115,6 +115,7 @@ fn on_attach() {
             let engine_log = if instance::second_client() { "IVMP_Engine_cl2.log" } else { "IVMP_Engine.log" };
             enginelog::install(&dll_dir().join(engine_log));
             nativelog::install();
+            ivmp_natives::natives::install_thread_capture();
             nativelog::install_script_names();
             lobby::install_host_override();
             ivmp_networking::hostsys::install_lobby_natives();

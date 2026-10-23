@@ -54,6 +54,10 @@ pub struct Server {
     offers: HashMap<String, Vec<resources::FileEntry>>,
     /// Files on their way to each client.
     transfers: HashMap<ClientId, resources::Queue>,
+    /// Where each player says they are (ClientMessage::Position).
+    reported_positions: HashMap<ClientId, [f32; 3]>,
+    /// What a script got from `CreateVehicle` (a token) -> the server entity it became.
+    script_entities: HashMap<u32, u32>,
     /// What clients host and join (server.cfg `gamemode`, `slots`).
     gamemode: i32,
     slots: u8,
@@ -116,6 +120,8 @@ impl Server {
             script_rate: HashMap::new(),
             offers: HashMap::new(),
             transfers: HashMap::new(),
+            script_entities: HashMap::new(),
+            reported_positions: HashMap::new(),
             socket,
             lobby: Lobby { preset_ids: config.ids.clone(), ..Lobby::default() },
             capture,
@@ -199,6 +205,24 @@ impl Server {
 
     /// What scripts asked for: players dropped, events for clients (stage 2 delivers those).
     fn script_requests(&mut self) {
+        let positions: HashMap<u32, [f32; 3]> =
+            self.player_positions().into_iter().filter_map(|(id, p)| p.map(|p| (id as u32, p))).collect();
+        self.scripting.set_positions(positions);
+        for request in self.scripting.take_entity_requests() {
+            match request {
+                ivmp_scripting::EntityRequest::Create { token, ped, model, position, heading } => {
+                    let kind = if ped { NetProtocol::SpawnKind::Ped } else { NetProtocol::SpawnKind::Vehicle };
+                    let id = self.world.add(kind, world::model_hash(&model), position, heading);
+                    self.script_entities.insert(token, id);
+                    say!("script entity {id}: {kind:?} {model} at {:.1} {:.1} {:.1}", position[0], position[1], position[2]);
+                    self.update_world();
+                }
+                ivmp_scripting::EntityRequest::Delete { token } => match self.script_entities.remove(&token) {
+                    Some(id) => self.despawn_server_entity(id),
+                    None => say!("DeleteEntity: no entity {token}"),
+                },
+            }
+        }
         for (id, reason) in self.scripting.take_drops() {
             if let Ok(client) = ClientId::try_from(id) {
                 if self.lobby.clients.contains_key(&client) {
@@ -221,6 +245,27 @@ impl Server {
                     _ => say!("TriggerClientEvent '{}': there is no player {}", event.name, event.target),
                 }
             }
+        }
+    }
+
+    /// Deletes a server entity: its owner deletes it, which removes it for everyone.
+    fn despawn_server_entity(&mut self, id: u32) {
+        match self.world.remove(id) {
+            Some(entity) => {
+                // The owner deletes it, which removes it for everyone.
+                let owner = entity.object_id.and_then(|object_id| {
+                    let owner = self.entities.entities.get(&object_id).map(|e| e.owner);
+                    owner.or(entity.creator.map(|(c, _)| c)).map(|owner| (owner, object_id))
+                });
+                match owner.filter(|(owner, _)| self.lobby.clients.contains_key(owner)) {
+                    Some((owner, object_id)) => {
+                        self.reliable(owner, &ServerMessage::Despawn { kind: entity.kind, object_id });
+                        say!("server entity {id} deleted (asked client {owner})");
+                    }
+                    None => say!("server entity {id} forgotten (nobody has it)"),
+                }
+            }
+            None => say!("no server entity {id}"),
         }
     }
 
@@ -444,6 +489,11 @@ impl Server {
                 }
             }
             (ClientMessage::KeepAlive, Some(_)) => {}
+            (ClientMessage::Position { position }, Some(id)) => {
+                if position.iter().all(|v| v.is_finite()) {
+                    self.reported_positions.insert(id, position);
+                }
+            }
             (ClientMessage::Ping { stamp }, Some(id)) => {
                 let (up, down) = self.lobby.clients.get(&id).map(|c| (c.up.get(), c.down.get())).unwrap_or((0, 0));
                 self.send(from, &ServerMessage::Pong { stamp, up, down });
@@ -553,12 +603,9 @@ impl Server {
             .clients
             .keys()
             .map(|id| {
-                let position = self
-                    .entities
-                    .entities
-                    .values()
-                    .find(|e| e.object_type == nodes::PLAYER && e.owner == *id)
-                    .and_then(|e| e.position);
+                let position = self.reported_positions.get(id).copied().or_else(|| {
+                    self.entities.entities.values().find(|e| e.object_type == nodes::PLAYER && e.owner == *id).and_then(|e| e.position)
+                });
                 (*id, position)
             })
             .collect()
@@ -599,23 +646,7 @@ impl Server {
                 say!("server entity {id}: {kind:?} {model} at {:.1} {:.1} {:.1}", position[0], position[1], position[2]);
                 self.update_world();
             }
-            Command::Despawn(id) => match self.world.remove(id) {
-                Some(entity) => {
-                    // The owner deletes it, which removes it for everyone.
-                    let owner = entity.object_id.and_then(|object_id| {
-                        let owner = self.entities.entities.get(&object_id).map(|e| e.owner);
-                        owner.or(entity.creator.map(|(c, _)| c)).map(|owner| (owner, object_id))
-                    });
-                    match owner.filter(|(owner, _)| self.lobby.clients.contains_key(owner)) {
-                        Some((owner, object_id)) => {
-                            self.reliable(owner, &ServerMessage::Despawn { kind: entity.kind, object_id });
-                            say!("server entity {id} deleted (asked client {owner})");
-                        }
-                        None => say!("server entity {id} forgotten (nobody has it)"),
-                    }
-                }
-                None => say!("no server entity {id}"),
-            },
+            Command::Despawn(id) => self.despawn_server_entity(id),
             Command::Entities => {
                 if self.world.entities.is_empty() {
                     say!("no server entities");
@@ -666,6 +697,7 @@ impl Server {
 
     fn remove(&mut self, id: ClientId, why: &str) {
         self.script_rate.remove(&id);
+        self.reported_positions.remove(&id);
         self.transfers.remove(&id);
         if let Some(host) = self.host.as_mut() {
             host.remove(id);

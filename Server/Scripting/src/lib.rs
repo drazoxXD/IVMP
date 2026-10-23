@@ -6,7 +6,7 @@ mod runtime;
 pub mod variant;
 
 pub use mlua;
-pub use runtime::{ClientEvent, Player, Side};
+pub use runtime::{ClientEvent, EntityRequest, Player, Side};
 pub use variant::Variant;
 
 use std::path::PathBuf;
@@ -138,6 +138,16 @@ impl Scripting {
     /// `TriggerClientEvent` calls waiting to be sent.
     pub fn take_client_events(&self) -> Vec<ClientEvent> {
         self.world.take_client_events()
+    }
+
+    /// What scripts asked for in the world since the last call (`CreateVehicle`, `CreatePed`, `DeleteEntity`).
+    pub fn take_entity_requests(&self) -> Vec<EntityRequest> {
+        self.world.take_entity_requests()
+    }
+
+    /// Where the players are now, for `GetPlayerCoords`.
+    pub fn set_positions(&self, positions: std::collections::HashMap<u32, [f32; 3]>) {
+        self.world.set_positions(positions);
     }
 
     /// A network event from a player: runs the handlers registered with `RegisterNetEvent`.

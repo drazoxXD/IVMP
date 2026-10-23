@@ -538,6 +538,11 @@ pub fn send_reliable(message: &ClientMessage) {
     }
 }
 
+/// Tells the server where the local player is (unreliable, a couple of times a second).
+pub fn send_position(position: [f32; 3]) {
+    send(&ClientMessage::Position { position });
+}
+
 /// Sends a message to the server (any thread). Dropped when not connected yet.
 pub fn send(message: &ClientMessage) {
     if let Some(connection) = connected() {
