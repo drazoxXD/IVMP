@@ -24,11 +24,12 @@ CreateThread(function()
     end
 end)
 
--- Natives by name (about 3000 are known, with their argument types): `where` in the F1 console
--- prints where you are. Out parameters (the ped, the coordinates) come back as return values.
+-- Natives are global functions, like in FiveM, in any style of their name (GET_PLAYER_CHAR, GetPlayerChar,
+-- getPlayerChar): about 3000 are known with their argument types. `where` in the F1 console prints
+-- where you are. A native that writes into pointers returns those values (the ped, the coordinates).
 RegisterCommand('where', function()
-    local ped = Natives.GET_PLAYER_CHAR(0)
-    local x, y, z = Natives.GET_CHAR_COORDINATES(ped)
+    local ped = GetPlayerChar(0)
+    local x, y, z = GetCharCoordinates(ped)
     print(string.format('you are at %.1f, %.1f, %.1f (ped %d)', x, y, z, ped))
 end)
 
@@ -41,4 +42,18 @@ end)
 -- `ui` in the F1 console: the page gets the mouse and keyboard (Escape gives them back).
 RegisterCommand('ui', function()
     SetNuiFocus(true, true)
+end)
+
+-- Sounds (wav, mp3, ogg, flac files of the resource) at a place in the world, muffled by what is in
+-- between (interiors for now): `beep` puts a looping beep 15 units ahead of the player, `nobeep` stops it.
+local beep
+RegisterCommand('beep', function()
+    local ped = GetPlayerChar(0)
+    local x, y, z = GetCharCoordinates(ped)
+    if beep then StopSound(beep) end
+    beep = PlaySoundAtCoords('sounds/beep.wav', x + 15.0, y, z, { volume = 1.0, radius = 60.0, loop = true })
+    print('beep at ' .. string.format('%.1f %.1f %.1f', x + 15.0, y, z) .. ' (sound ' .. beep .. ')')
+end)
+RegisterCommand('nobeep', function()
+    if beep then StopSound(beep) beep = nil end
 end)

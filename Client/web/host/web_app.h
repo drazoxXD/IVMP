@@ -118,7 +118,11 @@ class SchemeFactory : public CefSchemeHandlerFactory {
     buffer << file.rdbuf();
     std::string data = buffer.str();
     if (host != kHost && MimeOf(path) == "text/html") InjectNui(data);
-    return new CefStreamResourceHandler(MimeOf(path), CefStreamReader::CreateForData((void*)data.data(), data.size()));
+    // Files of another resource are fetched by the shell page (the audio file of a sound): same scheme,
+    // another host, so the response says it may be read.
+    CefResponse::HeaderMap headers;
+    headers.insert(std::make_pair(CefString("Access-Control-Allow-Origin"), CefString("*")));
+    return new CefStreamResourceHandler(200, "OK", MimeOf(path), headers, CefStreamReader::CreateForData((void*)data.data(), data.size()));
   }
   IMPLEMENT_REFCOUNTING(SchemeFactory);
 };
@@ -163,6 +167,8 @@ class WebApp : public CefApp, public CefRenderProcessHandler {
     line->AppendSwitch("disable-client-side-phishing-detection");
     line->AppendSwitch("disable-default-apps");
     line->AppendSwitch("no-pings");
+    // Sounds play without a click on the page (the page is never clicked before a sound starts).
+    line->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
     line->AppendSwitchWithValue("disable-features", "MediaRouter,Translate,WebRtcHideLocalIpsWithMdns");
   }
 

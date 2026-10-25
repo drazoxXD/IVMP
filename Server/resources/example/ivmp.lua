@@ -6,5 +6,5 @@ version '1.0.0'
 
 server_scripts { 'server.lua' }
 client_scripts { 'client.lua' }
-files { 'ui/index.html' }
+files { 'ui/index.html', 'sounds/beep.wav' }
 ui_page 'ui/index.html'

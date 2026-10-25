@@ -40,6 +40,7 @@ fn with_runtime<R>(f: impl FnOnce(&Scripting) -> R) -> R {
             runtime.set_extra_api(|lua| {
                 crate::luanatives::install(lua)?;
                 crate::luaui::install(lua)?;
+                crate::audio::install(lua)?;
                 crate::luacompat::install(lua)
             });
             runtime
@@ -70,6 +71,7 @@ fn report_position() {
 /// Call once per frame on the game thread.
 pub fn tick() {
     report_position();
+    crate::audio::tick();
     let changes = resources::take_changes();
     let events = net::take_script_events();
     // Nothing downloaded and nothing running: nothing to do, and no Lua state is made.
@@ -98,6 +100,7 @@ pub fn tick() {
                 },
                 Change::Stop(name) => {
                     crate::web::close_ui(&name);
+                    crate::audio::stop_resource(&name);
                     if runtime.stop(&name).is_err() && runtime.running().contains(&name) {
                         stops.push(name);
                     }

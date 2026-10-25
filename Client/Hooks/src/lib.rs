@@ -7,6 +7,7 @@
 // The DLL is named IVMP_Client.
 #![allow(non_snake_case)]
 
+mod audio;
 mod boot;
 mod crash;
 mod dlc;
