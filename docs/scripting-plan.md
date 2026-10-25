@@ -94,8 +94,10 @@ FiveM resources run as they are where IVMP has what they use (FiveM's `chat` doe
    sources, MIT; originally Alexander Blade's scocl): every name of it is registered in this game
    build with the same hash, and `Client/tools/gen_natives.py` turns it into
    `Client/Hooks/natives.json`, which is built into the DLL. Client Lua has
+   every native is a global function like in FiveM, in any style of its name (`GET_PLAYER_CHAR(0)`,
+   `GetPlayerChar(0)`, `getPlayerChar(0)`; case and underscores don't matter), plus
    `InvokeNative(name|hash, ...)`, `Natives.NAME(...)`, `DeclareNative(name, hash, args, ret)` and
-   `NativeExists(...)`, e.g. `local x, y, z = Natives.GET_CHAR_COORDINATES(Natives.GET_PLAYER_CHAR(0))`:
+   `NativeExists(...)`, e.g. `local x, y, z = GetCharCoordinates(GetPlayerChar(0))`:
    out parameters come back as return values. A `natives.json` next to the DLL adds or overrides
    entries (`{"NAME": {"hash": "0x...", "args": "iif", "ret": "b"}}`, signature letters in
    Hooks/src/luanatives.rs). F1 console: `lua <code>` runs Lua on the game thread, `nativetrace

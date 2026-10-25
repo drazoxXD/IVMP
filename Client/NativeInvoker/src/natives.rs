@@ -169,6 +169,52 @@ pub fn player_position() -> Option<[f32; 3]> {
     position.iter().all(|v| v.is_finite()).then_some(position)
 }
 
+fn out(cell: &mut [u32; 4]) -> u32 {
+    cell.as_mut_ptr() as usize as u32
+}
+
+/// The camera the game renders from: its position and rotation (Euler angles in degrees: x pitch, y
+/// roll, z heading). Game thread only; None before there is a camera.
+pub fn camera() -> Option<([f32; 3], [f32; 3])> {
+    const GET_ROOT_CAM: u32 = 0x75E0_05F1;
+    const GET_CAM_POS: u32 = 0x60C2_2E93;
+    const GET_CAM_ROT: u32 = 0x51A0_6698;
+    let mut cam = [0u32; 4];
+    invoke_slots(GET_ROOT_CAM, &[out(&mut cam)])?;
+    if cam[0] == 0 || cam[0] == u32::MAX {
+        return None;
+    }
+    let (mut px, mut py, mut pz) = ([0u32; 4], [0u32; 4], [0u32; 4]);
+    invoke_slots(GET_CAM_POS, &[cam[0], out(&mut px), out(&mut py), out(&mut pz)])?;
+    let (mut rx, mut ry, mut rz) = ([0u32; 4], [0u32; 4], [0u32; 4]);
+    invoke_slots(GET_CAM_ROT, &[cam[0], out(&mut rx), out(&mut ry), out(&mut rz)])?;
+    let position = [f32::from_bits(px[0]), f32::from_bits(py[0]), f32::from_bits(pz[0])];
+    let rotation = [f32::from_bits(rx[0]), f32::from_bits(ry[0]), f32::from_bits(rz[0])];
+    (position.iter().chain(&rotation).all(|v| v.is_finite())).then_some((position, rotation))
+}
+
+/// The interior at a point (0 outdoors). Game thread only.
+pub fn interior_at(point: [f32; 3]) -> Option<u32> {
+    const GET_INTERIOR_AT_COORDS: u32 = 0x2921_6610;
+    let mut interior = [0u32; 4];
+    invoke_slots(GET_INTERIOR_AT_COORDS, &[point[0].to_bits(), point[1].to_bits(), point[2].to_bits(), out(&mut interior)])?;
+    Some(if interior[0] == u32::MAX { 0 } else { interior[0] })
+}
+
+/// How many solid things (walls, closed doors, ...) are between two points: the game's own probe that
+/// its audio uses to muffle sounds (collision mask 0x86), at most `max` hits. Game thread only.
+pub fn solids_between(from: [f32; 3], to: [f32; 3], max: usize) -> usize {
+    type Probe = unsafe extern "C" fn(*const f32, *const f32, *const u32, *mut u32, u32, i32, i32, i32, i32) -> i32;
+    let max = max.clamp(1, 4);
+    let probe: Probe = unsafe { std::mem::transmute(0x00A5_3770usize) };
+    let start = [from[0], from[1], from[2], 0.0];
+    let end = [to[0], to[1], to[2], 0.0];
+    // 0x60 bytes per hit.
+    let mut hits = [0u32; 24 * 4 + 8];
+    let found = unsafe { probe(start.as_ptr(), end.as_ptr(), std::ptr::null(), hits.as_mut_ptr(), 0x86, max as i32, 0, 2, 4) };
+    (found.max(0) as usize).min(max)
+}
+
 /// Whether this game build has a native with this hash.
 pub fn exists(hash: u32) -> bool {
     nativelog::handler_for(hash).is_some()

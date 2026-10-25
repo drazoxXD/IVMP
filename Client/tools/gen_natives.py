@@ -8,6 +8,7 @@ is registered in the game.
 
   natives.cfg.txt   NAME=$HASH
   natives.h.txt     extern <ret> NAME(<type> <name>, ...);   (types for the signature)
+  missing-from-headers.txt   NAME  0xHASH  <ret> NAME(<type> <name>, ...)   (the same for what the header lacks)
 
 Usage: gen_natives.py <folder holding natives.cfg.txt and natives.h.txt> [output.json]
 
@@ -82,13 +83,32 @@ def main():
         ret, name, params = m.group(1), m.group(2), m.group(3).strip()
         args = "" if params in ("", "void") else "".join(parse_param(p) for p in params.split(",") if p.strip())
         signatures[name.upper()] = (args, parse_return(ret))
+    # Natives the header lacks: NAME 0xHASH <declaration or "-">. Their hash counts too.
+    missing = folder / "missing-from-headers.txt"
+    if missing.exists():
+        for line in missing.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 3 or not parts[1].lower().startswith("0x"):
+                continue
+            name, rest = parts[0].upper(), parts[2].strip()
+            try:
+                hashes.setdefault(name, int(parts[1], 16))
+            except ValueError:
+                continue
+            if name in signatures or rest.startswith("-"):
+                continue
+            m = DECL.match("extern " + re.sub(r"/\*.*?\*/", "", rest.split("//")[0]) + ";")
+            if m and m.group(2).upper() == name:
+                params = m.group(3).strip()
+                args = "" if params in ("", "void") else "".join(parse_param(p) for p in params.split(",") if p.strip())
+                signatures[name] = (args, parse_return(m.group(1)))
     table = {}
     for name, value in sorted(hashes.items()):
         entry = {"hash": f"0x{value:08X}"}
         if name in signatures:
             entry["args"], entry["ret"] = signatures[name]
         table[name] = entry
-    out.write_text(json.dumps(table, separators=(",", ":")) + "\n", encoding="utf-8")
+    out.write_text(json.dumps(table, indent=2) + "\n", encoding="utf-8")
     typed = sum(1 for e in table.values() if "args" in e)
     print(f"{len(table)} natives, {typed} with a signature -> {out}")
 

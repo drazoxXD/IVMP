@@ -1,5 +1,9 @@
-//! Natives for client scripts (docs/scripting-plan.md, stage 4): `InvokeNative(name or hash, ...)`,
-//! `Natives.NAME(...)`, `DeclareNative(name, hash, args, ret)` and `NativeExists(name or hash)`.
+//! Natives for client scripts (docs/scripting-plan.md, stage 4). Like in FiveM every native is a
+//! global function, in any style of its name: `GET_PLAYER_CHAR(0)`, `GetPlayerChar(0)` and
+//! `getPlayerChar(0)` are the same call (case and underscores don't matter), and a native that
+//! writes into pointers returns those values: `local x, y, z = GetCharCoordinates(ped)`.
+//! `InvokeNative(name or hash, ...)`, `Natives.NAME(...)`, `DeclareNative(name, hash, args, ret)`
+//! and `NativeExists(name or hash)` still exist.
 //!
 //! The name table (about 3000 natives with typed signatures, `Client/Hooks/natives.json`, built into
 //! the DLL) comes from the GTA IV script tooling's native lists, whose hashes are this game
@@ -19,7 +23,7 @@ use std::ffi::CString;
 use std::sync::Mutex;
 
 use ivmp_natives::natives;
-use ivmp_scripting::mlua::{self, Lua, Value, Variadic};
+use ivmp_scripting::mlua::{self, Lua, Table, Value, Variadic};
 
 use crate::log;
 
@@ -189,6 +193,41 @@ fn load_text(table: &mut HashMap<String, Signature>, text: &str, source: &str) -
     added
 }
 
+/// The name with only its lowercase letters and digits: `GET_PLAYER_CHAR`, `GetPlayerChar` and
+/// `getplayerchar` are one native.
+fn normalized(name: &str) -> String {
+    name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// The table's name for a name in any style, if it is a native.
+fn canonical(name: &str) -> Option<String> {
+    // Natives made with DeclareNative after the index was built are found too, by their own name.
+    let key = normalized(name);
+    if key.len() < 3 {
+        return None;
+    }
+    with_table(|t| {
+        if let Some(found) = t.get(&name.to_ascii_uppercase()) {
+            let _ = found;
+            return Some(name.to_ascii_uppercase());
+        }
+        NORMALIZED
+            .get_or_init(|| {
+                let mut index: HashMap<String, String> = HashMap::new();
+                let mut names: Vec<&String> = t.keys().collect();
+                names.sort();
+                for native in names {
+                    index.entry(normalized(native)).or_insert_with(|| native.clone());
+                }
+                index
+            })
+            .get(&key)
+            .cloned()
+    })
+}
+
+static NORMALIZED: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+
 /// The name of a native by its hash, for the trace log.
 pub fn name_of(hash: u32) -> Option<String> {
     static BY_HASH: std::sync::OnceLock<HashMap<u32, String>> = std::sync::OnceLock::new();
@@ -242,7 +281,7 @@ fn invoke(lua: &Lua, args: Variadic<Value>) -> mlua::Result<Variadic<Value>> {
     let target = args.next().ok_or_else(|| lua_error("InvokeNative(name or hash, ...)"))?;
     let (signature, label) = match &target {
         Value::String(name) => {
-            let name = name.to_string_lossy().to_ascii_uppercase();
+            let name = canonical(&name.to_string_lossy()).unwrap_or_else(|| name.to_string_lossy().to_ascii_uppercase());
             match with_table(|t| t.get(&name).cloned()) {
                 Some(signature) => (signature, name),
                 None => {
@@ -347,7 +386,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         "NativeExists",
         lua.create_function(|_, target: Value| {
             let hash = match &target {
-                Value::String(name) => with_table(|t| t.get(&name.to_string_lossy().to_ascii_uppercase()).map(|s| s.hash)),
+                Value::String(name) => canonical(&name.to_string_lossy()).and_then(|n| with_table(|t| t.get(&n).map(|s| s.hash))),
                 other => hash_of(other),
             };
             Ok(hash.is_some_and(natives::exists))
@@ -368,6 +407,30 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     table.set_metatable(Some(meta))?;
     globals.set("Natives", table)?;
+
+    // Every native is a global function, like in FiveM: a name that is no global yet but is a native
+    // (in any style) becomes a function that calls it, kept in the globals for the next time. The
+    // globals the runtime and the resource define come first, so `Wait` and `GetPlayerName` stay ours.
+    let global_meta = match globals.metatable() {
+        Some(existing) => existing,
+        None => lua.create_table()?,
+    };
+    global_meta.set(
+        "__index",
+        lua.create_function(|lua, (globals, key): (Table, Value)| {
+            let Value::String(key) = key else { return Ok(Value::Nil) };
+            let name = key.to_string_lossy().to_string();
+            let Some(native) = canonical(&name) else { return Ok(Value::Nil) };
+            let function = lua.create_function(move |lua, args: Variadic<Value>| {
+                let mut call = vec![Value::String(lua.create_string(&native)?)];
+                call.extend(args);
+                invoke(lua, Variadic::from(call))
+            })?;
+            globals.raw_set(name, function.clone())?;
+            Ok(Value::Function(function))
+        })?,
+    )?;
+    globals.set_metatable(Some(global_meta))?;
     Ok(())
 }
 
@@ -414,5 +477,16 @@ mod tests {
         assert_eq!((one.hash, two.hash), (0xAB, 4660));
         assert_eq!(two.ret, [Ret::Vector]);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_native_is_found_by_its_name_in_any_style() {
+        for name in ["GET_PLAYER_CHAR", "GetPlayerChar", "getPlayerChar", "getplayerchar", "get_Player_char"] {
+            assert_eq!(canonical(name).as_deref(), Some("GET_PLAYER_CHAR"), "{name}");
+        }
+        assert_eq!(canonical("GetCharCoordinates").as_deref(), Some("GET_CHAR_COORDINATES"));
+        assert_eq!(canonical("Wait2Frames"), None);
+        assert_eq!(canonical("ab"), None, "too short to be a native");
+        assert_eq!(canonical("SomethingNobodyDefined"), None);
     }
 }
