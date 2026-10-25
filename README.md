@@ -10,8 +10,11 @@
 ![Game](https://img.shields.io/badge/GTA%20IV-Complete%20Edition%201.2.0.59-orange?style=for-the-badge)
 
 [Download](https://github.com/drazoxXD/IVMP/releases/latest) · [Getting started](#getting-started) · [Server setup](#running-a-server) · [Building](#building) · [Docs](docs)
-
 </div>
+
+> [!WARNING]
+> IVMP is Work In Progress and under active development. \
+> IVMP uses AI for development and in stable version will refactor the whole codebase.
 
 ---
 
