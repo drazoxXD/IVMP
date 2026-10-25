@@ -150,6 +150,9 @@ const HANDLING_MARKERS: [(usize, usize); 3] = [(0xF8, 0x016E_80A0), (0xFC, 0x016
 /// `int append_or_find(const char* name)`, cdecl: the index of the named entry, new ones appended.
 const HANDLING_FIND_OR_ADD: usize = 0x00C7_3FC0;
 const HANDLING_COUNT: usize = 0x016D_D690;
+/// The handling loader functions (0x00C72E00..0x00C74000) that reference the handling table.
+const HANDLING_CODE_START: usize = 0x00C7_2D00;
+const HANDLING_CODE_END: usize = 0x00C7_4200;
 
 /// Where the table lives now (0 = it was not moved).
 static HANDLING_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -176,7 +179,8 @@ fn relocate_handling() {
     // The address operands in the code that point into the old table, found by decoding the
     // instructions (a search of the raw bytes also finds bytes of unrelated instructions).
     let mut patched = 0;
-    for field in ivmp_core::hook::find_address_operands(old_start..old_end) {
+    let code_range = memory::from_ghidra(HANDLING_CODE_START)..memory::from_ghidra(HANDLING_CODE_END);
+    for field in ivmp_core::hook::find_address_operands_in(code_range, old_start..old_end) {
         let mut current = [0u8; 4];
         if !memory::read(field, &mut current) {
             continue;

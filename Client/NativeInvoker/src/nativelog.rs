@@ -85,7 +85,7 @@ pub fn install() {
         return;
     };
     let rel = (native_thunk as usize as isize - (site as isize + 5)) as i32;
-    let mut bytes = [0x90u8; 13];
+    let mut bytes = [0x90u8; 14];
     bytes[0] = 0xE8;
     bytes[1..5].copy_from_slice(&rel.to_le_bytes());
     match unsafe { memory::patch(site, &bytes) } {
