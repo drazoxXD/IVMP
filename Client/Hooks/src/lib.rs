@@ -10,6 +10,7 @@
 mod audio;
 mod boot;
 mod crash;
+mod discord;
 mod dlc;
 mod dump;
 mod enginelog;
@@ -106,6 +107,7 @@ fn on_attach() {
         focus::install();
         render::install();
         web::install();
+        discord::install();
         // Let another copy of the game start next to this one.
         instance::release_single_instance_mutex();
         let config = crate::config();

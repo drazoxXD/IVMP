@@ -56,6 +56,9 @@ static RELIABLE_IN: Mutex<Option<ReliableIn>> = Mutex::new(None);
 
 static OUR_ID: AtomicU8 = AtomicU8::new(0);
 static HOST_ID: AtomicU8 = AtomicU8::new(0);
+static PEERS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static TARGET_SERVER: Mutex<String> = Mutex::new(String::new());
+static SERVER_NAME: Mutex<String> = Mutex::new(String::new());
 /// The session's game mode and slots from the server (server.cfg); Free Mode, 32 until told.
 static GAME_MODE: AtomicI32 = AtomicI32::new(FREE_MODE);
 static SLOTS: AtomicU8 = AtomicU8::new(32);
@@ -238,6 +241,7 @@ fn reject_text(reason: &RejectReason) -> String {
 /// Connects to the server in the background and installs the netSocket hooks.
 pub fn start(server: &str, nickname: &str) {
     let _ = crate::NICKNAME.set(nickname.to_string());
+    *TARGET_SERVER.lock().unwrap() = server.to_string();
     install_socket_hooks();
     let (server, nickname) = (server.to_string(), nickname.to_string());
     std::thread::spawn(move || {
@@ -245,6 +249,9 @@ pub fn start(server: &str, nickname: &str) {
         if let Err(e) = run(&server, &nickname) {
             set_status(format!("Could not connect to {server}: {e}"));
         }
+        OUR_ID.store(0, Ordering::SeqCst);
+        HOST_ID.store(0, Ordering::SeqCst);
+        PEERS.lock().unwrap().clear();
     });
 }
 
@@ -269,6 +276,7 @@ fn with_port(server: &str) -> String {
 fn new_session() {
     *RELIABLE_OUT.lock().unwrap() = Some(ReliableOut::default());
     *RELIABLE_IN.lock().unwrap() = Some(ReliableIn::default());
+    PEERS.lock().unwrap().clear();
     crate::resources::reset();
 }
 
@@ -379,6 +387,11 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 }
                 OUR_ID.store(id, Ordering::SeqCst);
                 HOST_ID.store(host, Ordering::SeqCst);
+                {
+                    let mut peers = PEERS.lock().unwrap();
+                    peers.clear();
+                    peers.push(id);
+                }
                 connected_text = format!("Connected to {address} as {} (id {id})", virtual_ip(id));
                 set_status(connected_text.clone());
             }
@@ -407,8 +420,19 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
                 set_status(reject_text(&reason));
                 return Ok(());
             }
-            ServerMessage::PeerJoined { id, nickname } => log!("net: {nickname} is {}", virtual_ip(id)),
-            ServerMessage::PeerLeft { id } => log!("net: {} left", virtual_ip(id)),
+            ServerMessage::PeerJoined { id, nickname } => {
+                log!("net: {nickname} is {}", virtual_ip(id));
+                {
+                    let mut p = PEERS.lock().unwrap();
+                    if !p.contains(&id) {
+                        p.push(id);
+                    }
+                }
+            }
+            ServerMessage::PeerLeft { id } => {
+                log!("net: {} left", virtual_ip(id));
+                PEERS.lock().unwrap().retain(|&x| x != id);
+            }
             ServerMessage::HostChanged { host } => {
                 HOST_ID.store(host, Ordering::SeqCst);
                 log!("net: host is now id {host}");
@@ -443,6 +467,11 @@ fn run(server: &str, nickname: &str) -> std::io::Result<()> {
             }
             ServerMessage::Despawn { kind, object_id } => crate::spawner::despawn(kind, object_id),
             ServerMessage::ScriptEvent { name, payload } => {
+                if name == "ivmp:server_name" {
+                    if let Ok(name_str) = std::str::from_utf8(&payload) {
+                        set_server_name(name_str.trim().trim_matches('"'));
+                    }
+                }
                 let json = String::from_utf8_lossy(&payload).to_string();
                 log!("net: script event '{name}' {json}");
                 let mut events = SCRIPT_EVENTS.lock().unwrap();
@@ -695,4 +724,34 @@ extern "thiscall" fn socket_receive(
         }
         len as i32
     }
+}
+
+/// Whether we are currently connected to an IVMP server.
+pub fn is_connected() -> bool {
+    our_id().is_some()
+}
+
+/// The server name if provided by the server, otherwise the server address we connected to.
+pub fn server_name() -> String {
+    let custom = SERVER_NAME.lock().unwrap().clone();
+    if !custom.is_empty() {
+        return custom;
+    }
+    let target = TARGET_SERVER.lock().unwrap().clone();
+    if !target.is_empty() {
+        return target;
+    }
+    "IVMP Server".to_string()
+}
+
+/// Sets a custom server name.
+pub fn set_server_name(name: impl Into<String>) {
+    *SERVER_NAME.lock().unwrap() = name.into();
+}
+
+/// Current connected players and max slots (current, max).
+pub fn player_count() -> (usize, u8) {
+    let count = PEERS.lock().unwrap().len().max(if our_id().is_some() { 1 } else { 0 });
+    let slots = SLOTS.load(Ordering::SeqCst);
+    (count, slots)
 }
