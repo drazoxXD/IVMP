@@ -63,6 +63,8 @@ pub struct Server {
     slots: u8,
     /// Which content the clients load (server.cfg `dlc`).
     dlc: u8,
+    /// Human-readable server name.
+    name: Option<String>,
 }
 
 /// How many unacknowledged messages a client may have outstanding while files are sent to it.
@@ -89,6 +91,9 @@ impl Server {
             }
             None => None,
         };
+        if let Some(ref name) = config.name {
+            say!("server name: \"{name}\"");
+        }
         if config.host {
             say!("the server hosts the game session (10.0.0.{HOST_ID}); every player joins it");
             if config.gamemode >= 0 && config.gamemode != 16 {
@@ -135,6 +140,7 @@ impl Server {
             gamemode: config.gamemode,
             dlc: config.dlc,
             slots: config.slots,
+            name: config.name.clone(),
         })
     }
 
@@ -594,6 +600,10 @@ impl Server {
             let (first, count) = ids::block(id);
             self.reliable(id, &ServerMessage::ObjectIds { first, count });
             self.reliable(id, &ServerMessage::GameSettings { mode: self.gamemode, slots: self.slots, dlc: self.dlc });
+            if let Some(ref name) = self.name {
+                let payload = serde_json::to_vec(name).unwrap_or_else(|_| name.as_bytes().to_vec());
+                self.reliable(id, &ServerMessage::ScriptEvent { name: "ivmp:server_name".into(), payload });
+            }
         }
     }
 

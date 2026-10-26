@@ -47,10 +47,15 @@ pub struct Config {
     pub resources: Option<String>,
     /// Resources to start, in order (`start = name` lines).
     pub start: Vec<String>,
+    /// Server name shown in Discord Rich Presence and server list (`name` in server.cfg).
+    pub name: Option<String>,
 }
 
 const DEFAULT_FILE: &str = "\
 # IVMP server settings. Lines are `key = value`; `#` starts a comment.
+
+# Server name shown in Discord Rich Presence and server list (optional).
+# name = IVMP Server
 
 # Address and port the server listens on.
 bind = 0.0.0.0:9999
@@ -124,6 +129,7 @@ impl Config {
             upnp: false,
             resources: None,
             start: Vec::new(),
+            name: None,
         }
     }
 
@@ -213,6 +219,10 @@ impl Config {
                     self.capture = (!value.is_empty()).then(|| value.to_string());
                     true
                 }
+                "name" | "servername" | "hostname" => {
+                    self.name = (!value.is_empty()).then(|| value.to_string());
+                    true
+                }
                 _ => {
                     warnings.push(format!("{FILE} line {}: unknown setting `{key}`", number + 1));
                     continue;
@@ -230,6 +240,7 @@ impl Config {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--capture" => self.capture = args.next(),
+                "--name" => self.name = args.next(),
                 "--host" => self.host = true,
                 "--verbose" => self.verbose = true,
                 "--ids" => {
