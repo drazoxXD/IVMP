@@ -41,6 +41,7 @@ dependencies = [
  "NetProtocol",
  "Sync",
  "igd-next",
+ "serde_json",
 ]
 
 [[package]]
