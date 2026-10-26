@@ -16,17 +16,8 @@
 //! Crates: `NetProtocol` (wire protocol shared with the client), `Sync` (decodes the game's
 //! sync traffic), and `Auth`, `Natives`, `Scripting` for what comes next.
 
-#[macro_use]
-mod log;
-mod capture;
-mod config;
-mod console;
-mod lobby;
-mod relay;
-mod resources;
-mod upnp;
-mod server;
-mod world;
+mod modules;
+use modules::*;
 
 fn main() -> std::io::Result<()> {
     log::open();

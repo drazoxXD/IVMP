@@ -7,27 +7,8 @@
 // The DLL is named IVMP_Client.
 #![allow(non_snake_case)]
 
-mod audio;
-mod boot;
-mod crash;
-mod discord;
-mod dlc;
-mod dump;
-mod enginelog;
-mod events;
-mod imgui_dx9;
-mod render;
-mod ui;
-mod web;
-mod focus;
-mod hang;
-mod memstats;
-mod luacompat;
-mod luanatives;
-mod luaui;
-mod mods;
-mod scripts;
-mod window;
+mod modules;
+use modules::*;
 
 /// Counts the client's heap for the Memory overlay.
 #[global_allocator]

@@ -112,7 +112,7 @@ fn parse_ret(text: &str) -> Result<Vec<Ret>, String> {
 }
 
 /// The table of natives generated from the script tooling's lists (see the module docs).
-const BUILT_IN: &str = include_str!("../natives.json");
+const BUILT_IN: &str = include_str!("../../../natives.json");
 
 fn with_table<R>(f: impl FnOnce(&mut HashMap<String, Signature>) -> R) -> R {
     let mut guard = TABLE.lock().unwrap();

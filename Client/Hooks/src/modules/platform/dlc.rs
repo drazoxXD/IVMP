@@ -288,7 +288,7 @@ pub fn early() {
         log!("dlc: off on this PC (dlc 1 in ivmp.json)");
         return;
     }
-    crate::boot::raise_model_pools();
+    ivmp_patches::pools::raise_model_pools();
     relocate_handling();
     install();
 }

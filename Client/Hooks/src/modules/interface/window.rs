@@ -14,7 +14,7 @@ use windows::core::BOOL;
 
 use crate::log;
 
-const ICON: &[u8] = include_bytes!("../../../Icons/logo.ico");
+const ICON: &[u8] = include_bytes!("../../../../../Icons/logo.ico");
 
 /// How often the title and icon are checked once set.
 const CHECK_EVERY: Duration = Duration::from_secs(2);

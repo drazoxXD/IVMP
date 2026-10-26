@@ -7,9 +7,8 @@
 // No console window, debug builds too: the launcher reports through its own window.
 #![windows_subsystem = "windows"]
 
-mod game;
-mod inject;
-mod process;
+mod modules;
+use modules::*;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

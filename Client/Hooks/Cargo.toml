@@ -17,6 +17,7 @@ Shared = { path = "../Shared" }
 Core = { path = "../Core" }
 NativeInvoker = { path = "../NativeInvoker" }
 Networking = { path = "../Networking" }
+ivmp_patches = { package = "Patches", path = "../Patches" }
 IvmpScripting = { path = "../../Server/Scripting" }
 serde_json = "1"
 imgui = "0.12"

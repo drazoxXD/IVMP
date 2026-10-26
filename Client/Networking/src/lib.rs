@@ -19,20 +19,8 @@ use std::sync::OnceLock;
 pub use ivmp_core::{log, memory};
 pub use ivmp_natives::natives;
 
-pub mod controltrace;
-pub mod crypt;
-pub mod hostsys;
-pub mod instance;
-pub mod jointrace;
-pub mod lobby;
-pub mod net;
-pub mod netobjects;
-pub mod peer;
-pub mod relay;
-pub mod resources;
-pub mod session;
-pub mod spawner;
-pub mod synctrace;
+mod modules;
+pub use modules::*;
 
 static NICKNAME: OnceLock<String> = OnceLock::new();
 

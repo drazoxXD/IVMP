@@ -18,6 +18,7 @@ dependencies = [
  "IvmpScripting",
  "NativeInvoker",
  "Networking",
+ "Patches",
  "Shared",
  "imgui",
  "serde_json",
@@ -67,6 +68,14 @@ dependencies = [
  "NetProtocol",
  "Shared",
  "windows",
+]
+
+[[package]]
+name = "Patches"
+version = "0.1.0"
+dependencies = [
+ "Core",
+ "Networking",
 ]
 
 [[package]]

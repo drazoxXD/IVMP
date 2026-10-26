@@ -3,5 +3,5 @@
 
 pub use ivmp_core::{log, memory};
 
-pub mod nativelog;
-pub mod natives;
+mod modules;
+pub use modules::{nativelog, natives};

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use ivmp_host::session::HostSession;
 use ivmp_scripting::Scripting;
 use ivmp_sync::{events::EventLog, ids, nodes, registry::Registry};
+use crate::{debug, say};
 use crate::resources;
 use NetProtocol::reliable::Accept;
 use NetProtocol::{ClientId, ClientMessage, MAX_SCRIPT_PAYLOAD, PROTOCOL_VERSION, RejectReason, ServerMessage, virtual_ip};

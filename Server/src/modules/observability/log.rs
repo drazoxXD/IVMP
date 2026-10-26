@@ -23,6 +23,7 @@ pub fn open() {
 }
 
 /// Like `say!`, but only with `verbose = 1`: debugging detail (entities, game events, summaries).
+#[macro_export]
 macro_rules! debug {
     ($($arg:tt)*) => {{
         if $crate::log::verbose() {
@@ -32,6 +33,7 @@ macro_rules! debug {
 }
 
 /// Prints a line to the console and the log file.
+#[macro_export]
 macro_rules! say {
     ($($arg:tt)*) => {{
         let line = format!($($arg)*);

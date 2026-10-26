@@ -11,328 +11,22 @@ use crate::{log, memory};
 // `80 3D ?? ?? ?? ?? 00 74 74 80 3D ?? ?? ?? ?? 00 74 6B E8` +7, `74 74` -> `EB 74`). It was the
 // first suspect for the crash while loading: the intro also covers engine init.
 
-struct Patch {
-    name: &'static str,
-    /// Signature of the site; `offset` is added to the match.
-    pattern: &'static str,
-    offset: usize,
-    /// Bytes expected at the site before patching (safety check).
-    original: &'static [u8],
-    bytes: &'static [u8],
-}
-
-const PATCHES: &[Patch] = &[
-    // Boot_TitleScreenWait: queue no frontend action instead of the title screen (0xE)...
-    Patch {
-        name: "no title screen action",
-        pattern: "33 F6 6A 0E 89 74 24 14 E8",
-        offset: 2,
-        original: &[0x6A, 0x0E],
-        bytes: &[0x6A, 0x00],
-    },
-    // ...and run its wait loop once instead of until the title is confirmed.
-    Patch {
-        name: "skip title screen wait",
-        pattern: "83 FE 01 0F 85 64 FF FF FF 6A 00 B9",
-        offset: 3,
-        original: &[0x0F, 0x85, 0x64, 0xFF, 0xFF, 0xFF],
-        bytes: &[0x90, 0x90, 0x90, 0x90, 0x90, 0x90],
-    },
-    // Boot_InitialLoadFlow loop head: `push 1; call Sleep` -> `jmp 0x5C1DE6` (mov esi, 9).
-    // Skips profile sign-in, storage device and autoload-save states and goes to the
-    // "continue" exit, which loads the world with fromSave = true and no save data.
-    Patch {
-        name: "skip boot profile/save states",
-        pattern: "6A 01 FF D3 E8 ?? ?? ?? ?? 83 FE 06 0F 87",
-        offset: 0,
-        original: &[0x6A, 0x01, 0xFF, 0xD3, 0xE8],
-        bytes: &[0xE9, 0xAE, 0x00, 0x00, 0x00],
-    },
-    // State 9 episode pick: `cmp byte [ep_override],0; mov ecx,[ep]; cmovnz ecx,[ep_cmdline]`
-    // -> `xor ecx, ecx` + NOPs, so we always load episode 0 (GTA IV).
-    Patch {
-        name: "force episode 0",
-        pattern: "80 3D ?? ?? ?? ?? 00 8B 0D ?? ?? ?? ?? 0F 45 0D ?? ?? ?? ?? 6A 00 6A 01 B2 01",
-        offset: 0,
-        original: &[0x80, 0x3D],
-        bytes: &[
-            0x33, 0xC9, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, //
-            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-        ],
-    },
-    // CGame_Process: with the pause menu open the world update flag (0x018B6EDF) is cleared
-    // unless the game thinks it is in a network session. Keep it set so the world never freezes.
-    Patch {
-        name: "world keeps running in the pause menu",
-        pattern: "C6 05 ?? ?? ?? ?? 00 84 DB 0F 84 85 00 00 00 8B 35",
-        offset: 6,
-        original: &[0x00],
-        bytes: &[0x01],
-    },
-    // CTheScripts_InitAndLaunchStartup: `jnz` -> `jmp`, never launch `startup` / `network_startup`.
-    Patch {
-        name: "no startup script",
-        pattern: "80 7D 08 00 C6 05 ?? ?? ?? ?? 00 75 64 E8",
-        offset: 11,
-        original: &[0x75, 0x64],
-        bytes: &[0xEB, 0x64],
-    },
-];
-
-/// With `network_test`: skip only the story `startup` script and let `network_startup` run
-/// (it sets up the multiplayer ped, HUD and menus). `jz startup` -> `jz exit`.
-const ONLY_SKIP_STORY_SCRIPT: Patch = Patch {
-    name: "skip story startup script only",
-    pattern: "80 7D 08 00 C6 05 ?? ?? ?? ?? 00 75 64 E8 ?? ?? ?? ?? 84 C0 74 07",
-    offset: 20,
-    original: &[0x74, 0x07],
-    bytes: &[0x74, 0x5B],
-};
-
-/// The startup script site once "no startup script" is applied (`jnz` became `jmp`).
-const STARTUP_SCRIPTS_SKIPPED: &str = "80 7D 08 00 C6 05 ?? ?? ?? ?? 00 EB 64 E8 ?? ?? ?? ?? 84 C0 74 07";
-
-/// The network session has started loading (the startup scripts launch while it loads).
-static SESSION_LOADING: AtomicBool = AtomicBool::new(false);
-
-/// `gamemode = -1` (told by the server, before the session loads): give the host the game's own
-/// multiplayer lobby back. Undo "no startup script" and skip only the story `startup` script
-/// ([`ONLY_SKIP_STORY_SCRIPT`]), so `network_startup` runs: it hosts and opens the lobby, where
-/// the host picks the game. Only on the host: on a joiner the script's session calls ran into
-/// IVMP's join and the game thread hung in the join code (0x47CF9F); joiners join as in peer
-/// to peer and get the game when the host starts it. Called from the network thread.
-fn use_game_lobby(mode: i32) {
-    use ivmp_networking::net;
-    if mode != net::LOBBY_MODE {
-        return;
-    }
-    if net::our_id().is_none() || net::our_id() != net::host_id() {
-        log!("boot: gamemode -1: we join the host's lobby, no lobby script here");
-        return;
-    }
-    if SESSION_LOADING.load(Ordering::SeqCst) {
-        log!("boot: gamemode -1 came after the session started loading; no lobby this time");
-        return;
-    }
-    let Some(site) = memory::find(STARTUP_SCRIPTS_SKIPPED) else {
-        log!("boot: gamemode -1: startup script site not found, no lobby");
-        return;
-    };
-    // `jmp` -> `jnz` again (offset 11), then `jz startup` -> `jz exit` (offset 20).
-    let restored = unsafe { memory::patch(site + 11, &[0x75]) };
-    let story_only = unsafe { memory::patch(site + 20, ONLY_SKIP_STORY_SCRIPT.bytes) };
-    match (restored, story_only) {
-        (Ok(()), Ok(())) => log!("boot: gamemode -1: network_startup runs, players get the game's lobby"),
-        (r, s) => log!("boot: gamemode -1: lobby patch failed ({r:?}, {s:?})"),
-    }
-}
-
-/// With `network_test`: the first world load is already a network game (the LibertyM way, see
-/// docs/libertym-notes.md), so the player and world are created as network objects and the
-/// engine syncs them. Loading single player first and switching modes left nothing to sync.
-const NETWORK_BOOT_PATCHES: &[Patch] = &[
-    // Boot_InitialLoadFlow: our jump lands on `mov esi, 9` (continue -> single-player load);
-    // state 8 instead is the network game start, which calls Game_StartNetworkSession.
-    Patch {
-        name: "boot into the network game state",
-        pattern: "BE 09 00 00 00 6A 00 B9 ?? ?? ?? ?? C6 05",
-        offset: 1,
-        original: &[0x09],
-        bytes: &[0x08],
-    },
-    // State 8 only starts the network game when 0x018B6148 == 2; otherwise it falls through to
-    // the single-player paths. `jnz` -> nops.
-    Patch {
-        name: "network game start without the mode check",
-        pattern: "83 3D ?? ?? ?? ?? 02 75 55 E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 8B 35",
-        offset: 7,
-        original: &[0x75, 0x55],
-        bytes: &[0x90, 0x90],
-    },
-    // State 8 takes the network episode from a pending invite (0x482150), which is -1 without one,
-    // and stores it in 0x011D6FE0 for Game_StartNetworkSession. -1 sometimes ended on "The
-    // downloadable content required for this autoload is not available". `call` -> `xor eax, eax`
-    // so the episode is always 0 (GTA IV).
-    Patch {
-        name: "network game in episode 0",
-        pattern: "E8 ?? ?? ?? ?? 8B 35 ?? ?? ?? ?? 8B F8 8B CE 89 3D",
-        offset: 0,
-        original: &[0xE8],
-        bytes: &[0x31, 0xC0, 0x90, 0x90, 0x90],
-    },
-    // LibertyM HookRemoveSpecNetChecks: the function keeping the MP_WARNING_5 / MP_WARNING_6
-    // counters ("running too slowly", "out of streaming memory"), which kick a player out of the
-    // session. Two copies on one PC are slow enough to trip them. `push ecx` -> `ret`.
-    Patch {
-        name: "no too-slow / streaming memory kicks",
-        pattern: "51 A1 ?? ?? ?? ?? 53 55 8B EA 56 8A F1 57",
-        offset: 0,
-        original: &[0x51],
-        bytes: &[0xC3],
-    },
-];
-
-/// GameMode_Request(mode) (0x942B20): `[0x11D6FC8] = mode; [0x11D6FCC] = 1` (mode change
-/// pending, picked up by GameMode_ProcessPendingChange).
-const GAME_MODE_REQUEST_PATTERN: &str = "8B 44 24 04 A3 ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 C3";
-static GAME_MODE_VAR: AtomicUsize = AtomicUsize::new(0);
-static GAME_MODE_PENDING: AtomicUsize = AtomicUsize::new(0);
-
-/// GameMode_Request, filtered: the game stays in network mode, network requests go through.
-/// Changing the game type in the lobby stores the new match settings (0x47B990) and requests the
-/// network game again (native 0x1BC5050E -> 0xBDC960 -> GameMode_Request(1)) so the session
-/// reloads with them; ignoring every request left the host on the loading screen for good.
-/// Leaving the session (after a race, "Leave" in the lobby, or the game bailing out of a session
-/// that failed or lost its connection) asks for single player (0): ignoring that left the host on
-/// a loading screen that never ended. There is no single player to go back to, so it becomes a
-/// network reload, a fresh session (a fresh lobby in a lobby game, which the others follow). Not
-/// more often than every 10 s, so a session that keeps failing doesn't reload in a loop.
-extern "C" fn game_mode_request(mode: i32) {
-    static LAST_RELOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mode = if mode == 0 {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-        if now.saturating_sub(LAST_RELOAD.load(Ordering::Relaxed)) >= 10_000 {
-            LAST_RELOAD.store(now, Ordering::Relaxed);
-            log!("boot: the game left its session (asked for single player): loading the network game again");
-            1
-        } else {
-            0
-        }
-    } else {
-        mode
-    };
-    if mode == 0 {
-        log!("boot: ignored a second request for single player within 10 s, staying in network mode");
-        return;
-    }
-    log!("boot: game mode {mode} requested (network game reload)");
-    // In a lobby game the host's reload means a new session: the joiners follow it.
-    if ivmp_networking::net::lobby_mode() {
-        ivmp_networking::net::tell_session_restart();
-    }
-    unsafe {
-        *(GAME_MODE_VAR.load(Ordering::SeqCst) as *mut i32) = mode;
-        *(GAME_MODE_PENDING.load(Ordering::SeqCst) as *mut u8) = 1;
-    }
-}
-
-fn install_game_mode_filter() {
-    let Some(site) = memory::find(GAME_MODE_REQUEST_PATTERN) else {
-        log!("boot: GameMode_Request not found, mode requests not filtered");
-        return;
-    };
-    unsafe {
-        GAME_MODE_VAR.store(std::ptr::read_unaligned((site + 5) as *const u32) as usize, Ordering::SeqCst);
-        GAME_MODE_PENDING.store(std::ptr::read_unaligned((site + 11) as *const u32) as usize, Ordering::SeqCst);
-        let rel = (game_mode_request as usize as isize - (site as isize + 5)) as i32;
-        let mut jump = [0xE9u8, 0, 0, 0, 0];
-        jump[1..].copy_from_slice(&rel.to_le_bytes());
-        match memory::patch(site, &jump) {
-            Ok(()) => log!("boot: game mode stays network (single player requests ignored) at {site:#x}"),
-            Err(e) => log!("boot: game mode filter at {site:#x} failed: {e}"),
-        }
-    }
-}
-
-/// Game mode (0x011D6FC8): 1 = network game.
-const GAME_MODE: usize = 0x011D_6FC8;
-/// Stored network game config (30 dwords) the network game start uses; Free Mode, 32 slots.
-const NETWORK_GAME_CONFIG: (&str, usize) = ("B9 1E 00 00 00 BF ?? ?? ?? ?? F3 A5 5F 5E C3", 6);
-/// A call that zeroes that config during network init (inside the function called at
-/// pattern + 20, at +0x76): nopped so our config survives.
-const CONFIG_ZEROING_CALL: (&str, usize, usize) = ("6A 08 6A 3B FF 15 ?? ?? ?? ?? E8", 20, 0x76);
-
-fn apply(patches: &[Patch]) {
-    for patch in patches {
-        let Some(site) = memory::find(patch.pattern).map(|a| a + patch.offset) else {
-            log!("boot: {}: signature not found, skipped", patch.name);
-            continue;
-        };
-        let current = unsafe { std::slice::from_raw_parts(site as *const u8, patch.original.len()) };
-        if current != patch.original {
-            log!("boot: {} at {site:#x}: unexpected bytes {current:02X?}, skipped", patch.name);
-            continue;
-        }
-        match unsafe { memory::patch(site, patch.bytes) } {
-            Ok(()) => log!("boot: {} at {site:#x}", patch.name),
-            Err(e) => log!("boot: {} at {site:#x} failed: {e}", patch.name),
-        }
-    }
-}
-
-/// Player_Create (0xBB53B0) starts with `push "player"` (the Niko model) at +4. The host refuses
-/// to clone a remote player with that model: the clone create for the second client's player
-/// (CNetObjPlayer, 0x4B9340) failed every time. Multiplayer players use the MP ped model.
-const PLAYER_MODEL_PUSH: usize = 0x00BB_53B4;
-static MP_PLAYER_MODEL: &[u8] = b"M_Y_MULTIPLAYER\0";
-
-fn use_mp_player_model() {
-    let site = memory::from_ghidra(PLAYER_MODEL_PUSH);
-    unsafe {
-        if *(site as *const u8) != 0x68 {
-            log!("boot: player model push not found at {site:#x}, keeping Niko");
-            return;
-        }
-        let mut bytes = [0x68u8, 0, 0, 0, 0];
-        bytes[1..].copy_from_slice(&(MP_PLAYER_MODEL.as_ptr() as u32).to_le_bytes());
-        match memory::patch(site, &bytes) {
-            Ok(()) => log!("boot: the player uses the multiplayer model M_Y_MULTIPLAYER"),
-            Err(e) => log!("boot: player model patch failed: {e}"),
-        }
-    }
-}
-
-fn install_network_boot() {
-    apply(NETWORK_BOOT_PATCHES);
-    install_game_mode_filter();
-    use_mp_player_model();
-    unsafe {
-        *(memory::from_ghidra(GAME_MODE) as *mut u32) = 1;
-        if let Some(site) = memory::find(NETWORK_GAME_CONFIG.0) {
-            let config = std::ptr::read_unaligned((site + NETWORK_GAME_CONFIG.1) as *const u32) as *mut u32;
-            std::ptr::write_bytes(config, 0, 30);
-            *config = 16; // Free Mode
-            *config.add(2) = 32; // slots
-            log!("boot: network game config at {config:p} set to Free Mode, 32 slots");
-            // The server's game mode and slots replace these once it sends them.
-            ivmp_networking::net::set_network_config(config as usize);
-        }
-        if let Some(site) = memory::find(CONFIG_ZEROING_CALL.0) {
-            let call = site + CONFIG_ZEROING_CALL.1;
-            let rel = std::ptr::read_unaligned((call + 1) as *const i32);
-            let zeroing = (call as isize + 5 + rel as isize) as usize + CONFIG_ZEROING_CALL.2;
-            if *(zeroing as *const u8) == 0xE8 {
-                match memory::patch(zeroing, &[0x90; 5]) {
-                    Ok(()) => log!("boot: network game config is no longer zeroed ({zeroing:#x})"),
-                    Err(e) => log!("boot: config zeroing patch failed: {e}"),
-                }
-            } else {
-                log!("boot: no call at the config zeroing site {zeroing:#x}, skipped");
-            }
-        }
-    }
-    log!("boot: the first load is a network game");
-}
-
 /// True when the game boots straight into a network game (no single-player load first).
 pub fn network_boot() -> bool {
     crate::config().network_test
 }
 
-/// Applies the boot patches. Must run before the game reaches its boot flow.
+/// Installs the boot hooks and delegates byte patches to the Patches crate.
 pub fn install() {
     log!("boot: scanning {} KB of game code", memory::code_section().len() / 1024);
-    // LibertyM route: no network_startup lobby either, our host system (hostsys.rs) hosts;
-    // with `gamemode = -1` the lobby comes back ([`use_game_lobby`]).
-    apply(PATCHES);
+    ivmp_patches::boot::install_direct_boot();
     if network_boot() {
-        install_network_boot();
-        ivmp_networking::net::on_game_settings(use_game_lobby);
+        ivmp_patches::boot::install_network_boot();
+        ivmp_networking::net::on_game_settings(ivmp_patches::boot::use_game_lobby);
     }
     install_spawn_hook();
     install_menu_guard();
 }
-
 // Without the startup script nothing creates the player ped, and the first world update
 // dereferences FindPlayerPed() == null. Boot_InitialLoadFlow calls Game_SpawnPlayerAfterLoad(1)
 // right after the world has loaded; we redirect that call, create the player and give the
@@ -485,7 +179,7 @@ fn install_network_session_hook() {
 /// The boot path spawns and fades in through Game_SpawnPlayerAfterLoad; a network session load
 /// has no such step (network_startup would do it), so the screen stayed on "LOADING...".
 extern "fastcall" fn start_network_session(loading_screen_up: u32) {
-    SESSION_LOADING.store(true, Ordering::SeqCst);
+    ivmp_patches::boot::mark_session_loading();
     unsafe {
         let original: extern "fastcall" fn(u32) = std::mem::transmute(ORIGINAL_START_NETWORK.load(Ordering::SeqCst));
         original(loading_screen_up);
@@ -509,13 +203,13 @@ const GAME_MODE_CURRENT: usize = 0x011D_6FC4;
 /// session). CGame_Process only runs once the boot load has returned (GameThread_Main), so on
 /// the first frames, once our hooks are in, finish what the hook would have done.
 fn catch_up_missed_network_load() {
-    if SESSION_LOADING.load(Ordering::SeqCst) || !HOOKS_INSTALLED.load(Ordering::SeqCst) || !network_boot() {
+    if ivmp_patches::boot::session_loading() || !HOOKS_INSTALLED.load(Ordering::SeqCst) || !network_boot() {
         return;
     }
     if unsafe { *(memory::from_ghidra(GAME_MODE_CURRENT) as *const i32) } != 1 {
         return;
     }
-    SESSION_LOADING.store(true, Ordering::SeqCst);
+    ivmp_patches::boot::mark_session_loading();
     log!("boot: the network session loaded before our hook was in (intros skipped?), finishing the load now");
     after_network_load();
     // The load ran its startup scripts before `gamemode -1` could bring `network_startup` back
@@ -643,41 +337,6 @@ fn network_test_tick() {
 // The M menu of the lobby (the MP frontend, `CViewportFrontend3DScene`): its close routine
 // (0x5BD8B0) runs on a null UI object when the setup (0x5B9AA0) never finished, which crashes the
 // game thread. Guard it, and log the setup's state once a second while the menu is up.
-// The model-info pools (docs/dlc.md): every kind of model definition (peds, vehicles, weapons,
-// instances, interiors, the 2dfx attributes, ...) lives in a fixed-size pool `{capacity, used, base}`,
-// 12 bytes each in a table at 0x0103AD64, built once at the game's start from the capacity in the
-// data section. The base game nearly fills several of them, and a game that also loads the
-// episodes' content (TLAD, TBoGT: `dlc` 2 and 3) takes more slots than exist, so the next
-// allocation is a garbage slot (a crash in the IDE parser). The capacities are raised before the
-// game builds the pools. The game's own capacities, in table order (the first pool, the 28000 base
-// model infos, is left alone: the model table has 31000 slots):
-const MODEL_POOL_TABLE: usize = 0x0103_AD64;
-const MODEL_POOL_CAPACITIES: [u32; 23] = [
-    550, 1800, 100, 205, 585, 220, 17000, 300, 11000, 13250, 10900, 2700, 50, 100, 122, 10900, 600, 35, 20, 100, 280, 250, 30,
-];
-
-/// Three times the room for the small pools, twice for the big ones (indices into them are 16 bit).
-fn raised(capacity: u32) -> u32 {
-    if capacity >= 10_000 { capacity * 2 } else { capacity * 3 }
-}
-
-pub fn raise_model_pools() {
-    let mut raised_count = 0;
-    for (index, original) in MODEL_POOL_CAPACITIES.iter().enumerate() {
-        let address = MODEL_POOL_TABLE + 12 * (index + 1);
-        let at = memory::from_ghidra(address);
-        let mut current = [0u8; 4];
-        if !memory::read(at, &mut current) || u32::from_le_bytes(current) != *original {
-            log!("pools: {address:#x} holds {}, not {original}: left alone", u32::from_le_bytes(current));
-            continue;
-        }
-        match unsafe { memory::patch(at, &raised(*original).to_le_bytes()) } {
-            Ok(()) => raised_count += 1,
-            Err(e) => log!("pools: {address:#x} could not be raised: {e}"),
-        }
-    }
-    log!("pools: {raised_count} of {} model pools raised for the episodes", MODEL_POOL_CAPACITIES.len());
-}
 
 static MENU_CLOSE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 const MENU_CLOSE: usize = 0x005B_D8B0;

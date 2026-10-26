@@ -9,7 +9,7 @@ members = [
     "Networking",
     "Networking/crates/Sync",
     "Preload",
-    "Scripting",
+    "Scripting", "Patches",
 ]
 
 [workspace.dependencies]

@@ -4,6 +4,8 @@
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
 
+use crate::say;
+
 use igd_next::{PortMappingProtocol, SearchOptions, search_gateway};
 
 const LEASE_SECONDS: u32 = 3600;
